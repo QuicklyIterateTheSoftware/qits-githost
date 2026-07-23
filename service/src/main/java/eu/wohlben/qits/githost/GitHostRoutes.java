@@ -1,11 +1,14 @@
 package eu.wohlben.qits.githost;
 
+import eu.wohlben.qits.domain.repository.persistence.RepositoryNameRepository;
+import io.quarkus.narayana.jta.QuarkusTransaction;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.ext.web.Router;
 import io.vertx.ext.web.RoutingContext;
 import io.vertx.ext.web.handler.BodyHandler;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
+import jakarta.inject.Inject;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
@@ -39,12 +42,25 @@ import org.jboss.logging.Logger;
  * are both enabled. The git CLI ({@code GitExecutor}) remains the only thing that mutates
  * repositories; JGit here speaks the wire protocol and nothing else.
  *
- * <p>The three smart-HTTP endpoints (relative to {@code /git/:repoId}):
+ * <p>Two addressing schemes, both served:
  *
  * <ul>
- *   <li>{@code GET /info/refs?service=git-(upload|receive)-pack} — the ref advertisement.
- *   <li>{@code POST /git-upload-pack} — fetch/clone negotiation + packfile.
- *   <li>{@code POST /git-receive-pack} — push.
+ *   <li><b>id-addressed</b> {@code /git/:repoId} — the opaque UUID, resolving directly to {@code
+ *       <data-dir>/<repoId>/origin} (back-compat: already-provisioned containers, metadata,
+ *       discovery).
+ *   <li><b>name-addressed</b> {@code /git/:projectId/:repoName} — a project's repositories served
+ *       as siblings, {@code repoName} resolved through the {@link RepositoryNameRepository} alias
+ *       table to a repo id. This is what lets committed relative submodule urls ({@code
+ *       ../<name>.git}) resolve natively against a sibling — no {@code submodule.<name>.url}
+ *       override.
+ * </ul>
+ *
+ * <p>The three smart-HTTP endpoints hang off each scheme:
+ *
+ * <ul>
+ *   <li>{@code GET …/info/refs?service=git-(upload|receive)-pack} — the ref advertisement.
+ *   <li>{@code POST …/git-upload-pack} — fetch/clone negotiation + packfile.
+ *   <li>{@code POST …/git-receive-pack} — push.
  * </ul>
  */
 @ApplicationScoped
@@ -64,38 +80,59 @@ public class GitHostRoutes {
   @ConfigProperty(name = "qits.repositories.data-dir", defaultValue = "data/repositories")
   String dataDir;
 
+  @Inject RepositoryNameRepository repositoryNames;
+
   /**
    * Register the routes on the main Vert.x router (root path — NOT under {@code
    * quarkus.rest.path}). Blocking: JGit's UploadPack/ReceivePack do synchronous stream I/O against
    * the on-disk bare, so they run on a worker thread. The POST bodies (packfiles) are buffered by a
    * {@link BodyHandler} first — fine at qits' single-node scale.
+   *
+   * <p>The two-segment name-addressed routes and the one-segment id-addressed routes never collide:
+   * they differ in path length, so Vert.x dispatches each unambiguously.
    */
   void init(@Observes Router router) {
-    router.get("/git/:repoId/info/refs").blockingHandler(this::infoRefs);
+    router.get("/git/:repoId/info/refs").blockingHandler(rc -> infoRefs(rc, open(rc, "repoId")));
     router
         .post("/git/:repoId/git-upload-pack")
         .handler(BodyHandler.create())
-        .blockingHandler(rc -> service(rc, UPLOAD));
+        .blockingHandler(rc -> service(rc, UPLOAD, open(rc, "repoId")));
     router
         .post("/git/:repoId/git-receive-pack")
         .handler(BodyHandler.create())
-        .blockingHandler(rc -> service(rc, RECEIVE));
+        .blockingHandler(rc -> service(rc, RECEIVE, open(rc, "repoId")));
+
+    router
+        .get("/git/:projectId/:repoName/info/refs")
+        .blockingHandler(rc -> infoRefs(rc, openByName(rc)));
+    router
+        .post("/git/:projectId/:repoName/git-upload-pack")
+        .handler(BodyHandler.create())
+        .blockingHandler(rc -> service(rc, UPLOAD, openByName(rc)));
+    router
+        .post("/git/:projectId/:repoName/git-receive-pack")
+        .handler(BodyHandler.create())
+        .blockingHandler(rc -> service(rc, RECEIVE, openByName(rc)));
   }
 
-  /** {@code GET /git/:repoId/info/refs?service=…} — the smart-HTTP ref advertisement. */
-  private void infoRefs(RoutingContext rc) {
+  /** {@code GET …/info/refs?service=…} — the smart-HTTP ref advertisement. */
+  private void infoRefs(RoutingContext rc, Repository repo) {
     String service = rc.request().getParam("service");
-    if (!UPLOAD.equals(service) && !RECEIVE.equals(service)) {
-      // Dumb-HTTP (no ?service=) is unsupported; only the smart protocol is served.
-      rc.response().setStatusCode(403).end("only smart HTTP is supported");
-      return;
-    }
-    Repository repo = open(rc.pathParam("repoId"));
-    if (repo == null) {
-      rc.response().setStatusCode(404).end();
-      return;
-    }
+    // try(repo) wraps the whole body — including the early returns — so a repo opened eagerly by
+    // the
+    // route handler is closed on every path (the 403 dumb-HTTP branch below would otherwise leak
+    // it).
+    // A null repo is a no-op for try-with-resources.
     try (repo) {
+      if (!UPLOAD.equals(service) && !RECEIVE.equals(service)) {
+        // Dumb-HTTP (no ?service=) is unsupported; only the smart protocol is served.
+        rc.response().setStatusCode(403).end("only smart HTTP is supported");
+        return;
+      }
+      if (repo == null) {
+        rc.response().setStatusCode(404).end();
+        return;
+      }
       ByteArrayOutputStream buf = new ByteArrayOutputStream();
       PacketLineOut pck = new PacketLineOut(buf);
       pck.writeString("# service=" + service + "\n");
@@ -119,9 +156,8 @@ public class GitHostRoutes {
     }
   }
 
-  /** {@code POST /git/:repoId/git-(upload|receive)-pack} — the actual fetch/push exchange. */
-  private void service(RoutingContext rc, String service) {
-    Repository repo = open(rc.pathParam("repoId"));
+  /** {@code POST …/git-(upload|receive)-pack} — the actual fetch/push exchange. */
+  private void service(RoutingContext rc, String service, Repository repo) {
     if (repo == null) {
       rc.response().setStatusCode(404).end();
       return;
@@ -150,6 +186,11 @@ public class GitHostRoutes {
     }
   }
 
+  /** Opens the repo named by the {@code repoId} path param (the id-addressed scheme). */
+  private Repository open(RoutingContext rc, String param) {
+    return open(rc.pathParam(param));
+  }
+
   /**
    * Opens the repository's bare origin at {@code <data-dir>/<repoId>/origin} — the same layout
    * {@code RepositoryService} clones into. Returns {@code null} (→ 404) for an id that isn't a
@@ -168,6 +209,33 @@ public class GitHostRoutes {
     } catch (Exception e) {
       return null;
     }
+  }
+
+  /**
+   * Opens the repository addressed by {@code /git/:projectId/:repoName}: strips an optional {@code
+   * .git} suffix, resolves {@code (projectId, name)} through the alias table to a repo id, then
+   * opens that repo's on-disk origin. The path segments are only DB lookup keys (never filesystem
+   * paths — the resolved id is), and the resolved id is re-validated by {@link #open(String)}, so
+   * traversal is impossible. The lookup runs in its own transaction (this is a Vert.x worker thread
+   * with no request context to bind a session from).
+   */
+  private Repository openByName(RoutingContext rc) {
+    String projectId = rc.pathParam("projectId");
+    String repoName = rc.pathParam("repoName");
+    if (projectId == null || repoName == null) {
+      return null;
+    }
+    String name =
+        repoName.endsWith(".git") ? repoName.substring(0, repoName.length() - 4) : repoName;
+    String repoId =
+        QuarkusTransaction.requiringNew()
+            .call(
+                () ->
+                    repositoryNames
+                        .findRepositoryByProjectAndName(projectId, name)
+                        .map(repo -> repo.id)
+                        .orElse(null));
+    return open(repoId);
   }
 
   private void fail(RoutingContext rc, String service, Exception e) {

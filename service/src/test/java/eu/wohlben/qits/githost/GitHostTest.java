@@ -5,10 +5,13 @@ import static org.hamcrest.Matchers.containsString;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import eu.wohlben.qits.domain.project.control.ProjectService;
+import eu.wohlben.qits.domain.repository.control.RepositoryService;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
+import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 import java.net.URL;
 import java.nio.file.Files;
@@ -42,6 +45,9 @@ public class GitHostTest {
 
   @ConfigProperty(name = "qits.repositories.data-dir")
   String dataDir;
+
+  @Inject ProjectService projectService;
+  @Inject RepositoryService repositoryService;
 
   @TestHTTPResource("/git")
   URL gitBase;
@@ -107,6 +113,18 @@ public class GitHostTest {
   }
 
   @Test
+  public void missingServiceParamIs403ForAKnownRepo() throws Exception {
+    // A known repo id with no ?service= (dumb-HTTP) is 403. The handler opens the repo eagerly, so
+    // this path must still close it — regression guard for the try(repo)-wraps-the-403 fix.
+    String repoId = seedOrigin();
+    given()
+        .when()
+        .get("/git/" + repoId + "/info/refs")
+        .then()
+        .statusCode(Response.Status.FORBIDDEN.getStatusCode());
+  }
+
+  @Test
   public void unknownRepoIdIs404() {
     given()
         .when()
@@ -122,6 +140,49 @@ public class GitHostTest {
     given()
         .when()
         .get("/git/foo.bar/info/refs?service=git-upload-pack")
+        .then()
+        .statusCode(Response.Status.NOT_FOUND.getStatusCode());
+  }
+
+  @Test
+  public void nameAddressedCloneResolvesThroughTheAliasTable() throws Exception {
+    // The full import path registers the repo's url-basename ("testing-repo") as a project-scoped
+    // name alias, so it is servable at /git/<projectId>/<name> as well as /git/<repoId>.
+    var project = projectService.create("GitHost Names", null);
+    var repo = repositoryService.cloneRepository(fixtureUrl, null, project);
+
+    Path clone = Files.createTempDirectory("qits-githost-named-clone");
+    Files.delete(clone);
+    runGit(null, "git", "clone", gitBase + "/" + project.id + "/testing-repo", clone.toString());
+    assertTrue(
+        Files.exists(clone.resolve(".git")), "name-addressed clone should produce a working copy");
+
+    // A trailing .git on the name segment is stripped before the alias lookup.
+    Path cloneDotGit = Files.createTempDirectory("qits-githost-named-clone-dotgit");
+    Files.delete(cloneDotGit);
+    runGit(
+        null,
+        "git",
+        "clone",
+        gitBase + "/" + project.id + "/testing-repo.git",
+        cloneDotGit.toString());
+    assertTrue(
+        Files.exists(cloneDotGit.resolve(".git")), "a .git suffix on the name still resolves");
+
+    // The id-addressed route keeps working for the same repo (back-compat).
+    given()
+        .when()
+        .get("/git/" + repo.id + "/info/refs?service=git-upload-pack")
+        .then()
+        .statusCode(Response.Status.OK.getStatusCode());
+  }
+
+  @Test
+  public void unknownNameInProjectIs404() {
+    var project = projectService.create("GitHost Missing Name", null);
+    given()
+        .when()
+        .get("/git/" + project.id + "/no-such-name/info/refs?service=git-upload-pack")
         .then()
         .statusCode(Response.Status.NOT_FOUND.getStatusCode());
   }
