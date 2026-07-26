@@ -82,6 +82,11 @@ public class GitHostRoutes {
 
   @Inject RepositoryNameRepository repositoryNames;
 
+  @Inject CiPostReceiveNotifier ciNotifier;
+
+  /** A resolved repository plus the id it resolved to (the post-receive hook needs the id). */
+  private record OpenedRepo(String repoId, Repository repo) {}
+
   /**
    * Register the routes on the main Vert.x router (root path — NOT under {@code
    * quarkus.rest.path}). Blocking: JGit's UploadPack/ReceivePack do synchronous stream I/O against
@@ -116,14 +121,14 @@ public class GitHostRoutes {
   }
 
   /** {@code GET …/info/refs?service=…} — the smart-HTTP ref advertisement. */
-  private void infoRefs(RoutingContext rc, Repository repo) {
+  private void infoRefs(RoutingContext rc, OpenedRepo opened) {
     String service = rc.request().getParam("service");
     // try(repo) wraps the whole body — including the early returns — so a repo opened eagerly by
     // the
     // route handler is closed on every path (the 403 dumb-HTTP branch below would otherwise leak
     // it).
     // A null repo is a no-op for try-with-resources.
-    try (repo) {
+    try (Repository repo = opened == null ? null : opened.repo()) {
       if (!UPLOAD.equals(service) && !RECEIVE.equals(service)) {
         // Dumb-HTTP (no ?service=) is unsupported; only the smart protocol is served.
         rc.response().setStatusCode(403).end("only smart HTTP is supported");
@@ -157,12 +162,12 @@ public class GitHostRoutes {
   }
 
   /** {@code POST …/git-(upload|receive)-pack} — the actual fetch/push exchange. */
-  private void service(RoutingContext rc, String service, Repository repo) {
-    if (repo == null) {
+  private void service(RoutingContext rc, String service, OpenedRepo opened) {
+    if (opened == null) {
       rc.response().setStatusCode(404).end();
       return;
     }
-    try (repo) {
+    try (Repository repo = opened.repo()) {
       InputStream in = new ByteArrayInputStream(rc.body().buffer().getBytes());
       if ("gzip".equals(rc.request().getHeader("Content-Encoding"))) {
         in = new GZIPInputStream(in);
@@ -171,10 +176,19 @@ public class GitHostRoutes {
       if (UPLOAD.equals(service)) {
         UploadPack up = new UploadPack(repo);
         up.setBiDirectionalPipe(false);
+        // The want policy stays JGit's default ADVERTISED. Relaxing it to REACHABLE_COMMIT would
+        // make every want for a non-tip object run a reachability walk on this shared worker
+        // thread — a DoS lever on a route that is deliberately unauthenticated. ci therefore
+        // fetches the BRANCH REF and verifies reachability itself (see GitConfigFetcher).
         up.upload(in, out, null);
       } else {
         ReceivePack rp = new ReceivePack(repo);
         rp.setBiDirectionalPipe(false);
+        // The literal post-receive event the CI pipelines are named after (docs/epics/qits-ci/):
+        // fires after the ref updates land, still inside receive() — the notifier is
+        // fire-and-forget so the push response is never delayed.
+        rp.setPostReceiveHook(
+            (pack, commands) -> ciNotifier.onPostReceive(opened.repoId(), commands));
         rp.receive(in, out, null);
       }
       rc.response()
@@ -187,7 +201,7 @@ public class GitHostRoutes {
   }
 
   /** Opens the repo named by the {@code repoId} path param (the id-addressed scheme). */
-  private Repository open(RoutingContext rc, String param) {
+  private OpenedRepo open(RoutingContext rc, String param) {
     return open(rc.pathParam(param));
   }
 
@@ -196,7 +210,7 @@ public class GitHostRoutes {
    * {@code RepositoryService} clones into. Returns {@code null} (→ 404) for an id that isn't a
    * valid repo-id slug or whose origin doesn't exist; the caller closes the returned repo.
    */
-  private Repository open(String repoId) {
+  private OpenedRepo open(String repoId) {
     if (repoId == null || !repoId.matches(REPO_ID_PATTERN)) {
       return null;
     }
@@ -205,7 +219,9 @@ public class GitHostRoutes {
       return null;
     }
     try {
-      return new FileRepositoryBuilder().setGitDir(origin.toFile()).setMustExist(true).build();
+      return new OpenedRepo(
+          repoId,
+          new FileRepositoryBuilder().setGitDir(origin.toFile()).setMustExist(true).build());
     } catch (Exception e) {
       return null;
     }
@@ -219,7 +235,7 @@ public class GitHostRoutes {
    * traversal is impossible. The lookup runs in its own transaction (this is a Vert.x worker thread
    * with no request context to bind a session from).
    */
-  private Repository openByName(RoutingContext rc) {
+  private OpenedRepo openByName(RoutingContext rc) {
     String projectId = rc.pathParam("projectId");
     String repoName = rc.pathParam("repoName");
     if (projectId == null || repoName == null) {
