@@ -5,8 +5,6 @@ import static org.hamcrest.Matchers.containsString;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import eu.wohlben.qits.domain.project.control.ProjectService;
-import eu.wohlben.qits.domain.repository.control.RepositoryService;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
@@ -16,6 +14,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.UUID;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -23,6 +22,11 @@ import org.junit.jupiter.api.Test;
  * workspace containers clone from and push to: a real {@code git clone} + {@code push} round-trip
  * moves the ref in the served bare origin, an unknown repo id is a 404, and a traversal-shaped id
  * is rejected. No docker is involved — this exercises only the git hosting.
+ *
+ * <p>The monorepo seeded its bare origins from a {@code /fixtures/testing-repo.git} classpath
+ * resource that an antrun step derived from a git submodule, and drove the name-addressed cases
+ * through the projects/repositories import path. Neither exists here, so the origin is built
+ * in-JVM by {@link #seedOrigin()} and the alias table is {@link FakeRepositoryNameResolver}.
  */
 @QuarkusTest
 public class GitHostTest {
@@ -30,24 +34,42 @@ public class GitHostTest {
   @ConfigProperty(name = "qits.repositories.data-dir")
   String dataDir;
 
-  @Inject ProjectService projectService;
-  @Inject RepositoryService repositoryService;
+  @Inject FakeRepositoryNameResolver repositoryNames;
 
   @TestHTTPResource("/git")
   URL gitBase;
 
-  private final String fixtureUrl;
-
-  public GitHostTest() throws Exception {
-    fixtureUrl = getClass().getResource("/fixtures/testing-repo.git").toURI().getPath();
+  @BeforeEach
+  void resetAliases() {
+    repositoryNames.clear();
   }
 
-  /** Seeds a bare origin at {@code <data-dir>/<repoId>/origin} from the fixture. */
+  /**
+   * Seeds a bare origin at {@code <data-dir>/<repoId>/origin} — one commit on the default branch,
+   * built with the git CLI so the served repository is a real on-disk bare, exactly as {@code
+   * RepositoryService} would have cloned it.
+   */
   private String seedOrigin() throws Exception {
     String repoId = UUID.randomUUID().toString();
     Path origin = Path.of(dataDir, repoId, "origin");
     Files.createDirectories(origin.getParent());
-    runGit(null, "git", "clone", "--bare", fixtureUrl, origin.toString());
+
+    Path seed = Files.createTempDirectory("qits-githost-seed");
+    runGit(null, "git", "init", "-q", seed.toString());
+    Files.writeString(seed.resolve("README.md"), "seed\n");
+    runGit(seed, "git", "add", "README.md");
+    runGit(
+        seed,
+        "git",
+        "-c",
+        "user.email=qits@local",
+        "-c",
+        "user.name=qits",
+        "commit",
+        "-q",
+        "-m",
+        "seed");
+    runGit(null, "git", "clone", "-q", "--bare", seed.toString(), origin.toString());
     return repoId;
   }
 
@@ -130,14 +152,15 @@ public class GitHostTest {
 
   @Test
   public void nameAddressedCloneResolvesThroughTheAliasTable() throws Exception {
-    // The full import path registers the repo's url-basename ("testing-repo") as a project-scoped
+    // A repository import registers the repo's url-basename ("testing-repo") as a project-scoped
     // name alias, so it is servable at /git/<projectId>/<name> as well as /git/<repoId>.
-    var project = projectService.create("GitHost Names", null);
-    var repo = repositoryService.cloneRepository(fixtureUrl, null, project);
+    String projectId = UUID.randomUUID().toString();
+    String repoId = seedOrigin();
+    repositoryNames.register(projectId, "testing-repo", repoId);
 
     Path clone = Files.createTempDirectory("qits-githost-named-clone");
     Files.delete(clone);
-    runGit(null, "git", "clone", gitBase + "/" + project.id + "/testing-repo", clone.toString());
+    runGit(null, "git", "clone", gitBase + "/" + projectId + "/testing-repo", clone.toString());
     assertTrue(
         Files.exists(clone.resolve(".git")), "name-addressed clone should produce a working copy");
 
@@ -148,7 +171,7 @@ public class GitHostTest {
         null,
         "git",
         "clone",
-        gitBase + "/" + project.id + "/testing-repo.git",
+        gitBase + "/" + projectId + "/testing-repo.git",
         cloneDotGit.toString());
     assertTrue(
         Files.exists(cloneDotGit.resolve(".git")), "a .git suffix on the name still resolves");
@@ -156,17 +179,17 @@ public class GitHostTest {
     // The id-addressed route keeps working for the same repo (back-compat).
     given()
         .when()
-        .get("/git/" + repo.id + "/info/refs?service=git-upload-pack")
+        .get("/git/" + repoId + "/info/refs?service=git-upload-pack")
         .then()
         .statusCode(Response.Status.OK.getStatusCode());
   }
 
   @Test
   public void unknownNameInProjectIs404() {
-    var project = projectService.create("GitHost Missing Name", null);
+    String projectId = UUID.randomUUID().toString();
     given()
         .when()
-        .get("/git/" + project.id + "/no-such-name/info/refs?service=git-upload-pack")
+        .get("/git/" + projectId + "/no-such-name/info/refs?service=git-upload-pack")
         .then()
         .statusCode(Response.Status.NOT_FOUND.getStatusCode());
   }
