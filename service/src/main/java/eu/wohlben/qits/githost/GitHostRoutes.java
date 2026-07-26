@@ -1,13 +1,12 @@
 package eu.wohlben.qits.githost;
 
-import eu.wohlben.qits.domain.repository.persistence.RepositoryNameRepository;
-import io.quarkus.narayana.jta.QuarkusTransaction;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.ext.web.Router;
 import io.vertx.ext.web.RoutingContext;
 import io.vertx.ext.web.handler.BodyHandler;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -49,10 +48,10 @@ import org.jboss.logging.Logger;
  *       <data-dir>/<repoId>/origin} (back-compat: already-provisioned containers, metadata,
  *       discovery).
  *   <li><b>name-addressed</b> {@code /git/:projectId/:repoName} — a project's repositories served
- *       as siblings, {@code repoName} resolved through the {@link RepositoryNameRepository} alias
- *       table to a repo id. This is what lets committed relative submodule urls ({@code
- *       ../<name>.git}) resolve natively against a sibling — no {@code submodule.<name>.url}
- *       override.
+ *       as siblings, {@code repoName} resolved through the {@link RepositoryNameResolver} port to a
+ *       repo id. This is what lets committed relative submodule urls ({@code ../<name>.git})
+ *       resolve natively against a sibling — no {@code submodule.<name>.url} override. With no
+ *       resolver on the classpath the scheme answers 404 and only the id-addressed one is served.
  * </ul>
  *
  * <p>The three smart-HTTP endpoints hang off each scheme:
@@ -80,7 +79,7 @@ public class GitHostRoutes {
   @ConfigProperty(name = "qits.repositories.data-dir", defaultValue = "data/repositories")
   String dataDir;
 
-  @Inject RepositoryNameRepository repositoryNames;
+  @Inject Instance<RepositoryNameResolver> repositoryNames;
 
   @Inject CiPostReceiveNotifier ciNotifier;
 
@@ -229,28 +228,20 @@ public class GitHostRoutes {
 
   /**
    * Opens the repository addressed by {@code /git/:projectId/:repoName}: strips an optional {@code
-   * .git} suffix, resolves {@code (projectId, name)} through the alias table to a repo id, then
-   * opens that repo's on-disk origin. The path segments are only DB lookup keys (never filesystem
-   * paths — the resolved id is), and the resolved id is re-validated by {@link #open(String)}, so
-   * traversal is impossible. The lookup runs in its own transaction (this is a Vert.x worker thread
-   * with no request context to bind a session from).
+   * .git} suffix, resolves {@code (projectId, name)} through the {@link RepositoryNameResolver} to
+   * a repo id, then opens that repo's on-disk origin. The path segments are only lookup keys (never
+   * filesystem paths — the resolved id is), and the resolved id is re-validated by {@link
+   * #open(String)}, so traversal is impossible. With no resolver configured this is a 404.
    */
   private OpenedRepo openByName(RoutingContext rc) {
     String projectId = rc.pathParam("projectId");
     String repoName = rc.pathParam("repoName");
-    if (projectId == null || repoName == null) {
+    if (projectId == null || repoName == null || repositoryNames.isUnsatisfied()) {
       return null;
     }
     String name =
         repoName.endsWith(".git") ? repoName.substring(0, repoName.length() - 4) : repoName;
-    String repoId =
-        QuarkusTransaction.requiringNew()
-            .call(
-                () ->
-                    repositoryNames
-                        .findRepositoryByProjectAndName(projectId, name)
-                        .map(repo -> repo.id)
-                        .orElse(null));
+    String repoId = repositoryNames.get().resolveRepositoryId(projectId, name).orElse(null);
     return open(repoId);
   }
 
