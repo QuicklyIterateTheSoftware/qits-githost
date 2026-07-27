@@ -24,8 +24,8 @@ import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
 /**
- * The in-process git smart-HTTP server, mounted at {@code /git/*} so workspace containers can clone
- * and push over {@code http://<qits-host>:<port>/git/<repoId>}.
+ * The in-process git smart-HTTP server, mounted at {@code /artifacts/git/*} so workspace containers
+ * can clone and push over {@code http://<qits-host>:<port>/artifacts/git/<repoId>}.
  *
  * <p>Implemented as plain Vert.x routes driving JGit's {@link UploadPack}/{@link ReceivePack}
  * directly — deliberately NOT as a servlet. qits used to host this with JGit's {@code GitServlet}
@@ -35,8 +35,8 @@ import org.jboss.logging.Logger;
  * lets Quinoa serve the UI exactly as it does in a plain Quinoa app.
  *
  * <p>No authentication: repo ids are capability UUIDs, and the callers are workspace containers,
- * which cannot hold a user token — so {@code /git/*} deliberately stays on {@code QitsAuthPolicy}'s
- * public list in every auth build variant (container traffic reaches qits directly on qits-net,
+ * which cannot hold a user token — so {@code /artifacts/git/*} deliberately stays on {@code
+ * QitsAuthPolicy}'s public list in every auth build variant (container traffic reaches qits directly on qits-net,
  * bypassing any forward-auth proxy — see auth-core's {@code PublicPaths}). Anonymous fetch AND push
  * are both enabled. The git CLI ({@code GitExecutor}) remains the only thing that mutates
  * repositories; JGit here speaks the wire protocol and nothing else.
@@ -44,14 +44,15 @@ import org.jboss.logging.Logger;
  * <p>Two addressing schemes, both served:
  *
  * <ul>
- *   <li><b>id-addressed</b> {@code /git/:repoId} — the opaque UUID, resolving directly to {@code
- *       <data-dir>/<repoId>/origin} (back-compat: already-provisioned containers, metadata,
+ *   <li><b>id-addressed</b> {@code /artifacts/git/:repoId} — the opaque UUID, resolving directly to
+ *       {@code <data-dir>/<repoId>/origin} (back-compat: already-provisioned containers, metadata,
  *       discovery).
- *   <li><b>name-addressed</b> {@code /git/:projectId/:repoName} — a project's repositories served
- *       as siblings, {@code repoName} resolved through the {@link RepositoryNameResolver} port to a
- *       repo id. This is what lets committed relative submodule urls ({@code ../<name>.git})
- *       resolve natively against a sibling — no {@code submodule.<name>.url} override. With no
- *       resolver on the classpath the scheme answers 404 and only the id-addressed one is served.
+ *   <li><b>name-addressed</b> {@code /artifacts/git/:projectId/:repoName} — a project's
+ *       repositories served as siblings, {@code repoName} resolved through the {@link
+ *       RepositoryNameResolver} port to a repo id. This is what lets committed relative submodule
+ *       urls ({@code ../<name>.git}) resolve natively against a sibling — no {@code
+ *       submodule.<name>.url} override. With no resolver on the classpath the scheme answers 404
+ *       and only the id-addressed one is served.
  * </ul>
  *
  * <p>The three smart-HTTP endpoints hang off each scheme:
@@ -73,6 +74,16 @@ public class GitHostRoutes {
    */
   private static final String REPO_ID_PATTERN = "[A-Za-z0-9][A-Za-z0-9-]{0,63}";
 
+  /**
+   * The mount point, {@code /<gateway segment>/git}. {@code git} is a second-level segment beside
+   * {@code api} — it is a wire protocol spoken by {@code git}, not a JSON API, and it appears in no
+   * OpenAPI document. Git treats whatever comes before the suffixes as an opaque base and appends
+   * {@code /info/refs}, {@code /git-upload-pack} and {@code /git-receive-pack} itself, so a base of
+   * any depth works; this one is a cross-repo contract (qits-ci's pipeline-config fetch and the
+   * workspace daemon's provisioner both clone from it).
+   */
+  private static final String BASE = "/artifacts/git";
+
   private static final String UPLOAD = "git-upload-pack";
   private static final String RECEIVE = "git-receive-pack";
 
@@ -92,29 +103,36 @@ public class GitHostRoutes {
    * the on-disk bare, so they run on a worker thread. The POST bodies (packfiles) are buffered by a
    * {@link BodyHandler} first — fine at qits' single-node scale.
    *
+   * <p>{@link #BASE} is spelled out here as a literal because these are raw Vert.x routes: changing
+   * {@code quarkus.rest.path} moves the JAX-RS surface and leaves these exactly where they were.
+   * The gateway routes {@code /artifacts/*} verbatim, so the segment has to be in the route.
+   *
    * <p>The two-segment name-addressed routes and the one-segment id-addressed routes never collide:
-   * they differ in path length, so Vert.x dispatches each unambiguously.
+   * they differ in path length, so Vert.x dispatches each unambiguously. Prefixing both with the
+   * same fixed segment preserves that — four path segments against five — and every handler reads
+   * its parameters {@link RoutingContext#pathParam(String) by name}, never by position, so nothing
+   * here depends on where in the path a parameter happens to sit.
    */
   void init(@Observes Router router) {
-    router.get("/git/:repoId/info/refs").blockingHandler(rc -> infoRefs(rc, open(rc, "repoId")));
+    router.get(BASE + "/:repoId/info/refs").blockingHandler(rc -> infoRefs(rc, open(rc, "repoId")));
     router
-        .post("/git/:repoId/git-upload-pack")
+        .post(BASE + "/:repoId/git-upload-pack")
         .handler(BodyHandler.create())
         .blockingHandler(rc -> service(rc, UPLOAD, open(rc, "repoId")));
     router
-        .post("/git/:repoId/git-receive-pack")
+        .post(BASE + "/:repoId/git-receive-pack")
         .handler(BodyHandler.create())
         .blockingHandler(rc -> service(rc, RECEIVE, open(rc, "repoId")));
 
     router
-        .get("/git/:projectId/:repoName/info/refs")
+        .get(BASE + "/:projectId/:repoName/info/refs")
         .blockingHandler(rc -> infoRefs(rc, openByName(rc)));
     router
-        .post("/git/:projectId/:repoName/git-upload-pack")
+        .post(BASE + "/:projectId/:repoName/git-upload-pack")
         .handler(BodyHandler.create())
         .blockingHandler(rc -> service(rc, UPLOAD, openByName(rc)));
     router
-        .post("/git/:projectId/:repoName/git-receive-pack")
+        .post(BASE + "/:projectId/:repoName/git-receive-pack")
         .handler(BodyHandler.create())
         .blockingHandler(rc -> service(rc, RECEIVE, openByName(rc)));
   }
@@ -227,7 +245,8 @@ public class GitHostRoutes {
   }
 
   /**
-   * Opens the repository addressed by {@code /git/:projectId/:repoName}: strips an optional {@code
+   * Opens the repository addressed by {@code /artifacts/git/:projectId/:repoName}: strips an
+   * optional {@code
    * .git} suffix, resolves {@code (projectId, name)} through the {@link RepositoryNameResolver} to
    * a repo id, then opens that repo's on-disk origin. The path segments are only lookup keys (never
    * filesystem paths — the resolved id is), and the resolved id is re-validated by {@link

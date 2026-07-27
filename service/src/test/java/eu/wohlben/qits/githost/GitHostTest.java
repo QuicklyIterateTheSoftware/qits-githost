@@ -18,10 +18,14 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 /**
- * Verifies the in-process JGit smart-HTTP server ({@link GitHostRoutes} at {@code /git/*}) that
- * workspace containers clone from and push to: a real {@code git clone} + {@code push} round-trip
- * moves the ref in the served bare origin, an unknown repo id is a 404, and a traversal-shaped id
- * is rejected. No docker is involved — this exercises only the git hosting.
+ * Verifies the in-process JGit smart-HTTP server ({@link GitHostRoutes} at {@code
+ * /artifacts/git/*}) that workspace containers clone from and push to: a real {@code git clone} +
+ * {@code push} round-trip moves the ref in the served bare origin, an unknown repo id is a 404, and
+ * a traversal-shaped id is rejected. No docker is involved — this exercises only the git hosting.
+ *
+ * <p>The paths are spelled out absolutely on purpose. These routes are raw Vert.x and carry the
+ * gateway segment as a literal, so nothing in the JAX-RS configuration would catch them drifting —
+ * this suite is the only thing that does.
  *
  * <p>The monorepo seeded its bare origins from a {@code /fixtures/testing-repo.git} classpath
  * resource that an antrun step derived from a git submodule, and drove the name-addressed cases
@@ -36,7 +40,7 @@ public class GitHostTest {
 
   @Inject FakeRepositoryNameResolver repositoryNames;
 
-  @TestHTTPResource("/git")
+  @TestHTTPResource("/artifacts/git")
   URL gitBase;
 
   @BeforeEach
@@ -112,7 +116,7 @@ public class GitHostTest {
     String repoId = seedOrigin();
     given()
         .when()
-        .get("/git/" + repoId + "/info/refs?service=git-upload-pack")
+        .get("/artifacts/git/" + repoId + "/info/refs?service=git-upload-pack")
         .then()
         .statusCode(Response.Status.OK.getStatusCode())
         .contentType(containsString("git-upload-pack-advertisement"));
@@ -125,7 +129,7 @@ public class GitHostTest {
     String repoId = seedOrigin();
     given()
         .when()
-        .get("/git/" + repoId + "/info/refs")
+        .get("/artifacts/git/" + repoId + "/info/refs")
         .then()
         .statusCode(Response.Status.FORBIDDEN.getStatusCode());
   }
@@ -134,7 +138,7 @@ public class GitHostTest {
   public void unknownRepoIdIs404() {
     given()
         .when()
-        .get("/git/" + UUID.randomUUID() + "/info/refs?service=git-upload-pack")
+        .get("/artifacts/git/" + UUID.randomUUID() + "/info/refs?service=git-upload-pack")
         .then()
         .statusCode(Response.Status.NOT_FOUND.getStatusCode());
   }
@@ -145,7 +149,7 @@ public class GitHostTest {
     // than letting it walk out of the data dir.
     given()
         .when()
-        .get("/git/foo.bar/info/refs?service=git-upload-pack")
+        .get("/artifacts/git/foo.bar/info/refs?service=git-upload-pack")
         .then()
         .statusCode(Response.Status.NOT_FOUND.getStatusCode());
   }
@@ -153,7 +157,9 @@ public class GitHostTest {
   @Test
   public void nameAddressedCloneResolvesThroughTheAliasTable() throws Exception {
     // A repository import registers the repo's url-basename ("testing-repo") as a project-scoped
-    // name alias, so it is servable at /git/<projectId>/<name> as well as /git/<repoId>.
+    // name alias, so it is servable at /artifacts/git/<projectId>/<name> as well as
+    // /artifacts/git/<repoId>. The two schemes still differ in path length under the new prefix,
+    // which is what keeps Vert.x dispatching them unambiguously.
     String projectId = UUID.randomUUID().toString();
     String repoId = seedOrigin();
     repositoryNames.register(projectId, "testing-repo", repoId);
@@ -179,7 +185,7 @@ public class GitHostTest {
     // The id-addressed route keeps working for the same repo (back-compat).
     given()
         .when()
-        .get("/git/" + repoId + "/info/refs?service=git-upload-pack")
+        .get("/artifacts/git/" + repoId + "/info/refs?service=git-upload-pack")
         .then()
         .statusCode(Response.Status.OK.getStatusCode());
   }
@@ -189,7 +195,7 @@ public class GitHostTest {
     String projectId = UUID.randomUUID().toString();
     given()
         .when()
-        .get("/git/" + projectId + "/no-such-name/info/refs?service=git-upload-pack")
+        .get("/artifacts/git/" + projectId + "/no-such-name/info/refs?service=git-upload-pack")
         .then()
         .statusCode(Response.Status.NOT_FOUND.getStatusCode());
   }

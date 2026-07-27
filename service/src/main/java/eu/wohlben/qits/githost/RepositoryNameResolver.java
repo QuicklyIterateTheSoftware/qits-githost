@@ -13,9 +13,9 @@ import java.util.Optional;
  * application implements it (typically over that same alias table).
  *
  * <p><b>Optional</b> ({@code Instance<>}; absent is a supported configuration). Without an
- * implementation the name-addressed scheme {@code /git/:projectId/:repoName} answers 404 and the
- * id-addressed scheme {@code /git/:repoId} — the older of the two, and the daemon's existing
- * fallback — keeps working unchanged.
+ * implementation the name-addressed scheme {@code /artifacts/git/:projectId/:repoName} answers 404
+ * and the id-addressed scheme {@code /artifacts/git/:repoId} — the older of the two, and the
+ * daemon's existing fallback — keeps working unchanged.
  *
  * <p>Called on a Vert.x worker thread with no request context bound, so an implementation that
  * reads a database must open its own transaction (the monorepo's inline {@code
