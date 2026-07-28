@@ -31,7 +31,18 @@ import org.jboss.logging.Logger;
 public class CiPostReceiveNotifier {
 
   private static final Logger LOG = Logger.getLogger(CiPostReceiveNotifier.class);
-  private static final HttpClient CLIENT =
+
+  /**
+   * An <b>instance</b> field, not a static one, and that is a native-image constraint rather than a
+   * style preference: a static {@code HttpClient} is built while the class initialiser runs, which
+   * under GraalVM is image-build time, and native-image then refuses the image ("An object of type
+   * 'jdk.internal.net.http.HttpClientFacade' was found in the image heap"). Even if it were allowed
+   * it would be wrong — an {@code HttpClient} owns a selector thread and an executor, neither of
+   * which survives being frozen into a binary. This bean is {@code @ApplicationScoped}, so there is
+   * still exactly one client per process; it is now created when the process starts rather than
+   * when the image is compiled.
+   */
+  private final HttpClient client =
       HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build();
 
   @ConfigProperty(name = "qits.ci.intake-url")
@@ -77,7 +88,7 @@ public class CiPostReceiveNotifier {
         .map(String::trim)
         .filter(t -> !t.isEmpty())
         .ifPresent(t -> request.header("X-CI-Token", t));
-    CLIENT
+    client
         .sendAsync(request.build(), HttpResponse.BodyHandlers.discarding())
         .whenComplete(
             (response, failure) -> {

@@ -240,6 +240,13 @@ public class GitHostRoutes {
           repoId,
           new FileRepositoryBuilder().setGitDir(origin.toFile()).setMustExist(true).build());
     } catch (Exception e) {
+      // A directory that exists but will not open is a different situation from one that is
+      // absent, and both answer 404 — so without this line the two are indistinguishable from
+      // outside. That mattered: a native build failed here for every repository (JGit's resource
+      // bundles were not in the image) and the only symptom was a 404 that looked like an unknown
+      // id. Debug rather than warn, because a malformed directory under the data dir is a
+      // deployment fact, not an error this process can act on.
+      LOG.debugf(e, "git repository %s exists at %s but could not be opened", repoId, origin);
       return null;
     }
   }
