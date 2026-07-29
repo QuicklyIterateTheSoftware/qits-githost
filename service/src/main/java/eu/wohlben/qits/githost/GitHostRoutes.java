@@ -1,5 +1,6 @@
 package eu.wohlben.qits.githost;
 
+import io.quarkus.runtime.configuration.MemorySize;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.ext.web.Router;
 import io.vertx.ext.web.RoutingContext;
@@ -90,6 +91,22 @@ public class GitHostRoutes {
   @ConfigProperty(name = "qits.repositories.data-dir", defaultValue = "data/repositories")
   String dataDir;
 
+  /**
+   * The largest pack this host accepts, and the reason it is spelled out rather than inherited.
+   *
+   * <p>{@code BodyHandler.create()} is <em>not</em> unlimited: vertx-web's {@code BodyHandlerImpl}
+   * defaults its {@code bodyLimit} to 10 MiB. So until this existed every push over 10 MB was
+   * silently 413'd — not at the 64M this service's config comment claimed, and not at the global
+   * ceiling the README described either. Both were wrong about which number bound.
+   *
+   * <p>It must also stay well below {@code quarkus.http.limits.max-body-size}, which the OCI
+   * registry raised to 1088M. That ceiling is sized for a layer that streams to disk; a pack goes
+   * through a {@link BodyHandler} into memory, so inheriting it would turn a large push into a
+   * gigabyte-sized heap allocation on a deliberately unauthenticated route.
+   */
+  @ConfigProperty(name = "qits.repositories.git.max-pack-size", defaultValue = "64M")
+  MemorySize maxPackSize;
+
   @Inject Instance<RepositoryNameResolver> repositoryNames;
 
   @Inject CiPostReceiveNotifier ciNotifier;
@@ -101,7 +118,9 @@ public class GitHostRoutes {
    * Register the routes on the main Vert.x router (root path — NOT under {@code
    * quarkus.rest.path}). Blocking: JGit's UploadPack/ReceivePack do synchronous stream I/O against
    * the on-disk bare, so they run on a worker thread. The POST bodies (packfiles) are buffered by a
-   * {@link BodyHandler} first — fine at qits' single-node scale.
+   * {@link BodyHandler} first — fine at qits' single-node scale, and bounded by {@link
+   * #maxPackSize} rather than by the global wire ceiling, which the OCI registry raised past
+   * anything that should be held in memory.
    *
    * <p>{@link #BASE} is spelled out here as a literal because these are raw Vert.x routes: changing
    * {@code quarkus.rest.path} moves the JAX-RS surface and leaves these exactly where they were.
@@ -117,11 +136,11 @@ public class GitHostRoutes {
     router.get(BASE + "/:repoId/info/refs").blockingHandler(rc -> infoRefs(rc, open(rc, "repoId")));
     router
         .post(BASE + "/:repoId/git-upload-pack")
-        .handler(BodyHandler.create())
+        .handler(packBodyHandler())
         .blockingHandler(rc -> service(rc, UPLOAD, open(rc, "repoId")));
     router
         .post(BASE + "/:repoId/git-receive-pack")
-        .handler(BodyHandler.create())
+        .handler(packBodyHandler())
         .blockingHandler(rc -> service(rc, RECEIVE, open(rc, "repoId")));
 
     router
@@ -129,12 +148,22 @@ public class GitHostRoutes {
         .blockingHandler(rc -> infoRefs(rc, openByName(rc)));
     router
         .post(BASE + "/:projectId/:repoName/git-upload-pack")
-        .handler(BodyHandler.create())
+        .handler(packBodyHandler())
         .blockingHandler(rc -> service(rc, UPLOAD, openByName(rc)));
     router
         .post(BASE + "/:projectId/:repoName/git-receive-pack")
-        .handler(BodyHandler.create())
+        .handler(packBodyHandler())
         .blockingHandler(rc -> service(rc, RECEIVE, openByName(rc)));
+  }
+
+  /**
+   * The pack body handler, with its limit stated. See {@link #maxPackSize} for why leaving it at
+   * {@code BodyHandler.create()}'s default was a bug rather than a choice. File uploads are off:
+   * these routes carry a single binary pack, never a multipart form, and the default would have the
+   * handler spooling into a {@code file-uploads} directory nothing ever reads.
+   */
+  private BodyHandler packBodyHandler() {
+    return BodyHandler.create(false).setBodyLimit(maxPackSize.asLongValue());
   }
 
   /** {@code GET …/info/refs?service=…} — the smart-HTTP ref advertisement. */

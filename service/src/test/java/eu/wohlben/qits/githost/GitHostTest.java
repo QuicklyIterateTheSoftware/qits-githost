@@ -12,6 +12,7 @@ import jakarta.ws.rs.core.Response;
 import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Random;
 import java.util.UUID;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.junit.jupiter.api.BeforeEach;
@@ -109,6 +110,40 @@ public class GitHostTest {
     // The ref moved in the served bare origin.
     String originSha = runGit(origin, "git", "rev-parse", "refs/heads/" + branch).trim();
     assertEquals(pushedSha, originSha, "push should have advanced the origin's branch ref");
+  }
+
+  @Test
+  public void aPushLargerThanTheBodyHandlerDefaultSucceeds() throws Exception {
+    // Regression guard for a silent 10 MiB cap. BodyHandler.create() is not unlimited: vertx-web's
+    // BodyHandlerImpl defaults bodyLimit to 10485760, so every push above that was 413'd — while
+    // this service's config comment and the README both said the binding number was 64M. The routes
+    // now set the limit explicitly (qits.repositories.git.max-pack-size).
+    //
+    // 12 MB of incompressible bytes: git deflates the pack, so a compressible file would ride under
+    // the old cap and prove nothing. It also puts the push past http.postBuffer (1 MB by default),
+    // which is what makes git send it chunked — the encoding where the global wire ceiling does not
+    // apply and only the BodyHandler's own limit does.
+    String repoId = seedOrigin();
+    Path origin = Path.of(dataDir, repoId, "origin");
+    Path clone = Files.createTempDirectory("qits-githost-big-clone");
+    Files.delete(clone);
+    runGit(null, "git", "clone", gitBase + "/" + repoId, clone.toString());
+
+    byte[] incompressible = new byte[12 * 1024 * 1024];
+    new Random(20260729L).nextBytes(incompressible);
+    Files.write(clone.resolve("big.bin"), incompressible);
+
+    String branch = runGit(clone, "git", "rev-parse", "--abbrev-ref", "HEAD").trim();
+    runGit(clone, "git", "add", "big.bin");
+    runGit(
+        clone, "git", "-c", "user.email=qits@local", "-c", "user.name=qits", "commit", "-m", "big");
+    String pushedSha = runGit(clone, "git", "rev-parse", "HEAD").trim();
+    runGit(clone, "git", "push", "origin", branch);
+
+    assertEquals(
+        pushedSha,
+        runGit(origin, "git", "rev-parse", "refs/heads/" + branch).trim(),
+        "a pack larger than BodyHandler's 10 MiB default must reach the origin");
   }
 
   @Test
