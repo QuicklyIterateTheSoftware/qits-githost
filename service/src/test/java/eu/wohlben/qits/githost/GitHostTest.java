@@ -55,27 +55,7 @@ public class GitHostTest {
    * RepositoryService} would have cloned it.
    */
   private String seedOrigin() throws Exception {
-    String repoId = UUID.randomUUID().toString();
-    Path origin = Path.of(dataDir, repoId, "origin");
-    Files.createDirectories(origin.getParent());
-
-    Path seed = Files.createTempDirectory("qits-githost-seed");
-    runGit(null, "git", "init", "-q", seed.toString());
-    Files.writeString(seed.resolve("README.md"), "seed\n");
-    runGit(seed, "git", "add", "README.md");
-    runGit(
-        seed,
-        "git",
-        "-c",
-        "user.email=qits@local",
-        "-c",
-        "user.name=qits",
-        "commit",
-        "-q",
-        "-m",
-        "seed");
-    runGit(null, "git", "clone", "-q", "--bare", seed.toString(), origin.toString());
-    return repoId;
+    return GitHostFixture.seedOrigin(dataDir);
   }
 
   @Test
@@ -225,6 +205,183 @@ public class GitHostTest {
         .statusCode(Response.Status.OK.getStatusCode());
   }
 
+  // --- the default branch's seatbelt (ProtectedRefHook) -------------------------------------------
+  // These run under the SHIPPED configuration: qits.repositories.git.protect-default-branch=false
+  // and no qits.repositories.git.push-token at all. So they cover the two halves this profile can
+  // prove — that the feature is inert as shipped, and that a repository which opts IN through its
+  // own bare config gets the whole refuse/accept matrix, with the token unconfigured (nothing
+  // matches). The configured and configured-empty token cases are different process configurations
+  // and live in GitHostPushTokenTest / GitHostEmptyPushTokenTest.
+
+  @Test
+  public void theReceivePackAdvertisementOffersPushOptions() throws Exception {
+    // The silent-failure guard. A client only sends `-o` if the capability was advertised HERE, in
+    // infoRefs — so a ReceivePack that allows push options on the POST but not on the GET produces
+    // the confusing failure where every option is simply never seen and every bypass is refused.
+    // The two setAllowPushOptions calls are one feature; this asserts the half that has no other
+    // symptom.
+    String repoId = seedOrigin();
+    given()
+        .when()
+        .get("/artifacts/git/" + repoId + "/info/refs?service=git-receive-pack")
+        .then()
+        .statusCode(Response.Status.OK.getStatusCode())
+        .contentType(containsString("git-receive-pack-advertisement"))
+        .body(containsString("push-options"));
+  }
+
+  @Test
+  public void protectionIsInertInTheShippedDefaults() throws Exception {
+    // The trap this workstream is built around: the change ships by a push to the very service that
+    // would refuse it. Default-off is what makes that safe, and "off" has to mean off for the
+    // roughest push there is — a force push over the default branch, with no option supplied.
+    String repoId = seedOrigin();
+    Path origin = GitHostFixture.origin(dataDir, repoId);
+    Path clone = GitHostFixture.clone(gitBase, repoId);
+
+    GitHostFixture.rewriteTip(clone, "rewritten with no option at all");
+    String rewritten = GitHostFixture.head(clone);
+    runGit(clone, "git", "push", "--force", "origin", "main");
+
+    assertEquals(
+        rewritten,
+        GitHostFixture.refSha(origin, "refs/heads/main"),
+        "with protection off a plain force push must behave exactly as it always did");
+  }
+
+  @Test
+  public void aDirectUpdateOfTheProtectedRefIsRefusedWithAnActionableMessage() throws Exception {
+    String repoId = seedOrigin();
+    Path origin = GitHostFixture.origin(dataDir, repoId);
+    GitHostFixture.protectDefaultBranch(origin, true);
+    Path clone = GitHostFixture.clone(gitBase, repoId);
+    String before = GitHostFixture.refSha(origin, "refs/heads/main");
+
+    GitHostFixture.commitFile(clone, "direct.txt", "by hand\n", "direct");
+    String refusal = GitHostFixture.gitExpectingFailure(clone, "git", "push", "origin", "main");
+
+    assertTrue(refusal.contains("protected ref refs/heads/main"), refusal);
+    // A refusal a human cannot act on is a worse bug than the accidental push, so both doors are
+    // named: where releases go, and what the alternative requires.
+    assertTrue(refusal.contains("/workspaces/api/workspaces/{id}/integrate"), refusal);
+    assertTrue(refusal.contains("qits.token="), refusal);
+    assertEquals(
+        before,
+        GitHostFixture.refSha(origin, "refs/heads/main"),
+        "a refused push must leave the ref exactly where it was");
+  }
+
+  @Test
+  public void theReleaseOptionAcceptsAFastForward() throws Exception {
+    // The sanctioned domain door: what qits-workspaces' integrate flow sends, and nothing else.
+    String repoId = seedOrigin();
+    Path origin = GitHostFixture.origin(dataDir, repoId);
+    GitHostFixture.protectDefaultBranch(origin, true);
+    Path clone = GitHostFixture.clone(gitBase, repoId);
+
+    GitHostFixture.commitFile(clone, "release.txt", "2026.731.193059\n", "release");
+    String released = GitHostFixture.head(clone);
+    runGit(clone, "git", "push", "-o", "qits.release", "origin", "main");
+
+    assertEquals(released, GitHostFixture.refSha(origin, "refs/heads/main"));
+  }
+
+  @Test
+  public void theReleaseOptionRefusesANonFastForward() throws Exception {
+    // Fast-forward-only is what bounds the release door: the integrate flow's push IS the
+    // compare-and-swap that makes two concurrent releases resolve into one, and granting it force
+    // would defeat that silently.
+    String repoId = seedOrigin();
+    Path origin = GitHostFixture.origin(dataDir, repoId);
+    GitHostFixture.protectDefaultBranch(origin, true);
+    Path clone = GitHostFixture.clone(gitBase, repoId);
+    String before = GitHostFixture.refSha(origin, "refs/heads/main");
+
+    GitHostFixture.rewriteTip(clone, "rewritten history");
+    String refusal =
+        GitHostFixture.gitExpectingFailure(
+            clone, "git", "push", "--force", "-o", "qits.release", "origin", "main");
+
+    assertTrue(refusal.contains("fast-forward only"), refusal);
+    assertEquals(before, GitHostFixture.refSha(origin, "refs/heads/main"));
+  }
+
+  @Test
+  public void deletingTheProtectedRefIsRefusedWithAndWithoutTheReleaseOption() throws Exception {
+    // The accidental `:main` is exactly what a seatbelt is for, and the release door never deletes.
+    String repoId = seedOrigin();
+    Path origin = GitHostFixture.origin(dataDir, repoId);
+    GitHostFixture.protectDefaultBranch(origin, true);
+    Path clone = GitHostFixture.clone(gitBase, repoId);
+    String before = GitHostFixture.refSha(origin, "refs/heads/main");
+
+    String bare = GitHostFixture.gitExpectingFailure(clone, "git", "push", "origin", ":main");
+    assertTrue(bare.contains("protected ref refs/heads/main"), bare);
+
+    String withRelease =
+        GitHostFixture.gitExpectingFailure(
+            clone, "git", "push", "-o", "qits.release", "origin", ":main");
+    assertTrue(withRelease.contains("never deletes it"), withRelease);
+
+    assertEquals(before, GitHostFixture.refSha(origin, "refs/heads/main"), "main must still exist");
+  }
+
+  @Test
+  public void creatingTheDefaultBranchIsAllowedWhileProtectionIsOn() throws Exception {
+    // An empty repository has no default branch to protect, and blocking the seeding push buys no
+    // safety — this is what keeps qits-local-up.sh's first-run push working with no option at all.
+    String repoId = GitHostFixture.emptyOrigin(dataDir);
+    Path origin = GitHostFixture.origin(dataDir, repoId);
+    GitHostFixture.protectDefaultBranch(origin, true);
+
+    Path local = GitHostFixture.localRepo();
+    String seeded = GitHostFixture.head(local);
+    runGit(local, "git", "push", gitBase + "/" + repoId, "main");
+
+    assertEquals(seeded, GitHostFixture.refSha(origin, "refs/heads/main"));
+  }
+
+  @Test
+  public void anyOtherBranchIsUntouchedByProtection() throws Exception {
+    // The protected ref is the bare's HEAD and nothing else. Workspace branches are force-pushed
+    // and deleted constantly, and this guard must be invisible to them.
+    String repoId = seedOrigin();
+    Path origin = GitHostFixture.origin(dataDir, repoId);
+    GitHostFixture.protectDefaultBranch(origin, true);
+    Path clone = GitHostFixture.clone(gitBase, repoId);
+
+    runGit(clone, "git", "switch", "-q", "-c", "workspace-branch");
+    GitHostFixture.commitFile(clone, "work.txt", "in progress\n", "work");
+    runGit(clone, "git", "push", "origin", "workspace-branch");
+    GitHostFixture.rewriteTip(clone, "reworked");
+    runGit(clone, "git", "push", "--force", "origin", "workspace-branch");
+    assertEquals(
+        GitHostFixture.head(clone), GitHostFixture.refSha(origin, "refs/heads/workspace-branch"));
+
+    runGit(clone, "git", "push", "origin", ":workspace-branch");
+    GitHostFixture.gitExpectingFailure(origin, "git", "rev-parse", "refs/heads/workspace-branch");
+  }
+
+  @Test
+  public void aPushTokenIsRefusedWhenNoneIsConfigured() throws Exception {
+    // Settled decision 3, and the half of it most easily got wrong: UNSET means nothing matches. A
+    // deployment with protection on and no token configured has no escape hatch at all, and the
+    // message says so rather than leaving the pusher guessing at a value.
+    String repoId = seedOrigin();
+    Path origin = GitHostFixture.origin(dataDir, repoId);
+    GitHostFixture.protectDefaultBranch(origin, true);
+    Path clone = GitHostFixture.clone(gitBase, repoId);
+    String before = GitHostFixture.refSha(origin, "refs/heads/main");
+
+    GitHostFixture.commitFile(clone, "guessed.txt", "let me in\n", "guess");
+    String refusal =
+        GitHostFixture.gitExpectingFailure(
+            clone, "git", "push", "-o", "qits.token=anything-at-all", "origin", "main");
+
+    assertTrue(refusal.contains("no push token configured"), refusal);
+    assertEquals(before, GitHostFixture.refSha(origin, "refs/heads/main"));
+  }
+
   @Test
   public void unknownNameInProjectIs404() {
     String projectId = UUID.randomUUID().toString();
@@ -236,17 +393,6 @@ public class GitHostTest {
   }
 
   private String runGit(Path cwd, String... command) throws Exception {
-    ProcessBuilder pb = new ProcessBuilder(command);
-    if (cwd != null) {
-      pb.directory(cwd.toFile());
-    }
-    pb.redirectErrorStream(true);
-    Process p = pb.start();
-    String out = new String(p.getInputStream().readAllBytes());
-    int exit = p.waitFor();
-    if (exit != 0) {
-      throw new RuntimeException("git " + String.join(" ", command) + " failed:\n" + out);
-    }
-    return out;
+    return GitHostFixture.git(cwd, command);
   }
 }

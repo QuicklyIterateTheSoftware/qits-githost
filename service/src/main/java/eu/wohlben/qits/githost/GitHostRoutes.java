@@ -42,6 +42,12 @@ import org.jboss.logging.Logger;
  * are both enabled. The git CLI ({@code GitExecutor}) remains the only thing that mutates
  * repositories; JGit here speaks the wire protocol and nothing else.
  *
+ * <p>One thing a push is checked against: {@link ProtectedRefHook}, the default branch's seatbelt.
+ * It is not authentication and is not an authorization system — it guards exactly one ref per repo
+ * (the bare's {@code HEAD}) against a reflex {@code git push … main}, and it ships inert. See that
+ * class for the mechanism, the two push-option bypasses and why they are options rather than
+ * headers.
+ *
  * <p>Two addressing schemes, both served:
  *
  * <ul>
@@ -110,6 +116,8 @@ public class GitHostRoutes {
   @Inject Instance<RepositoryNameResolver> repositoryNames;
 
   @Inject CiPostReceiveNotifier ciNotifier;
+
+  @Inject ProtectedRefHook protectedRefs;
 
   /** A resolved repository plus the id it resolved to (the post-receive hook needs the id). */
   private record OpenedRepo(String repoId, Repository repo) {}
@@ -196,6 +204,11 @@ public class GitHostRoutes {
       } else {
         ReceivePack rp = new ReceivePack(repo);
         rp.setBiDirectionalPipe(false);
+        // The ADVERTISEMENT half of push options, and the one that is easy to miss: a client only
+        // sends `-o` if the capability was offered here, so without this line the options in
+        // service() below are silently never seen and every guarded push is simply refused. The two
+        // calls are one feature spread over two ReceivePack instances — they move together.
+        rp.setAllowPushOptions(true);
         rp.sendAdvertisedRefs(adv);
       }
       rc.response()
@@ -230,6 +243,14 @@ public class GitHostRoutes {
       } else {
         ReceivePack rp = new ReceivePack(repo);
         rp.setBiDirectionalPipe(false);
+        // The RECEIVING half of push options — the advertisement in infoRefs() is the other, and
+        // neither works alone. This is the only bypass channel that behaves identically through all
+        // three doors this host is reachable through, because options ride inside the pack protocol
+        // while qits-gateway strips the whole X-Qits- header prefix unconditionally.
+        rp.setAllowPushOptions(true);
+        // The default branch's seatbelt. Inert unless qits.repositories.git.protect-default-branch
+        // (or the bare's own [qits] protectDefaultBranch) says otherwise — see ProtectedRefHook.
+        rp.setPreReceiveHook(protectedRefs);
         // The literal post-receive event the CI pipelines are named after (docs/epics/qits-ci/):
         // fires after the ref updates land, still inside receive() — the notifier is
         // fire-and-forget so the push response is never delayed.
