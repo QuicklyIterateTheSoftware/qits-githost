@@ -1,6 +1,8 @@
 package eu.wohlben.qits.githost;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.quarkus.oidc.client.OidcClient;
+import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import java.net.URI;
@@ -26,6 +28,12 @@ import org.jboss.logging.Logger;
  * <p>Fire-and-forget, the {@code OtelForwarder} idiom: the hook fires inside {@code
  * ReceivePack.receive(...)} — before the push response is written — so this must never block or
  * throw; failures are swallowed at debug (a missed event just means no advisory run for that push).
+ *
+ * <p><b>The credential.</b> qits-ci's intake wants a bearer minted by qits-idp for {@code
+ * aud=qits-ci}; quarkus-oidc-client fetches and caches it and this class only attaches it. Both the
+ * bearer and the older {@code X-CI-Token} are optional and independent, so a deployment can be on
+ * either, both or neither — which is what lets the two services cut over one at a time. With no
+ * client credentials configured nothing is fetched and the POST goes out exactly as it always has.
  */
 @ApplicationScoped
 public class CiPostReceiveNotifier {
@@ -52,6 +60,18 @@ public class CiPostReceiveNotifier {
   // no header, matching the filter's open mode.
   @ConfigProperty(name = "qits.ci.token")
   Optional<String> token;
+
+  /**
+   * Whether a machine token is attached. It is the oidc-client's own switch rather than a key of our
+   * own, so there is one thing to set and nothing to keep in step: with the client disabled there
+   * are no credentials to fetch a token with, and asking it anyway throws. Off is the shipped
+   * default and means "post as this service always has".
+   */
+  @ConfigProperty(name = "quarkus.oidc-client.client-enabled", defaultValue = "false")
+  boolean machineTokenEnabled;
+
+  /** Fetches, caches and refreshes the bearer for qits-ci; see the oidc-client block in config. */
+  @Inject OidcClient oidcClient;
 
   @Inject ObjectMapper objectMapper;
 
@@ -88,8 +108,35 @@ public class CiPostReceiveNotifier {
         .map(String::trim)
         .filter(t -> !t.isEmpty())
         .ifPresent(t -> request.header("X-CI-Token", t));
+    // Non-blocking like everything else on this path: the token fetch is a Uni, and the send hangs
+    // off its completion rather than waiting for it.
+    bearer()
+        .subscribe()
+        .with(
+            bearer -> {
+              bearer.ifPresent(b -> request.header("Authorization", "Bearer " + b));
+              send(request.build(), repoId, branch);
+            },
+            failure -> {
+              // A token we could not get is not a reason to drop the event. qits-ci with its gate
+              // off takes it either way, and with the gate on it refuses it — which is the right
+              // answer for a caller that cannot prove who it is.
+              LOG.debugf("CI token for %s@%s unavailable: %s", repoId, branch, failure);
+              send(request.build(), repoId, branch);
+            });
+  }
+
+  /** The bearer for qits-ci, or empty when this deployment has no client credentials. */
+  private Uni<Optional<String>> bearer() {
+    if (!machineTokenEnabled) {
+      return Uni.createFrom().item(Optional.empty());
+    }
+    return oidcClient.getTokens().map(tokens -> Optional.of(tokens.getAccessToken()));
+  }
+
+  private void send(HttpRequest request, String repoId, String branch) {
     client
-        .sendAsync(request.build(), HttpResponse.BodyHandlers.discarding())
+        .sendAsync(request, HttpResponse.BodyHandlers.discarding())
         .whenComplete(
             (response, failure) -> {
               if (failure != null) {
