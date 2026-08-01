@@ -382,6 +382,201 @@ public class GitHostTest {
     assertEquals(before, GitHostFixture.refSha(origin, "refs/heads/main"));
   }
 
+  // --- tags (the release flow's checkout target and its uniqueness guarantee) ---------------------
+  // Nothing here had ever been measured: no test in this repo pushed a tag, so JGit's acceptance of
+  // one was inferred from ReceivePack's defaults. These five cases are that measurement, and the
+  // release-split design rests on them.
+
+  @Test
+  public void anAnnotatedTagPushIsAcceptedWhileTheDefaultBranchIsProtected() throws Exception {
+    // ProtectedRefHook guards exactly one ref name — the bare's HEAD — so a tag is simply another
+    // ref to it. Measured rather than reasoned: this is the answer that decides whether the release
+    // can carry a tag at all.
+    String repoId = seedOrigin();
+    Path origin = GitHostFixture.origin(dataDir, repoId);
+    GitHostFixture.protectDefaultBranch(origin, true);
+    Path clone = GitHostFixture.clone(gitBase, repoId);
+
+    String tagObject = GitHostFixture.tagObject(clone, "v2026.801.63140", "release");
+    runGit(clone, "git", "push", "origin", tagObject + ":refs/tags/v2026.801.63140");
+
+    assertEquals(
+        tagObject,
+        GitHostFixture.refSha(origin, "refs/tags/v2026.801.63140"),
+        "an annotated tag must land with protection on and no push option at all");
+    assertEquals(
+        "tag",
+        GitHostFixture.objectType(origin, tagObject),
+        "the ref names the TAG OBJECT, not the commit — peeling is the consumer's job");
+  }
+
+  @Test
+  public void onePushCarriesTheBranchAndTheTagAsOneReceivePack() throws Exception {
+    // The shape the release flow uses: `git push -o qits.release origin HEAD:refs/heads/main
+    // <tagobj>:refs/tags/<version>`. One push is one receive-pack, so both commands ride one
+    // pre-receive and one post-receive — which is why the single push option authorises the branch
+    // update while the tag rides along beside it.
+    String repoId = seedOrigin();
+    Path origin = GitHostFixture.origin(dataDir, repoId);
+    GitHostFixture.protectDefaultBranch(origin, true);
+    Path clone = GitHostFixture.clone(gitBase, repoId);
+
+    GitHostFixture.commitFile(clone, "release.txt", "2026.801.63140\n", "release");
+    String released = GitHostFixture.head(clone);
+    String tagObject = GitHostFixture.tagObject(clone, "v2026.801.63140", "release");
+
+    String trace =
+        GitHostFixture.gitTracingHttp(
+            clone,
+            "git",
+            "push",
+            "-o",
+            "qits.release",
+            "origin",
+            "HEAD:refs/heads/main",
+            tagObject + ":refs/tags/v2026.801.63140");
+
+    assertEquals(
+        1L,
+        GitHostFixture.receivePackRequests(trace),
+        "both refs must ride ONE receive-pack, or they are two pushes and two hooks");
+    assertEquals(released, GitHostFixture.refSha(origin, "refs/heads/main"));
+    assertEquals(tagObject, GitHostFixture.refSha(origin, "refs/tags/v2026.801.63140"));
+  }
+
+  @Test
+  public void anAtomicPushIsSupportedAndARefusedBranchTakesTheTagWithIt() throws Exception {
+    // The measurement qits-workspaces needs before it chooses between one atomic push and a
+    // sequence, and the answer was not the one JGit's ref backend suggests: this host DOES
+    // advertise `atomic`, so the capability is negotiated and both commands stand or fall together.
+    String repoId = seedOrigin();
+    Path origin = GitHostFixture.origin(dataDir, repoId);
+    GitHostFixture.protectDefaultBranch(origin, true);
+    Path clone = GitHostFixture.clone(gitBase, repoId);
+    String before = GitHostFixture.refSha(origin, "refs/heads/main");
+
+    given()
+        .when()
+        .get("/artifacts/git/" + repoId + "/info/refs?service=git-receive-pack")
+        .then()
+        .statusCode(Response.Status.OK.getStatusCode())
+        .body(containsString("atomic"));
+
+    // --force is what makes this a measurement of the HOST rather than of the client: without it
+    // git refuses a non-fast-forward locally and never sends anything, so the server's atomic
+    // handling is never reached. Forced, both commands go out and ProtectedRefHook refuses the
+    // branch — the release door is fast-forward only.
+    GitHostFixture.rewriteTip(clone, "rewritten history");
+    String tagObject = GitHostFixture.tagObject(clone, "v1", "atomic probe");
+
+    String atomic =
+        GitHostFixture.gitExpectingFailure(
+            clone,
+            "git",
+            "push",
+            "--atomic",
+            "--force",
+            "-o",
+            "qits.release",
+            "origin",
+            "HEAD:refs/heads/main",
+            tagObject + ":refs/tags/v1");
+    assertTrue(atomic.contains("fast-forward only"), atomic);
+    assertEquals(before, GitHostFixture.refSha(origin, "refs/heads/main"));
+    GitHostFixture.gitExpectingFailure(origin, "git", "rev-parse", "--verify", "refs/tags/v1");
+
+    // And the contrast that makes the flag worth passing: the same push without --atomic applies
+    // the tag anyway, leaving a tag for a release that never landed.
+    String partial =
+        GitHostFixture.gitExpectingFailure(
+            clone,
+            "git",
+            "push",
+            "--force",
+            "-o",
+            "qits.release",
+            "origin",
+            "HEAD:refs/heads/main",
+            tagObject + ":refs/tags/v1");
+    assertTrue(partial.contains("fast-forward only"), partial);
+    assertEquals(before, GitHostFixture.refSha(origin, "refs/heads/main"));
+    assertEquals(
+        tagObject,
+        GitHostFixture.refSha(origin, "refs/tags/v1"),
+        "without --atomic a refused branch command does not roll the tag back");
+  }
+
+  @Test
+  public void pushingATagThatAlreadyExistsIsRefusedUnlessItIsForced() throws Exception {
+    // Settled decision 3: the tag IS the version-uniqueness guarantee, because a second release
+    // stamped the same version cannot create the ref a second time. Where the refusal comes from is
+    // worth knowing precisely — the git CLI refuses any non-forced update of an existing
+    // refs/tags/* ref off the advertisement, while this host allows it under --force, exactly as
+    // JGit's receive.denyNonFastForwards default says it should. So the guarantee holds for the
+    // release flow (which never forces) and is a client-side one.
+    String repoId = seedOrigin();
+    Path origin = GitHostFixture.origin(dataDir, repoId);
+    Path clone = GitHostFixture.clone(gitBase, repoId);
+
+    String first = GitHostFixture.tagObject(clone, "v1", "first release");
+    runGit(clone, "git", "push", "origin", first + ":refs/tags/v1");
+
+    GitHostFixture.commitFile(clone, "second.txt", "again\n", "second");
+    String second = GitHostFixture.tagObject(clone, "v1", "second release, same version");
+    String refusal =
+        GitHostFixture.gitExpectingFailure(
+            clone, "git", "push", "origin", second + ":refs/tags/v1");
+
+    assertTrue(refusal.contains("already exists"), refusal);
+    assertEquals(
+        first,
+        GitHostFixture.refSha(origin, "refs/tags/v1"),
+        "the first release's tag must survive the second release's push");
+
+    runGit(clone, "git", "push", "--force", "origin", second + ":refs/tags/v1");
+    assertEquals(
+        second,
+        GitHostFixture.refSha(origin, "refs/tags/v1"),
+        "the host itself allows a forced tag move, so the release push must never force");
+  }
+
+  @Test
+  public void aDuplicateTagDoesNotStopTheBranchHalfOfTheSamePush() throws Exception {
+    // What a duplicate version costs WITHOUT --atomic, which is the case the release flow has to
+    // choose against: the tag command is rejected and the branch command lands anyway, so "the tag
+    // guarantees uniqueness" would mean the release fails with its merge commit already on main.
+    // The push above shows --atomic is available and prevents exactly this.
+    String repoId = seedOrigin();
+    Path origin = GitHostFixture.origin(dataDir, repoId);
+    GitHostFixture.protectDefaultBranch(origin, true);
+    Path clone = GitHostFixture.clone(gitBase, repoId);
+
+    String first = GitHostFixture.tagObject(clone, "v1", "first release");
+    runGit(clone, "git", "push", "origin", first + ":refs/tags/v1");
+
+    GitHostFixture.commitFile(clone, "again.txt", "same version\n", "second release");
+    String released = GitHostFixture.head(clone);
+    String second = GitHostFixture.tagObject(clone, "v1", "second release, same version");
+
+    String refusal =
+        GitHostFixture.gitExpectingFailure(
+            clone,
+            "git",
+            "push",
+            "-o",
+            "qits.release",
+            "origin",
+            "HEAD:refs/heads/main",
+            second + ":refs/tags/v1");
+
+    assertTrue(refusal.contains("already exists"), refusal);
+    assertEquals(first, GitHostFixture.refSha(origin, "refs/tags/v1"), "the tag did not move");
+    assertEquals(
+        released,
+        GitHostFixture.refSha(origin, "refs/heads/main"),
+        "and main moved anyway — the two commands are independent");
+  }
+
   @Test
   public void unknownNameInProjectIs404() {
     String projectId = UUID.randomUUID().toString();

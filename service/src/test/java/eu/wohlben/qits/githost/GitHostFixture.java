@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.fail;
 import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -116,6 +117,47 @@ final class GitHostFixture {
     return git(repo, "git", "rev-parse", ref).trim();
   }
 
+  /** {@code commit}, {@code tag}, {@code blob} — how a pushed tag ref is proved to be annotated. */
+  static String objectType(Path repo, String sha) throws Exception {
+    return git(repo, "git", "cat-file", "-t", sha).trim();
+  }
+
+  /**
+   * Builds an annotated tag object and hands back its sha, leaving <b>no ref behind</b>.
+   *
+   * <p>This is the release flow's own dance, not a test convenience: {@code prepareWorktree} runs
+   * {@code git worktree add} on the served bare, and a linked worktree shares the common ref store —
+   * so {@code git tag -a} there writes {@code refs/tags/…} straight into the bare with no push at
+   * all, and the push that follows reports {@code [up to date]} with zero receive commands.
+   * Creating the object, capturing its sha and deleting the ref is what turns the tag back into
+   * something a push actually carries.
+   */
+  static String tagObject(Path repo, String name, String message) throws Exception {
+    gitCommitting(repo, "tag", "-a", name, "-m", message);
+    String sha = refSha(repo, name);
+    git(repo, "git", "tag", "-d", name);
+    return sha;
+  }
+
+  /**
+   * Runs git with {@code GIT_CURL_VERBOSE}, so the caller can count the HTTP requests a single push
+   * made. That is the only way to tell "one receive-pack carrying two commands" from "two pushes"
+   * from outside the server, and the distinction is the whole point of pushing the branch and the
+   * tag together.
+   */
+  static String gitTracingHttp(Path cwd, String... command) throws Exception {
+    Result result = run(cwd, Map.of("GIT_CURL_VERBOSE", "1"), command);
+    if (result.exit() != 0) {
+      throw new RuntimeException("git " + String.join(" ", command) + " failed:\n" + result.out());
+    }
+    return result.out();
+  }
+
+  /** How many times {@code git-receive-pack} was POSTed, out of {@link #gitTracingHttp} output. */
+  static long receivePackRequests(String trace) {
+    return trace.lines().filter(l -> l.contains("POST") && l.contains("git-receive-pack")).count();
+  }
+
   /** Sets (or clears, with a null value) the bare's own {@code [qits] protectDefaultBranch}. */
   static void protectDefaultBranch(Path origin, Boolean value) throws Exception {
     if (value == null) {
@@ -150,10 +192,16 @@ final class GitHostFixture {
   private record Result(int exit, String out) {}
 
   private static Result run(Path cwd, String... command) throws Exception {
+    return run(cwd, Map.of(), command);
+  }
+
+  private static Result run(Path cwd, Map<String, String> environment, String... command)
+      throws Exception {
     ProcessBuilder pb = new ProcessBuilder(command);
     if (cwd != null) {
       pb.directory(cwd.toFile());
     }
+    pb.environment().putAll(environment);
     pb.redirectErrorStream(true);
     Process p = pb.start();
     String out = new String(p.getInputStream().readAllBytes());
