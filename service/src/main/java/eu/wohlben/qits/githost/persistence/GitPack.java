@@ -12,8 +12,9 @@ import jakarta.persistence.Table;
  * DFS-backed git repository has.
  *
  * <p><b>The platform does not garbage collect git, deliberately.</b> A pack's blobs are immutable
- * and the blob store has no delete, so a repack does not reclaim — it duplicates: the new pack is
- * written, the packs it replaced lose their rows here, and their bytes stay forever. Measured on the
+ * and nothing frees them — the blob store's one delete is package-private to its sweep, which does
+ * not run — so a repack does not reclaim: it duplicates. The new pack is written, the packs it
+ * replaced lose their rows here, and their bytes stay forever. Measured on the
  * platform's largest real repository, one {@code DfsGarbageCollector} run took it from 7.8 MB to 15
  * MB. The accepted cost instead is roughly three blobs and three rows per push, about 75 blobs per
  * active repository per year. Deleting a row here frees nothing.
