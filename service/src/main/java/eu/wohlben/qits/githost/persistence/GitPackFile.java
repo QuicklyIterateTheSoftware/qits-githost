@@ -8,8 +8,8 @@ import jakarta.persistence.IdClass;
 import jakarta.persistence.Table;
 
 /**
- * One file of one pack, and the blob that holds it: {@code pack}, {@code idx}, {@code reftable}, and
- * whatever a later JGit adds.
+ * One file of one pack, and the blob that holds it: {@code pack}, {@code idx}, {@code ref} — a
+ * reftable's extension, measured through the adapter — and whatever a later JGit adds.
  *
  * <p>{@link #extension} is a string rather than a JGit {@code PackExt}, on purpose: a stored row
  * must not carry another library's enum, or an upgrade that renames one silently changes what the

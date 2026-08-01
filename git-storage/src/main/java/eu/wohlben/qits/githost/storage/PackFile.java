@@ -6,7 +6,9 @@ import java.util.Objects;
  * One file of a pack, and the blob that holds it.
  *
  * @param extension the file extension JGit knows the file by — {@code pack}, {@code idx}, {@code
- *     reftable}, {@code bitmap}, and whatever a later JGit adds. A <b>string</b>, deliberately: a
+ *     ref} (a reftable's {@code PackExt.REFTABLE} spells its extension {@code ref}, measured through
+ *     the adapter, not {@code reftable}), {@code bitmap}, and whatever a later JGit adds. A
+ *     <b>string</b>, deliberately: a
  *     catalog row must not carry a JGit enum, or a JGit upgrade that renames one silently changes
  *     what stored rows mean.
  * @param blobId the content address {@link PackBlobStore.StagedBlob#promote} returned
