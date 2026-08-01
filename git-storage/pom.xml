@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>eu.wohlben.qits</groupId>
+        <artifactId>qits-artifacts</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <!-- The git STORAGE ENGINE: a JGit `DfsRepository` whose packs are blobs in a content-addressed
+         store and whose refs are reftables in that same store. A plain library jar — no Quarkus, no
+         CDI, no datasource, no Flyway.
+
+         It owns the engine and its contract, and it owns NEITHER its bytes NOR its rows: the two
+         ports it declares (PackBlobStore, PackCatalog) are implemented in `service`, the one module
+         that may depend on both this context and `artifacts`. That is why the only compile
+         dependency below is JGit — a dependency on qits-artifacts-artifacts would be a dependency
+         on another context, which CLAUDE.md forbids ("Adding a dependency on another context —
+         Don't").
+
+         See README.md in this directory before bumping ${jgit.version}: everything here extends
+         org.eclipse.jgit.internal.storage.dfs, which carries no API stability promise. -->
+    <artifactId>qits-artifacts-git-storage</artifactId>
+    <name>qits-artifacts :: git-storage</name>
+
+    <dependencies>
+        <dependency>
+            <!-- The ONE compile dependency, deliberately. -->
+            <groupId>org.eclipse.jgit</groupId>
+            <artifactId>org.eclipse.jgit</artifactId>
+        </dependency>
+        <dependency>
+            <!-- Plain JUnit, not quarkus-junit5: this module's suite starts no Quarkus, opens no
+                 database and pulls no container. It drives the real git CLI against an in-process
+                 JDK HttpServer, which is what keeps `mvn verify` on a bare clone green. -->
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <artifactId>maven-compiler-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <artifactId>maven-surefire-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>
