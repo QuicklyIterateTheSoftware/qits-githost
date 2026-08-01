@@ -12,11 +12,8 @@ import jakarta.inject.Inject;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.zip.GZIPInputStream;
 import org.eclipse.jgit.lib.Repository;
-import org.eclipse.jgit.storage.file.FileRepositoryBuilder;
 import org.eclipse.jgit.transport.PacketLineOut;
 import org.eclipse.jgit.transport.ReceivePack;
 import org.eclipse.jgit.transport.RefAdvertiser.PacketLineOutRefAdvertiser;
@@ -51,9 +48,8 @@ import org.jboss.logging.Logger;
  * <p>Two addressing schemes, both served:
  *
  * <ul>
- *   <li><b>id-addressed</b> {@code /artifacts/git/:repoId} — the opaque UUID, resolving directly to
- *       {@code <data-dir>/<repoId>/origin} (back-compat: already-provisioned containers, metadata,
- *       discovery).
+ *   <li><b>id-addressed</b> {@code /artifacts/git/:repoId} — the opaque UUID, handed straight to the
+ *       storage backend (back-compat: already-provisioned containers, metadata, discovery).
  *   <li><b>name-addressed</b> {@code /artifacts/git/:projectId/:repoName} — a project's
  *       repositories served as siblings, {@code repoName} resolved through the {@link
  *       RepositoryNameResolver} port to a repo id. This is what lets committed relative submodule
@@ -94,9 +90,6 @@ public class GitHostRoutes {
   private static final String UPLOAD = "git-upload-pack";
   private static final String RECEIVE = "git-receive-pack";
 
-  @ConfigProperty(name = "qits.repositories.data-dir", defaultValue = "data/repositories")
-  String dataDir;
-
   /**
    * The largest pack this host accepts, and the reason it is spelled out rather than inherited.
    *
@@ -119,13 +112,21 @@ public class GitHostRoutes {
 
   @Inject ProtectedRefHook protectedRefs;
 
+  /**
+   * Where repositories live. Two backends ship in the same binary and {@code
+   * qits.repositories.git.storage} picks one; nothing in this class knows which, because {@link
+   * #open} is the only method that has to.
+   */
+  @Inject GitRepositoryBackend backend;
+
   /** A resolved repository plus the id it resolved to (the post-receive hook needs the id). */
   private record OpenedRepo(String repoId, Repository repo) {}
 
   /**
    * Register the routes on the main Vert.x router (root path — NOT under {@code
    * quarkus.rest.path}). Blocking: JGit's UploadPack/ReceivePack do synchronous stream I/O against
-   * the on-disk bare, so they run on a worker thread. The POST bodies (packfiles) are buffered by a
+   * whatever storage backs the repository, so they run on a worker thread. The POST bodies
+   * (packfiles) are buffered by a
    * {@link BodyHandler} first — fine at qits' single-node scale, and bounded by {@link
    * #maxPackSize} rather than by the global wire ceiling, which the OCI registry raised past
    * anything that should be held in memory.
@@ -249,8 +250,10 @@ public class GitHostRoutes {
         // while qits-gateway strips the whole X-Qits- header prefix unconditionally.
         rp.setAllowPushOptions(true);
         // The default branch's seatbelt. Inert unless qits.repositories.git.protect-default-branch
-        // (or the bare's own [qits] protectDefaultBranch) says otherwise — see ProtectedRefHook.
-        rp.setPreReceiveHook(protectedRefs);
+        // (or this repository's own protection row) says otherwise — see ProtectedRefHook. Bound to
+        // the repo id rather than handed the ReceivePack alone, because the override is a row keyed
+        // on that id and a DFS repository has no directory to derive it from.
+        rp.setPreReceiveHook(protectedRefs.forRepository(opened.repoId()));
         // The literal post-receive event the CI pipelines are named after (docs/epics/qits-ci/):
         // fires after the ref updates land, still inside receive() — the notifier is
         // fire-and-forget so the push response is never delayed.
@@ -273,40 +276,33 @@ public class GitHostRoutes {
   }
 
   /**
-   * Opens the repository's bare origin at {@code <data-dir>/<repoId>/origin} — the same layout
-   * {@code RepositoryService} clones into. Returns {@code null} (→ 404) for an id that isn't a
-   * valid repo-id slug or whose origin doesn't exist; the caller closes the returned repo.
+   * Validates the id and hands it to the selected {@link GitRepositoryProvider}. Returns {@code
+   * null} (→ 404) for an id that isn't a valid repo-id slug or that the backend does not hold; the
+   * caller closes the returned repo.
+   *
+   * <p><b>This is the whole storage seam.</b> Everything above it — {@link #infoRefs} and {@link
+   * #service} — takes a {@code Repository} and cannot tell a bare on the shared volume from a
+   * repository whose packs and refs are blobs in this service's own store.
+   *
+   * <p>The slug check stays <b>here</b> rather than moving into a provider, because it is a property
+   * of the url and not of a backend: the file backend joins the id to a path and needs it, the DFS
+   * backend never touches a filesystem and would not — and a traversal-shaped id has to be refused
+   * identically either way.
    */
   private OpenedRepo open(String repoId) {
     if (repoId == null || !repoId.matches(REPO_ID_PATTERN)) {
       return null;
     }
-    Path origin = Path.of(dataDir, repoId, "origin");
-    if (!Files.isDirectory(origin)) {
-      return null;
-    }
-    try {
-      return new OpenedRepo(
-          repoId,
-          new FileRepositoryBuilder().setGitDir(origin.toFile()).setMustExist(true).build());
-    } catch (Exception e) {
-      // A directory that exists but will not open is a different situation from one that is
-      // absent, and both answer 404 — so without this line the two are indistinguishable from
-      // outside. That mattered: a native build failed here for every repository (JGit's resource
-      // bundles were not in the image) and the only symptom was a 404 that looked like an unknown
-      // id. Debug rather than warn, because a malformed directory under the data dir is a
-      // deployment fact, not an error this process can act on.
-      LOG.debugf(e, "git repository %s exists at %s but could not be opened", repoId, origin);
-      return null;
-    }
+    Repository repo = backend.provider().open(repoId);
+    return repo == null ? null : new OpenedRepo(repoId, repo);
   }
 
   /**
    * Opens the repository addressed by {@code /artifacts/git/:projectId/:repoName}: strips an
    * optional {@code
    * .git} suffix, resolves {@code (projectId, name)} through the {@link RepositoryNameResolver} to
-   * a repo id, then opens that repo's on-disk origin. The path segments are only lookup keys (never
-   * filesystem paths — the resolved id is), and the resolved id is re-validated by {@link
+   * a repo id, then opens that repo through the storage backend. The path segments are only lookup
+   * keys (never filesystem paths), and the resolved id is re-validated by {@link
    * #open(String)}, so traversal is impossible. With no resolver configured this is a 404.
    */
   private OpenedRepo openByName(RoutingContext rc) {

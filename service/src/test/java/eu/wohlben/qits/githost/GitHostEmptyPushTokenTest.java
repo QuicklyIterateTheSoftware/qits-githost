@@ -7,10 +7,10 @@ import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
+import jakarta.inject.Inject;
 import java.net.URL;
 import java.nio.file.Path;
 import java.util.Map;
-import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -36,18 +36,20 @@ public class GitHostEmptyPushTokenTest {
     }
   }
 
-  @ConfigProperty(name = "qits.repositories.data-dir")
-  String dataDir;
+  @Inject GitRepositoryBackend backend;
 
   @TestHTTPResource("/artifacts/git")
   URL gitBase;
 
+  private String refSha(String repoId, String ref) throws Exception {
+    return GitHostFixture.requireRemoteRefSha(gitBase, repoId, ref);
+  }
+
   @Test
   public void anEmptyConfiguredTokenIsSatisfiedByNothingAtAll() throws Exception {
-    String repoId = GitHostFixture.seedOrigin(dataDir);
-    Path origin = GitHostFixture.origin(dataDir, repoId);
+    String repoId = GitHostFixture.seedOrigin(backend.provider(), gitBase);
     Path clone = GitHostFixture.clone(gitBase, repoId);
-    String before = GitHostFixture.refSha(origin, "refs/heads/main");
+    String before = refSha(repoId, "refs/heads/main");
 
     GitHostFixture.commitFile(clone, "empty.txt", "nothing to present\n", "empty");
 
@@ -63,6 +65,6 @@ public class GitHostEmptyPushTokenTest {
             clone, "git", "push", "-o", "qits.token=something", "origin", "main");
     assertTrue(presentedSomething.contains("no push token configured"), presentedSomething);
 
-    assertEquals(before, GitHostFixture.refSha(origin, "refs/heads/main"));
+    assertEquals(before, refSha(repoId, "refs/heads/main"));
   }
 }

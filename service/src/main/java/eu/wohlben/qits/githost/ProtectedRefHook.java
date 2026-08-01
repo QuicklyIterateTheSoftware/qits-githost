@@ -1,7 +1,8 @@
 package eu.wohlben.qits.githost;
 
+import eu.wohlben.qits.githost.persistence.RepositoryProtectionStore;
 import jakarta.enterprise.context.ApplicationScoped;
-import java.io.File;
+import jakarta.inject.Inject;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
@@ -14,14 +15,16 @@ import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
 /**
- * The default branch's seatbelt: a {@link PreReceiveHook} that refuses a direct update or delete of
- * whatever {@code HEAD} points at, so that releasing becomes something the platform does (through
- * qits-workspaces' integrate endpoint) rather than something a person remembers to do.
+ * The default branch's seatbelt: it builds a {@link PreReceiveHook} that refuses a direct update or
+ * delete of whatever {@code HEAD} points at, so that releasing becomes something the platform does
+ * (through qits-workspaces' integrate endpoint) rather than something a person remembers to do.
  *
- * <p><b>This is not a lock and must not pretend to be one.</b> Anything with the {@code
- * qits-repositories} volume mounted still moves a ref by writing a file, and that is fine — those
- * are platform components, not accidents. What this guards against is reflex: the muscle memory of
- * {@code git push …/artifacts/git/<repo> main} that every doc in this tree taught first.
+ * <p><b>This is not a lock and must not pretend to be one.</b> On the file backend, anything with
+ * the {@code qits-repositories} volume mounted still moves a ref by writing a file, and that is fine
+ * — those are platform components, not accidents. What this guards against is reflex: the muscle
+ * memory of {@code git push …/artifacts/git/<repo> main} that every doc in this tree taught first.
+ * (On the DFS backend that second door does not exist at all: there is no file to write, so
+ * receive-pack — and therefore this hook — is on the only path in.)
  *
  * <p>Why a Java hook and not a {@code hooks/pre-receive} script: this host runs no git. {@link
  * GitHostRoutes} drives JGit's {@link ReceivePack} in-process from raw Vert.x routes — no CGI, no
@@ -31,11 +34,13 @@ import org.jboss.logging.Logger;
  *
  * <h2>What is protected</h2>
  *
- * <p>The protected ref is {@link Repository#getFullBranch()} — the bare's own {@code HEAD}. That is
- * {@code refs/heads/main} for every repository here, it is per-repo without a table or a config
- * write, it needs no cross-service read of qits-projects' {@code Repository.mainBranch}, and it is
- * semantically the right answer ("the repo's default branch") rather than a hardcoded string. Every
- * other ref is untouched: this is a guard on one branch, not an authorization system.
+ * <p>The protected ref is {@link Repository#getFullBranch()} — the repository's own {@code HEAD}.
+ * That is {@code refs/heads/main} for every repository here, it is per-repo with nothing to keep in
+ * step, it needs no cross-service read of qits-projects' {@code Repository.mainBranch}, and it is
+ * semantically the right answer ("the repo's default branch") rather than a hardcoded string. It is
+ * also the one thing that survived the move to DFS untouched: under reftable {@code HEAD} is a
+ * symbolic ref in the ref database like any other. Every other ref is untouched: this is a guard on
+ * one branch, not an authorization system.
  *
  * <p><b>Creates are allowed.</b> An empty repository has no default branch to protect and blocking
  * its seeding push buys no safety — which is also what keeps {@code qits-local-up.sh}'s first-run
@@ -69,15 +74,25 @@ import org.jboss.logging.Logger;
  * <p>{@code qits.repositories.git.protect-default-branch} is the platform-wide switch and ships
  * <b>false</b>: a host that refuses pushes is the host that serves its own redeploy, so this shipped
  * inert and is flipped once every legitimate pusher has been taught the options. The per-repo
- * override is {@code [qits] protectDefaultBranch} in the bare's own config, which needs no table
- * (this service owns none, by design) and travels with the volume.
+ * override is a row, {@link RepositoryProtectionStore}.
+ *
+ * <p>It was {@code [qits] protectDefaultBranch} in the bare's own config, read straight off the
+ * repository JGit had already opened. That reading has no future: a DFS-backed repository has no
+ * config file at all — {@code DfsRepository.getConfig()} is an in-memory {@code DfsConfig} whose
+ * load and save are no-ops — so the call would have answered the platform default for every
+ * repository with no symptom anywhere. The row replaces it for <b>both</b> backends rather than only
+ * the new one: one question with two answer sources is a question that eventually gets two answers.
+ *
+ * <p>The hook is therefore <b>bound to a repo id</b> before it is installed ({@link
+ * #forRepository}). {@code GitHostRoutes} already knows the id it resolved; deriving it from the
+ * repository's directory would work on one backend and return nothing on the other.
  *
  * <p>JGit's own {@code validateCommands()} runs <i>before</i> this hook and is what makes
  * fast-forward detection reliable here: by the time a command reaches {@link #onPreReceive} its type
  * is already refined to {@code UPDATE} or {@code UPDATE_NONFASTFORWARD}.
  */
 @ApplicationScoped
-public class ProtectedRefHook implements PreReceiveHook {
+public class ProtectedRefHook {
 
   private static final Logger LOG = Logger.getLogger(ProtectedRefHook.class);
 
@@ -109,10 +124,22 @@ public class ProtectedRefHook implements PreReceiveHook {
   @ConfigProperty(name = "qits.repositories.git.push-token")
   Optional<String> pushToken;
 
-  @Override
-  public void onPreReceive(ReceivePack rp, Collection<ReceiveCommand> commands) {
+  @Inject RepositoryProtectionStore protections;
+
+  /**
+   * The hook to install on a {@code ReceivePack}, carrying the repo id the route resolved.
+   *
+   * <p>A {@code PreReceiveHook} is handed only the {@code ReceivePack}, and the id cannot be
+   * recovered from the repository on every backend — a bare has a directory whose parent is the id,
+   * a DFS repository has no directory at all. So the id is bound here, where it is still known.
+   */
+  public PreReceiveHook forRepository(String repoId) {
+    return (rp, commands) -> onPreReceive(repoId, rp, commands);
+  }
+
+  void onPreReceive(String repoId, ReceivePack rp, Collection<ReceiveCommand> commands) {
     Repository repo = rp.getRepository();
-    if (!isProtectionEnabled(repo)) {
+    if (!isProtectionEnabled(repoId)) {
       return;
     }
     String protectedRef = protectedRef(repo);
@@ -124,7 +151,6 @@ public class ProtectedRefHook implements PreReceiveHook {
     boolean release = options.contains(RELEASE_OPTION);
     boolean tokenPresented = options.stream().anyMatch(o -> o.startsWith(TOKEN_OPTION_PREFIX));
     boolean tokenAccepted = tokenPresented && tokenMatches(options);
-    String repoLabel = label(repo);
 
     for (ReceiveCommand cmd : commands) {
       if (!protectedRef.equals(cmd.getRefName()) || cmd.getType() == ReceiveCommand.Type.CREATE) {
@@ -134,7 +160,7 @@ public class ProtectedRefHook implements PreReceiveHook {
       if (tokenAccepted) {
         LOG.infof(
             "push token accepted for protected ref %s in %s (%s %s -> %s)",
-            protectedRef, repoLabel, cmd.getType(), cmd.getOldId().name(), cmd.getNewId().name());
+            protectedRef, repoId, cmd.getType(), cmd.getOldId().name(), cmd.getNewId().name());
         continue;
       }
       if (release && cmd.getType() == ReceiveCommand.Type.UPDATE) {
@@ -144,33 +170,27 @@ public class ProtectedRefHook implements PreReceiveHook {
             "push option %s accepted for protected ref %s in %s (fast-forward %s -> %s)",
             RELEASE_OPTION,
             protectedRef,
-            repoLabel,
+            repoId,
             cmd.getOldId().name(),
             cmd.getNewId().name());
         continue;
       }
       String reason = refusal(protectedRef, cmd, release, tokenPresented);
-      LOG.infof("refused %s of protected ref %s in %s: %s", cmd.getType(), protectedRef, repoLabel,
+      LOG.infof("refused %s of protected ref %s in %s: %s", cmd.getType(), protectedRef, repoId,
           reason);
       cmd.setResult(Result.REJECTED_OTHER_REASON, reason);
     }
   }
 
   /**
-   * The platform-wide setting, overridable per repository by {@code [qits] protectDefaultBranch} in
-   * the bare's own config — read straight off the repository JGit already opened, so a deployment
-   * exempts one repo by writing one line into a file that travels with the volume.
+   * The platform-wide setting, overridden per repository by a protection row when there is one.
+   *
+   * <p>The store answers "no override" for a row that is absent <b>and</b> for a read it could not
+   * make, which is deliberate: an unreadable answer must not decide the question in either
+   * direction, so both fall through to the platform setting.
    */
-  private boolean isProtectionEnabled(Repository repo) {
-    try {
-      return repo.getConfig().getBoolean("qits", "protectDefaultBranch", protectByDefault);
-    } catch (RuntimeException e) {
-      // A malformed value ("protectDefaultBranch = maybe") must not decide the question silently in
-      // either direction; fall back to the platform setting and say so.
-      LOG.warnf(e, "unreadable [qits] protectDefaultBranch in %s; using the platform default %s",
-          label(repo), protectByDefault);
-      return protectByDefault;
-    }
+  private boolean isProtectionEnabled(String repoId) {
+    return protections.protectionOverride(repoId).orElse(protectByDefault);
   }
 
   /**
@@ -183,7 +203,7 @@ public class ProtectedRefHook implements PreReceiveHook {
       String full = repo.getFullBranch();
       return full != null && full.startsWith("refs/heads/") ? full : null;
     } catch (Exception e) {
-      LOG.debugf(e, "could not read HEAD of %s; nothing is protected", label(repo));
+      LOG.debugf(e, "could not read HEAD; nothing is protected");
       return null;
     }
   }
@@ -245,19 +265,5 @@ public class ProtectedRefHook implements PreReceiveHook {
 
   private boolean hasConfiguredToken() {
     return !pushToken.orElse("").isEmpty();
-  }
-
-  /**
-   * A name for the log line. The bare is {@code <data-dir>/<repoId>/origin}, so its parent directory
-   * is the repo id — the same identity {@code CiPostReceiveNotifier} carries. Only ever a label; no
-   * decision is taken on it.
-   */
-  private String label(Repository repo) {
-    File dir = repo.getDirectory();
-    if (dir == null) {
-      return "an unnamed repository";
-    }
-    File parent = dir.getParentFile();
-    return parent == null ? dir.getName() : parent.getName();
   }
 }

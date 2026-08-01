@@ -9,13 +9,20 @@ import java.util.Map;
 import java.util.UUID;
 
 /**
- * The git CLI, driven as a test would drive a workspace container: real bare origins under the test
- * data dir, real clones over the served HTTP endpoint, real pushes.
+ * The git CLI, driven as a test would drive a workspace container: real repositories provisioned
+ * through the host's own storage backend, real clones over the served HTTP endpoint, real pushes.
  *
- * <p>Static and shared because three {@code @QuarkusTest} classes need it and they cannot share a
- * base class usefully — each carries a different {@code @TestProfile}, which is the whole point of
- * splitting them (the push token's configured / configured-empty / unset cases are three different
- * process configurations, and Quarkus reads config once per profile).
+ * <p>Static and shared because four {@code @QuarkusTest} classes need it and only two of them share
+ * a base class. {@code GitHostSuite} is that base and its subclasses differ by one config value; the
+ * two push-token classes carry profiles that change what the whole suite would mean, so they stay
+ * separate and reach these helpers as statics.
+ *
+ * <p><b>Nothing here reads a directory.</b> {@link #emptyOrigin} asks the selected {@link
+ * GitRepositoryProvider} to make a repository and every assertion after that goes over the wire, so
+ * the same helpers serve a bare on the shared volume and a repository whose packs and refs are blobs
+ * — which is what lets {@code GitHostSuite} run against either backend unchanged. Reading a served
+ * bare with {@code rev-parse} was the shortcut that would have made half this suite untranslatable:
+ * a {@code DfsRepository} has no directory for the git CLI to open at all.
  *
  * <p>The git CLI rather than JGit's porcelain, for the same reason {@code GitHostTest} always shelled
  * it: what is under test is whether the real client can talk to this host, including the parts of
@@ -41,40 +48,88 @@ final class GitHostFixture {
   }
 
   /**
-   * Seeds a bare origin at {@code <data-dir>/<repoId>/origin} with one commit on {@code main},
-   * exactly as {@code RepositoryService} would have cloned it. The branch is pinned rather than left
-   * to {@code init.defaultBranch}, because the protected ref is the bare's own HEAD and a test that
-   * does not know its name proves nothing about it.
+   * An empty repository whose HEAD names {@code refs/heads/main} with nothing on it — the shape a
+   * freshly provisioned origin has, and the one where the protected ref exists only as a symref.
+   * Pushing to it is a CREATE, which protection deliberately allows.
+   *
+   * <p><b>This is the backend lever.</b> It is the only method in this class that knows anything
+   * about where a repository lives, and it does not know either: it asks the selected {@link
+   * GitRepositoryProvider}, so the same suite runs against a bare on the volume and against a
+   * repository whose packs and refs are blobs. Everything else here goes over the wire, which is
+   * backend-agnostic by construction.
+   *
+   * <p>The branch is pinned rather than left to {@code init.defaultBranch}, because the protected
+   * ref is the repository's own HEAD and a test that does not know its name proves nothing about it.
    */
-  static String seedOrigin(String dataDir) throws Exception {
+  static String emptyOrigin(GitRepositoryProvider provider) throws Exception {
     String repoId = UUID.randomUUID().toString();
-    Path origin = Path.of(dataDir, repoId, "origin");
-    Files.createDirectories(origin.getParent());
+    provider.create(repoId, "main");
+    return repoId;
+  }
 
+  /**
+   * An empty repository with one commit pushed onto {@code main} — a repository as the platform's
+   * would be after its first push, and the starting point for most of the suite.
+   *
+   * <p>Seeded <b>through the served endpoint</b> rather than by building a bare beside it: that is
+   * the only seeding that exists on both backends, and it is also the honest one, since receive-pack
+   * is the only door a DFS-backed repository has.
+   */
+  static String seedOrigin(GitRepositoryProvider provider, URL gitBase) throws Exception {
+    String repoId = emptyOrigin(provider);
     Path seed = Files.createTempDirectory("qits-githost-seed");
     git(null, "git", "init", "-q", "-b", "main", seed.toString());
     Files.writeString(seed.resolve("README.md"), "seed\n");
     git(seed, "git", "add", "README.md");
     gitCommitting(seed, "commit", "-q", "-m", "seed");
-    git(null, "git", "clone", "-q", "--bare", seed.toString(), origin.toString());
+    git(seed, "git", "push", "-q", gitBase + "/" + repoId, "main");
     return repoId;
   }
 
   /**
-   * An empty bare whose HEAD names {@code refs/heads/main} with nothing on it — the shape a freshly
-   * provisioned repository has, and the one where the protected ref exists only as a symref. Pushing
-   * to it is a CREATE, which protection deliberately allows.
+   * What the served repository says a ref is, or {@code null} if it has none — {@code git ls-remote}
+   * rather than a {@code rev-parse} in a directory, because only one of those two exists on both
+   * backends. It also asks the question the clients actually ask.
    */
-  static String emptyOrigin(String dataDir) throws Exception {
-    String repoId = UUID.randomUUID().toString();
-    Path origin = Path.of(dataDir, repoId, "origin");
-    Files.createDirectories(origin.getParent());
-    git(null, "git", "init", "--bare", "-q", "-b", "main", origin.toString());
-    return repoId;
+  static String remoteRefSha(URL gitBase, String repoId, String ref) throws Exception {
+    return lsRemote(gitBase, repoId, ref, ref);
   }
 
-  static Path origin(String dataDir, String repoId) {
-    return Path.of(dataDir, repoId, "origin");
+  /** Fails the test if the ref is absent; returns its sha. */
+  static String requireRemoteRefSha(URL gitBase, String repoId, String ref) throws Exception {
+    String sha = remoteRefSha(gitBase, repoId, ref);
+    if (sha == null) {
+      fail("the served repository " + repoId + " has no " + ref);
+    }
+    return sha;
+  }
+
+  /**
+   * The sha a tag ref <b>peels to</b>, or {@code null} if it peels to nothing.
+   *
+   * <p>An advertisement carries {@code <ref>^{}} only for a ref that names a tag OBJECT, so a
+   * non-null answer here is how "the ref names an annotated tag rather than the commit" is proved
+   * over the wire — the question {@code cat-file -t} answers in a directory that a DFS-backed
+   * repository does not have.
+   *
+   * <p>The pattern is globbed rather than the exact ref, because {@code ls-remote} matches its
+   * patterns against ref names and {@code <ref>^{}} is not one: asking for the ref exactly filters
+   * the peeled line straight back out.
+   */
+  static String peeledRemoteRef(URL gitBase, String repoId, String ref) throws Exception {
+    return lsRemote(gitBase, repoId, ref + "*", ref + "^{}");
+  }
+
+  private static String lsRemote(URL gitBase, String repoId, String pattern, String wanted)
+      throws Exception {
+    String out = git(null, "git", "ls-remote", gitBase + "/" + repoId, pattern);
+    for (String line : out.split("\n")) {
+      String[] parts = line.trim().split("\\s+");
+      if (parts.length == 2 && parts[1].equals(wanted)) {
+        return parts[0];
+      }
+    }
+    return null;
   }
 
   /** Clones the served repository over HTTP into a fresh temp directory. */
@@ -117,11 +172,6 @@ final class GitHostFixture {
     return git(repo, "git", "rev-parse", ref).trim();
   }
 
-  /** {@code commit}, {@code tag}, {@code blob} — how a pushed tag ref is proved to be annotated. */
-  static String objectType(Path repo, String sha) throws Exception {
-    return git(repo, "git", "cat-file", "-t", sha).trim();
-  }
-
   /**
    * Builds an annotated tag object and hands back its sha, leaving <b>no ref behind</b>.
    *
@@ -156,15 +206,6 @@ final class GitHostFixture {
   /** How many times {@code git-receive-pack} was POSTed, out of {@link #gitTracingHttp} output. */
   static long receivePackRequests(String trace) {
     return trace.lines().filter(l -> l.contains("POST") && l.contains("git-receive-pack")).count();
-  }
-
-  /** Sets (or clears, with a null value) the bare's own {@code [qits] protectDefaultBranch}. */
-  static void protectDefaultBranch(Path origin, Boolean value) throws Exception {
-    if (value == null) {
-      git(origin, "git", "config", "--unset", "qits.protectDefaultBranch");
-    } else {
-      git(origin, "git", "config", "qits.protectDefaultBranch", value.toString());
-    }
   }
 
   /** Runs git, failing the test with the captured output if it exits non-zero. */
