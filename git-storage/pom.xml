@@ -7,7 +7,7 @@
     <parent>
         <groupId>eu.wohlben.qits</groupId>
         <artifactId>qits-artifacts</artifactId>
-        <version>2026.802.174551</version>
+        <version>2026.802.174701</version>
         <relativePath>../pom.xml</relativePath>
     </parent>
 
