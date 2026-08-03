@@ -2,6 +2,7 @@ package eu.wohlben.qits.githost;
 
 import io.quarkus.runtime.configuration.MemorySize;
 import io.vertx.core.buffer.Buffer;
+import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.Router;
 import io.vertx.ext.web.RoutingContext;
 import io.vertx.ext.web.handler.BodyHandler;
@@ -11,8 +12,11 @@ import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
+import java.util.List;
 import java.util.zip.GZIPInputStream;
+import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.transport.PacketLineOut;
 import org.eclipse.jgit.transport.ReceivePack;
@@ -65,6 +69,21 @@ import org.jboss.logging.Logger;
  *   <li>{@code POST …/git-upload-pack} — fetch/clone negotiation + packfile.
  *   <li>{@code POST …/git-receive-pack} — push.
  * </ul>
+ *
+ * <p>Beside those, three lifecycle routes on the id-addressed base only — not served
+ * name-addressed, since a name is an alias for an id that has to already exist:
+ *
+ * <ul>
+ *   <li>{@code PUT …/:repoId} {@code {"defaultBranch": "main"}} — create, idempotently: 201 when
+ *       this call created the repository, 200 when one was already there.
+ *   <li>{@code GET …/:repoId} — {@code {"repoId", "defaultBranch"}} for a repository that exists,
+ *       404 otherwise.
+ *   <li>{@code HEAD …/:repoId} — the same existence question with no body.
+ * </ul>
+ *
+ * <p>These give a caller (qits-projects) a way to provision a repository over the wire instead of
+ * {@code git init --bare} on the shared volume — see {@code projects-volume-decoupling-plan.md}
+ * §2. There is deliberately no delete verb and no enumerate verb (that plan's §2.1).
  */
 @ApplicationScoped
 public class GitHostRoutes {
@@ -89,6 +108,21 @@ public class GitHostRoutes {
 
   private static final String UPLOAD = "git-upload-pack";
   private static final String RECEIVE = "git-receive-pack";
+
+  /**
+   * {@code -o qits.no-ci} — skip the CI post-receive POST for this push. Read in {@link
+   * #service}'s post-receive lambda, not by {@link ProtectedRefHook}: it grants no write, so it is
+   * not a bypass of anything. See {@code ProtectedRefHook}'s "two bypasses" javadoc, third bullet.
+   */
+  private static final String NO_CI_OPTION = "qits.no-ci";
+
+  /**
+   * The JSON body limit for the lifecycle {@code PUT} — a {@code {"defaultBranch": "…"}} document,
+   * nowhere near what a pack needs. Stated explicitly rather than inherited, for the same reason
+   * {@link #maxPackSize} is: {@code BodyHandler.create()} defaults to 10 MiB, and a bound this far
+   * under that is what keeps a stray large body a 413 instead of a memory allocation.
+   */
+  private static final long LIFECYCLE_BODY_LIMIT = 4096;
 
   /**
    * The largest pack this host accepts, and the reason it is spelled out rather than inherited.
@@ -153,6 +187,13 @@ public class GitHostRoutes {
         .blockingHandler(rc -> service(rc, RECEIVE, open(rc, "repoId")));
 
     router
+        .put(BASE + "/:repoId")
+        .handler(lifecycleBodyHandler())
+        .blockingHandler(this::createRepository);
+    router.get(BASE + "/:repoId").blockingHandler(this::describeRepository);
+    router.head(BASE + "/:repoId").blockingHandler(this::headRepository);
+
+    router
         .get(BASE + "/:projectId/:repoName/info/refs")
         .blockingHandler(rc -> infoRefs(rc, openByName(rc)));
     router
@@ -173,6 +214,11 @@ public class GitHostRoutes {
    */
   private BodyHandler packBodyHandler() {
     return BodyHandler.create(false).setBodyLimit(maxPackSize.asLongValue());
+  }
+
+  /** The lifecycle {@code PUT}'s body handler. See {@link #LIFECYCLE_BODY_LIMIT} for the number. */
+  private BodyHandler lifecycleBodyHandler() {
+    return BodyHandler.create(false).setBodyLimit(LIFECYCLE_BODY_LIMIT);
   }
 
   /** {@code GET …/info/refs?service=…} — the smart-HTTP ref advertisement. */
@@ -256,9 +302,16 @@ public class GitHostRoutes {
         rp.setPreReceiveHook(protectedRefs.forRepository(opened.repoId()));
         // The literal post-receive event the CI pipelines are named after (docs/epics/qits-ci/):
         // fires after the ref updates land, still inside receive() — the notifier is
-        // fire-and-forget so the push response is never delayed.
+        // fire-and-forget so the push response is never delayed. -o qits.no-ci skips it: an
+        // imported upstream's whole history is one push, and without this every branch in it would
+        // queue a CI run for history that predates the platform.
         rp.setPostReceiveHook(
-            (pack, commands) -> ciNotifier.onPostReceive(opened.repoId(), commands));
+            (pack, commands) -> {
+              if (hasNoCiOption(pack)) {
+                return;
+              }
+              ciNotifier.onPostReceive(opened.repoId(), commands);
+            });
         rp.receive(in, out, null);
       }
       rc.response()
@@ -268,6 +321,145 @@ public class GitHostRoutes {
     } catch (Exception e) {
       fail(rc, service, e);
     }
+  }
+
+  /** Whether this push carried {@code -o qits.no-ci}. */
+  private boolean hasNoCiOption(ReceivePack pack) {
+    List<String> options = pack.getPushOptions();
+    return options != null && options.contains(NO_CI_OPTION);
+  }
+
+  /**
+   * {@code PUT …/:repoId} — create, idempotently. {@code defaultBranch} is validated as a branch
+   * name before it reaches {@link GitRepositoryProvider#create}: the same argv-safety discipline
+   * every user-supplied ref gets before it reaches JGit.
+   */
+  private void createRepository(RoutingContext rc) {
+    String repoId = rc.pathParam("repoId");
+    if (repoId == null || !repoId.matches(REPO_ID_PATTERN)) {
+      rc.response().setStatusCode(400).end("repo id must match " + REPO_ID_PATTERN);
+      return;
+    }
+    String defaultBranch = readDefaultBranch(rc);
+    if (defaultBranch == null) {
+      rc.response()
+          .setStatusCode(400)
+          .end(
+              "defaultBranch must be a non-blank branch name with no leading dash, no \"..\", and"
+                  + " no whitespace");
+      return;
+    }
+    try {
+      backend.provider().create(repoId, defaultBranch);
+      respondRepository(rc, 201, repoId);
+    } catch (IOException e) {
+      // create() throws IOException both for "already exists" and for any other creation failure,
+      // with no subtype to tell them apart. Re-opening does: PUT is idempotent, so a repository
+      // that is there now is success (200) regardless of which defaultBranch it already carries —
+      // not necessarily the one just requested.
+      if (repositoryExists(repoId)) {
+        respondRepository(rc, 200, repoId);
+      } else {
+        LOG.errorf(e, "failed to create git repository %s", repoId);
+        rc.response().setStatusCode(500).end();
+      }
+    } catch (Exception e) {
+      fail(rc, "git-create", e);
+    }
+  }
+
+  /** {@code GET …/:repoId} — {@code {"repoId", "defaultBranch"}}, or 404. */
+  private void describeRepository(RoutingContext rc) {
+    String repoId = rc.pathParam("repoId");
+    if (repoId == null || !repoId.matches(REPO_ID_PATTERN)) {
+      rc.response().setStatusCode(400).end("repo id must match " + REPO_ID_PATTERN);
+      return;
+    }
+    respondRepository(rc, 200, repoId);
+  }
+
+  /** {@code HEAD …/:repoId} — the same existence question as {@link #describeRepository}, no body. */
+  private void headRepository(RoutingContext rc) {
+    String repoId = rc.pathParam("repoId");
+    if (repoId == null || !repoId.matches(REPO_ID_PATTERN)) {
+      rc.response().setStatusCode(400).end();
+      return;
+    }
+    try (Repository repo = backend.provider().open(repoId)) { // null repo: a no-op close
+      rc.response().setStatusCode(repo == null ? 404 : 200).end();
+    } catch (Exception e) {
+      fail(rc, "git-head", e);
+    }
+  }
+
+  /**
+   * Opens {@code repoId} and writes {@code {"repoId", "defaultBranch"}} at {@code status}, or 404 if
+   * the backend holds no such repository. Shared by the create 200/201 arms and by {@link
+   * #describeRepository}, so all three report the repository's own {@code HEAD} rather than trusting
+   * whatever a caller asked for.
+   */
+  private void respondRepository(RoutingContext rc, int status, String repoId) {
+    try (Repository repo = backend.provider().open(repoId)) { // null repo: a no-op close
+      if (repo == null) {
+        rc.response().setStatusCode(404).end();
+        return;
+      }
+      rc.response()
+          .setStatusCode(status)
+          .putHeader("Content-Type", "application/json")
+          .end(
+              new JsonObject()
+                  .put("repoId", repoId)
+                  .put("defaultBranch", defaultBranchOf(repo))
+                  .encode());
+    } catch (Exception e) {
+      fail(rc, "git-lifecycle", e);
+    }
+  }
+
+  /** Whether the backend already holds {@code repoId}. */
+  private boolean repositoryExists(String repoId) {
+    try (Repository repo = backend.provider().open(repoId)) { // null repo: a no-op close
+      return repo != null;
+    }
+  }
+
+  /** The repository's {@code HEAD}, as a short branch name, or {@code null} if it names none. */
+  private String defaultBranchOf(Repository repo) throws IOException {
+    String full = repo.getFullBranch();
+    return full != null && full.startsWith(Constants.R_HEADS)
+        ? full.substring(Constants.R_HEADS.length())
+        : full;
+  }
+
+  /**
+   * Reads and validates {@code defaultBranch} from the request body, or {@code null} if the body is
+   * missing, malformed, or the value fails validation.
+   */
+  private String readDefaultBranch(RoutingContext rc) {
+    Buffer body = rc.body().buffer();
+    if (body == null || body.length() == 0) {
+      return null;
+    }
+    String candidate;
+    try {
+      candidate = new JsonObject(body).getString("defaultBranch");
+    } catch (Exception e) {
+      return null;
+    }
+    return isValidBranchName(candidate) ? candidate : null;
+  }
+
+  /**
+   * Non-blank, no leading dash (an option-injection shape), no {@code ..}, no whitespace — the same
+   * argv-safety discipline every user-supplied ref is checked against before it reaches JGit.
+   */
+  private static boolean isValidBranchName(String name) {
+    return name != null
+        && !name.isBlank()
+        && !name.startsWith("-")
+        && !name.contains("..")
+        && name.chars().noneMatch(Character::isWhitespace);
   }
 
   /** Opens the repo named by the {@code repoId} path param (the id-addressed scheme). */
