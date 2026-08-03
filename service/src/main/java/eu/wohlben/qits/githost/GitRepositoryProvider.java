@@ -43,10 +43,10 @@ public interface GitRepositoryProvider {
    * Creates an empty repository whose {@code HEAD} names {@code defaultBranch}, which need not exist
    * yet — the shape a freshly provisioned origin has, and what makes the first push a create.
    *
-   * <p>No route calls this. Creation reaches this host as {@code git clone --mirror} or {@code git
-   * init --bare} on the shared volume today, which is exactly the filesystem coupling workstream AT
-   * removes; when it does, its new create verb lands on this method rather than beside it. It exists
-   * now because the test suite needs one way to provision a repository in whichever backend is
+   * <p>{@code PUT /artifacts/git/:repoId} ({@link GitHostRoutes}) is the route that calls this — the
+   * git-host lifecycle API ({@code projects-volume-decoupling-plan.md} §2) that replaced "creation
+   * reaches this host as {@code git clone --mirror} or {@code git init --bare} on the shared
+   * volume". The test suite also uses it directly to provision a repository in whichever backend is
    * selected.
    *
    * @throws IOException if the repository already exists or cannot be created

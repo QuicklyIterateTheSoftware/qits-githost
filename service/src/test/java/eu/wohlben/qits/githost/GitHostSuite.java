@@ -2,6 +2,7 @@ package eu.wohlben.qits.githost;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -9,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import eu.wohlben.qits.githost.persistence.RepositoryProtectionStore;
 import io.quarkus.test.common.http.TestHTTPResource;
+import io.restassured.http.ContentType;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 import java.net.URL;
@@ -593,5 +595,140 @@ abstract class GitHostSuite {
         released,
         refSha(repoId, "refs/heads/main"),
         "and main moved anyway — the two commands are independent");
+  }
+
+  // --- the lifecycle routes: PUT/GET/HEAD /artifacts/git/:repoId (workstream BM) -------------------
+
+  @Test
+  public void putCreatesANewRepositoryAnd201s() {
+    String repoId = UUID.randomUUID().toString();
+    given()
+        .contentType(ContentType.JSON)
+        .body("{\"defaultBranch\":\"main\"}")
+        .when()
+        .put("/artifacts/git/" + repoId)
+        .then()
+        .statusCode(Response.Status.CREATED.getStatusCode())
+        .body("repoId", equalTo(repoId))
+        .body("defaultBranch", equalTo("main"));
+  }
+
+  @Test
+  public void aSecondPutOnTheSameIdIs200AndLeavesTheRepositoryUnchanged() {
+    // PUT is idempotent: 201 on the call that created it, 200 on every call after — and a second
+    // call asking for a DIFFERENT branch must not disturb the one already there.
+    String repoId = UUID.randomUUID().toString();
+    given()
+        .contentType(ContentType.JSON)
+        .body("{\"defaultBranch\":\"main\"}")
+        .when()
+        .put("/artifacts/git/" + repoId)
+        .then()
+        .statusCode(Response.Status.CREATED.getStatusCode());
+
+    given()
+        .contentType(ContentType.JSON)
+        .body("{\"defaultBranch\":\"other\"}")
+        .when()
+        .put("/artifacts/git/" + repoId)
+        .then()
+        .statusCode(Response.Status.OK.getStatusCode())
+        .body("repoId", equalTo(repoId))
+        .body("defaultBranch", equalTo("main"));
+  }
+
+  @Test
+  public void putWithAnInvalidDefaultBranchIs400() {
+    // The argv-safety check named in the plan: a leading dash reads as an option, not a branch.
+    given()
+        .contentType(ContentType.JSON)
+        .body("{\"defaultBranch\":\"-oops\"}")
+        .when()
+        .put("/artifacts/git/" + UUID.randomUUID())
+        .then()
+        .statusCode(Response.Status.BAD_REQUEST.getStatusCode());
+  }
+
+  @Test
+  public void getReportsTheDefaultBranchOfAnExistingRepository() {
+    String repoId = UUID.randomUUID().toString();
+    given()
+        .contentType(ContentType.JSON)
+        .body("{\"defaultBranch\":\"main\"}")
+        .when()
+        .put("/artifacts/git/" + repoId)
+        .then()
+        .statusCode(Response.Status.CREATED.getStatusCode());
+
+    given()
+        .when()
+        .get("/artifacts/git/" + repoId)
+        .then()
+        .statusCode(Response.Status.OK.getStatusCode())
+        .body("repoId", equalTo(repoId))
+        .body("defaultBranch", equalTo("main"));
+  }
+
+  @Test
+  public void getOnAnUnknownIdIs404OnTheLifecycleRoute() {
+    given()
+        .when()
+        .get("/artifacts/git/" + UUID.randomUUID())
+        .then()
+        .statusCode(Response.Status.NOT_FOUND.getStatusCode());
+  }
+
+  @Test
+  public void aTraversalShapedIdOnTheLifecycleRoutesIs400() {
+    // Malformed input, not "not found" — unlike the smart-HTTP routes, which stay 404 so a
+    // traversal-shaped id looks identical to an unknown one from outside.
+    given()
+        .when()
+        .get("/artifacts/git/foo.bar")
+        .then()
+        .statusCode(Response.Status.BAD_REQUEST.getStatusCode());
+    given()
+        .contentType(ContentType.JSON)
+        .body("{\"defaultBranch\":\"main\"}")
+        .when()
+        .put("/artifacts/git/foo.bar")
+        .then()
+        .statusCode(Response.Status.BAD_REQUEST.getStatusCode());
+  }
+
+  @Test
+  public void headReportsExistenceWithNoBody() {
+    String repoId = UUID.randomUUID().toString();
+    given().when().head("/artifacts/git/" + repoId).then().statusCode(
+        Response.Status.NOT_FOUND.getStatusCode());
+
+    given()
+        .contentType(ContentType.JSON)
+        .body("{\"defaultBranch\":\"main\"}")
+        .when()
+        .put("/artifacts/git/" + repoId)
+        .then()
+        .statusCode(Response.Status.CREATED.getStatusCode());
+
+    given().when().head("/artifacts/git/" + repoId).then().statusCode(
+        Response.Status.OK.getStatusCode());
+  }
+
+  @Test
+  public void aPushToAPutCreatedRepositoryIsAccepted() throws Exception {
+    String repoId = UUID.randomUUID().toString();
+    given()
+        .contentType(ContentType.JSON)
+        .body("{\"defaultBranch\":\"main\"}")
+        .when()
+        .put("/artifacts/git/" + repoId)
+        .then()
+        .statusCode(Response.Status.CREATED.getStatusCode());
+
+    Path local = GitHostFixture.localRepo();
+    String seeded = GitHostFixture.head(local);
+    GitHostFixture.git(local, "git", "push", gitBase + "/" + repoId, "main");
+
+    assertEquals(seeded, refSha(repoId, "refs/heads/main"));
   }
 }
