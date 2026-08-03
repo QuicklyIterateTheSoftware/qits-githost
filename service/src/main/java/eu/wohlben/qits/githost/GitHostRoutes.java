@@ -14,6 +14,7 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.List;
 import java.util.zip.GZIPInputStream;
 import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.Repository;
@@ -107,6 +108,13 @@ public class GitHostRoutes {
 
   private static final String UPLOAD = "git-upload-pack";
   private static final String RECEIVE = "git-receive-pack";
+
+  /**
+   * {@code -o qits.no-ci} — skip the CI post-receive POST for this push. Read in {@link
+   * #service}'s post-receive lambda, not by {@link ProtectedRefHook}: it grants no write, so it is
+   * not a bypass of anything. See {@code ProtectedRefHook}'s "two bypasses" javadoc, third bullet.
+   */
+  private static final String NO_CI_OPTION = "qits.no-ci";
 
   /**
    * The JSON body limit for the lifecycle {@code PUT} — a {@code {"defaultBranch": "…"}} document,
@@ -294,9 +302,16 @@ public class GitHostRoutes {
         rp.setPreReceiveHook(protectedRefs.forRepository(opened.repoId()));
         // The literal post-receive event the CI pipelines are named after (docs/epics/qits-ci/):
         // fires after the ref updates land, still inside receive() — the notifier is
-        // fire-and-forget so the push response is never delayed.
+        // fire-and-forget so the push response is never delayed. -o qits.no-ci skips it: an
+        // imported upstream's whole history is one push, and without this every branch in it would
+        // queue a CI run for history that predates the platform.
         rp.setPostReceiveHook(
-            (pack, commands) -> ciNotifier.onPostReceive(opened.repoId(), commands));
+            (pack, commands) -> {
+              if (hasNoCiOption(pack)) {
+                return;
+              }
+              ciNotifier.onPostReceive(opened.repoId(), commands);
+            });
         rp.receive(in, out, null);
       }
       rc.response()
@@ -306,6 +321,12 @@ public class GitHostRoutes {
     } catch (Exception e) {
       fail(rc, service, e);
     }
+  }
+
+  /** Whether this push carried {@code -o qits.no-ci}. */
+  private boolean hasNoCiOption(ReceivePack pack) {
+    List<String> options = pack.getPushOptions();
+    return options != null && options.contains(NO_CI_OPTION);
   }
 
   /**
