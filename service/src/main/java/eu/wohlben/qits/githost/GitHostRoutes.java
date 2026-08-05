@@ -2,6 +2,7 @@ package eu.wohlben.qits.githost;
 
 import io.quarkus.runtime.configuration.MemorySize;
 import io.vertx.core.buffer.Buffer;
+import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.Router;
 import io.vertx.ext.web.RoutingContext;
@@ -83,7 +84,20 @@ import org.jboss.logging.Logger;
  *
  * <p>These give a caller (qits-projects) a way to provision a repository over the wire instead of
  * {@code git init --bare} on the shared volume — see {@code projects-volume-decoupling-plan.md}
- * §2. There is deliberately no delete verb and no enumerate verb (that plan's §2.1).
+ * §2. There is deliberately no delete verb.
+ *
+ * <p>And one route on the bare collection:
+ *
+ * <ul>
+ *   <li>{@code GET /artifacts/git} — {@code {"repositories": ["<repoId>", …]}}, every repository
+ *       this host serves, sorted lexicographically.
+ * </ul>
+ *
+ * <p>That listing was withheld on purpose while nothing needed it (the same plan's §2.1, "no
+ * enumerate verb"); the decision is reversed rather than left standing, because qits-ci's trigger
+ * engine has to enumerate candidates before it can fire an event-triggered pipeline, and a caller
+ * that cannot ask has to be told out of band by whoever creates a repository. It is one segment
+ * shorter than every route above it, so it shadows none of them.
  */
 @ApplicationScoped
 public class GitHostRoutes {
@@ -176,6 +190,12 @@ public class GitHostRoutes {
    * here depends on where in the path a parameter happens to sit.
    */
   void init(@Observes Router router) {
+    // The collection, on the base itself: one segment shorter than every route below, so Vert.x can
+    // never dispatch a per-repo request here or a collection request there — the same path-length
+    // argument the two addressing schemes rest on. Blocking like the rest, because enumerating is a
+    // directory read on one backend and a query on the other.
+    router.get(BASE).blockingHandler(this::listRepositories);
+
     router.get(BASE + "/:repoId/info/refs").blockingHandler(rc -> infoRefs(rc, open(rc, "repoId")));
     router
         .post(BASE + "/:repoId/git-upload-pack")
@@ -327,6 +347,36 @@ public class GitHostRoutes {
   private boolean hasNoCiOption(ReceivePack pack) {
     List<String> options = pack.getPushOptions();
     return options != null && options.contains(NO_CI_OPTION);
+  }
+
+  /**
+   * {@code GET /artifacts/git} — {@code {"repositories": [...]}}, every repository this host serves.
+   *
+   * <p>Sorted here rather than by a backend, so the order is a property of the response and one
+   * answer for both storage engines. Filtered here for the same reason the id check in {@link
+   * #open(String)} is: an id that is not a valid slug cannot be served by any route on this host, so
+   * listing one would advertise a repository no caller could clone.
+   *
+   * <p>No authentication, exactly like every other route in this class — repo ids are capability
+   * UUIDs and the callers are machines on qits-net. A read surface gated on its own would be the
+   * piecemeal machine auth this platform has decided against; qits-idp gates these together.
+   *
+   * <p>An enumeration failure is a 500 by way of {@link #fail}, never an empty list: a trigger
+   * engine told "no repositories" stops triggering and reports nothing wrong.
+   */
+  private void listRepositories(RoutingContext rc) {
+    try {
+      JsonArray repositories = new JsonArray();
+      backend.provider().repositoryIds().stream()
+          .filter(repoId -> repoId.matches(REPO_ID_PATTERN))
+          .sorted()
+          .forEach(repositories::add);
+      rc.response()
+          .putHeader("Content-Type", "application/json")
+          .end(new JsonObject().put("repositories", repositories).encode());
+    } catch (Exception e) {
+      fail(rc, "git-list", e);
+    }
   }
 
   /**

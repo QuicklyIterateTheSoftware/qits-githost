@@ -1,6 +1,7 @@
 package eu.wohlben.qits.githost;
 
 import java.io.IOException;
+import java.util.List;
 import org.eclipse.jgit.lib.Repository;
 
 /**
@@ -52,4 +53,23 @@ public interface GitRepositoryProvider {
    * @throws IOException if the repository already exists or cannot be created
    */
   void create(String repoId, String defaultBranch) throws IOException;
+
+  /**
+   * Every repository this backend currently holds, by id — the enumeration {@code GET
+   * /artifacts/git} answers, and what qits-ci's trigger engine reads to know which repositories an
+   * event-triggered pipeline could fire for.
+   *
+   * <p><b>Order is not part of this contract and the route does not trust it.</b> The wire answer is
+   * sorted lexicographically and filtered to ids that are valid repo-id slugs, both in {@link
+   * GitHostRoutes}: sorting is a property of the response, and the slug rule is a property of the
+   * url, so neither belongs in a backend that could get it subtly wrong.
+   *
+   * <p>Unlike {@link #open}, this <b>throws rather than reads empty</b>. A backend that cannot be
+   * enumerated is not a host with no repositories, and answering an empty list would leave the
+   * trigger engine believing it had nothing to trigger — a failure with no symptom anywhere. An
+   * empty list means exactly one thing: this host serves no repository yet.
+   *
+   * @throws IOException if the backend cannot be enumerated
+   */
+  List<String> repositoryIds() throws IOException;
 }

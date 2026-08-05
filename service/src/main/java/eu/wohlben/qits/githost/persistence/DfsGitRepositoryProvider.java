@@ -6,6 +6,7 @@ import eu.wohlben.qits.githost.storage.QitsDfsRepositoryBuilder;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import java.io.IOException;
+import java.util.List;
 import org.eclipse.jgit.lib.Repository;
 import org.jboss.logging.Logger;
 
@@ -57,6 +58,15 @@ public class DfsGitRepositoryProvider implements GitRepositoryProvider {
     }
     repo.close();
     return null;
+  }
+
+  /**
+   * The catalog's own repository ids. Nothing is opened and no blob is read — enumerating a host is
+   * one query, not one repository open per row.
+   */
+  @Override
+  public List<String> repositoryIds() {
+    return catalog.repositoryIds();
   }
 
   @Override

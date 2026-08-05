@@ -46,6 +46,32 @@ public class CatalogRepository implements PackCatalog {
   }
 
   /**
+   * Every repository this catalog holds, by id — the DFS backend's half of {@code GET
+   * /artifacts/git}.
+   *
+   * <p>Not part of {@link PackCatalog}: that port is what JGit reaches through, one repository at a
+   * time, and it has no reason to know the catalog holds more than one. This is the git host asking
+   * the adapter a question only the adapter can answer, so it stays a method on the class.
+   *
+   * <p>A repository is here because it has packs, and it has packs from the moment it is created —
+   * {@code create} writes {@code HEAD} as a symref, and a reftable is a pack like any other. So the
+   * rows answer the same question {@code DfsGitRepositoryProvider.open} answers, off the same state,
+   * with no second table to keep in step.
+   *
+   * <p>Same threading as everything else here (see the class javadoc): its own request context and
+   * its own transaction, because the route's blocking handler binds neither.
+   */
+  @ActivateRequestContext
+  public List<String> repositoryIds() {
+    return QuarkusTransaction.requiringNew()
+        .call(
+            () ->
+                GitPack.getEntityManager()
+                    .createQuery("select distinct p.repositoryId from GitPack p", String.class)
+                    .getResultList());
+  }
+
+  /**
    * Adds and removes in <b>one</b> transaction, because a reader that saw only half of a repack
    * would find objects in no pack at all. Removes go first: a name is never reused, so the two sets
    * cannot overlap, but doing it in this order makes that assumption harmless if it ever stops

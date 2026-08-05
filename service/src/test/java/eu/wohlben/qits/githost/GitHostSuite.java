@@ -4,6 +4,7 @@ import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -16,6 +17,7 @@ import jakarta.ws.rs.core.Response;
 import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Random;
 import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
@@ -712,6 +714,85 @@ abstract class GitHostSuite {
 
     given().when().head("/artifacts/git/" + repoId).then().statusCode(
         Response.Status.OK.getStatusCode());
+  }
+
+  // --- the collection listing: GET /artifacts/git ------------------------------------------------
+  // A host is never empty by the time these run — the suite has created repositories above, and the
+  // file backend's data dir outlives the run — so every case here is stated as a property of the
+  // whole answer rather than as an equality against one. The empty host is a process configuration
+  // of its own: GitHostListingEmptyTest and GitHostListingEmptyDfsTest.
+
+  /** {@code GET /artifacts/git}, as the ordered list of ids it carries. */
+  private List<String> listRepositories() {
+    return given()
+        .when()
+        .get("/artifacts/git")
+        .then()
+        .statusCode(Response.Status.OK.getStatusCode())
+        .contentType(containsString("application/json"))
+        .extract()
+        .jsonPath()
+        .getList("repositories", String.class);
+  }
+
+  @Test
+  public void aCreatedRepositoryAppearsInTheListing() {
+    String repoId = UUID.randomUUID().toString();
+    assertFalse(listRepositories().contains(repoId), "an id nothing created must not be listed");
+
+    given()
+        .contentType(ContentType.JSON)
+        .body("{\"defaultBranch\":\"main\"}")
+        .when()
+        .put("/artifacts/git/" + repoId)
+        .then()
+        .statusCode(Response.Status.CREATED.getStatusCode());
+
+    assertTrue(
+        listRepositories().contains(repoId),
+        "a repository the host holds must be one the host lists");
+  }
+
+  @Test
+  public void theListingIsSortedLexicographically() throws Exception {
+    // Created out of order, under one run-unique prefix so the assertion survives a data dir that
+    // outlives the run: the three are compared in isolation, and the whole answer is then checked
+    // for sortedness so the order is a property of the response rather than of the insert order.
+    String prefix = "listing-" + UUID.randomUUID();
+    for (String suffix : new String[] {"-c", "-a", "-b"}) {
+      backend.provider().create(prefix + suffix, "main");
+    }
+
+    List<String> repositories = listRepositories();
+    assertEquals(
+        List.of(prefix + "-a", prefix + "-b", prefix + "-c"),
+        repositories.stream().filter(id -> id.startsWith(prefix)).toList());
+    assertEquals(
+        repositories.stream().sorted().toList(),
+        repositories,
+        "the whole listing is sorted, not merely the ids one test happened to create");
+  }
+
+  @Test
+  public void theListingRouteLeavesThePerRepositoryRoutesAlone() throws Exception {
+    // The collection sits one segment above every route that was there first, and a listing that
+    // swallowed info/refs would break every clone on this platform while looking like a new feature
+    // working.
+    String repoId = seedOrigin();
+    assertTrue(listRepositories().contains(repoId));
+
+    given()
+        .when()
+        .get("/artifacts/git/" + repoId + "/info/refs?service=git-upload-pack")
+        .then()
+        .statusCode(Response.Status.OK.getStatusCode())
+        .contentType(containsString("git-upload-pack-advertisement"));
+    given()
+        .when()
+        .get("/artifacts/git/" + repoId)
+        .then()
+        .statusCode(Response.Status.OK.getStatusCode())
+        .body("repoId", equalTo(repoId));
   }
 
   @Test

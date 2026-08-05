@@ -4,6 +4,8 @@ import jakarta.enterprise.context.ApplicationScoped;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
+import java.util.stream.Stream;
 import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.RefUpdate;
 import org.eclipse.jgit.lib.Repository;
@@ -72,6 +74,31 @@ public class FileGitRepositoryProvider implements GitRepositoryProvider {
       if (result != RefUpdate.Result.NEW && result != RefUpdate.Result.FORCED) {
         throw new IOException("could not point HEAD at " + defaultBranch + ": " + result.name());
       }
+    }
+  }
+
+  /**
+   * The data dir's immediate children that hold a bare — one directory read, no repository opened.
+   *
+   * <p>A child is a repository when it has an {@code origin} directory under it, which is the layout
+   * {@link #origin} writes and the one qits-projects and qits-workspaces mount. Anything else on the
+   * volume is simply not one, so nothing else is listed.
+   *
+   * <p>A data dir that does not exist yet is a host with no repositories, not a failure: that is how
+   * a deployment reads before it is ever provisioned. Every other I/O failure propagates, per the
+   * port — an unreadable directory must not read as an empty host.
+   */
+  @Override
+  public List<String> repositoryIds() throws IOException {
+    Path base = Path.of(dataDir);
+    if (!Files.isDirectory(base)) {
+      return List.of();
+    }
+    try (Stream<Path> children = Files.list(base)) {
+      return children
+          .filter(child -> Files.isDirectory(child.resolve("origin")))
+          .map(child -> child.getFileName().toString())
+          .toList();
     }
   }
 
