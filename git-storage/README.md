@@ -4,8 +4,8 @@
 
 A JGit `DfsRepository` whose packs, pack indexes and refs are all blobs in a content-addressed
 store, listed by a catalog keyed on a repository id. `UploadPack` and `ReceivePack` take a
-`Repository`, so the smart-HTTP endpoints that serve a bare origin today serve one of these
-unchanged — only whatever *opens* the repository changes.
+`Repository`, so the smart-HTTP endpoints above it never learn where the bytes are — only whatever
+*opens* the repository knows.
 
 Six classes, two ports, one dependency: `org.eclipse.jgit`.
 

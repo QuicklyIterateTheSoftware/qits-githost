@@ -3,8 +3,8 @@ package eu.wohlben.qits.githost;
 import java.util.Optional;
 
 /**
- * Port: resolves a project-scoped repository <b>name</b> to the repo id whose bare origin this
- * context serves — the one fact {@link GitHostRoutes} reads of another context.
+ * Port: resolves a project-scoped repository <b>name</b> to the repo id this context serves — the
+ * one fact {@link GitHostRoutes} reads of another context.
  *
  * <p>In the monorepo this was a direct injection of {@code
  * eu.wohlben.qits.domain.repository.persistence.RepositoryNameRepository}, the alias table owned by

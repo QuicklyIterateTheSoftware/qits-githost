@@ -15,16 +15,14 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@code -o qits.no-ci} (workstream BN) against the {@code file} backend: a push carrying the
- * option produces no delivery to the CI intake, and a push without it still does — the regression
- * the option must never become. {@link GitHostNoCiOptionDfsTest} is the same suite against {@code
- * dfs}.
+ * {@code -o qits.no-ci} (workstream BN): a push carrying the option produces no delivery to the CI
+ * intake, and a push without it still does — the regression the option must never become.
  *
- * <p>A pair of standalone classes rather than two more cases in {@link GitHostSuite}, because
+ * <p>A standalone class rather than two more cases in {@link GitHostTest}, because
  * {@code qits.ci.intake-url} has to point at {@link StubCiIntake} for this and only this — the
  * suite otherwise runs against a closed port on purpose (see the shared test {@code
- * application.properties}), and giving the SHIPPED-config class ({@link GitHostTest}) a {@code
- * @TestProfile} would contradict the one its own javadoc states. Same shape as {@link
+ * application.properties}), and giving {@link GitHostTest} a {@code @TestProfile} would contradict
+ * the shipped configuration its own javadoc claims. Same shape as {@link
  * GitHostPushTokenTest}/{@link GitHostEmptyPushTokenTest}: a process configuration is a class, not a
  * case.
  */
@@ -39,7 +37,7 @@ public class GitHostNoCiOptionTest {
     }
   }
 
-  @Inject GitRepositoryBackend backend;
+  @Inject GitRepositoryProvider repositories;
 
   @TestHTTPResource("/artifacts/git")
   URL gitBase;
@@ -51,7 +49,7 @@ public class GitHostNoCiOptionTest {
 
   @Test
   public void theNoCiOptionSuppressesTheIntakePost() throws Exception {
-    String repoId = GitHostFixture.seedOrigin(backend.provider(), gitBase);
+    String repoId = GitHostFixture.seedOrigin(repositories, gitBase);
     Path clone = GitHostFixture.clone(gitBase, repoId);
     StubCiIntake.reset(); // seedOrigin's own push is an ordinary one and already fired an event
 
@@ -66,7 +64,7 @@ public class GitHostNoCiOptionTest {
 
   @Test
   public void aPushWithoutTheOptionStillFiresTheIntakePost() throws Exception {
-    String repoId = GitHostFixture.seedOrigin(backend.provider(), gitBase);
+    String repoId = GitHostFixture.seedOrigin(repositories, gitBase);
     Path clone = GitHostFixture.clone(gitBase, repoId);
     StubCiIntake.reset();
 

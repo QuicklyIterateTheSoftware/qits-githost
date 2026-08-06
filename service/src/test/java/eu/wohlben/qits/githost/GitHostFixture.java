@@ -10,19 +10,16 @@ import java.util.UUID;
 
 /**
  * The git CLI, driven as a test would drive a workspace container: real repositories provisioned
- * through the host's own storage backend, real clones over the served HTTP endpoint, real pushes.
+ * through the host's own storage, real clones over the served HTTP endpoint, real pushes.
  *
- * <p>Static and shared because four {@code @QuarkusTest} classes need it and only two of them share
- * a base class. {@code GitHostSuite} is that base and its subclasses differ by one config value; the
- * two push-token classes carry profiles that change what the whole suite would mean, so they stay
- * separate and reach these helpers as statics.
+ * <p>Static and shared because four {@code @QuarkusTest} classes need it and they share no base
+ * class: each carries a profile that would change what the whole suite means, so they stay separate
+ * and reach these helpers as statics.
  *
- * <p><b>Nothing here reads a directory.</b> {@link #emptyOrigin} asks the selected {@link
- * GitRepositoryProvider} to make a repository and every assertion after that goes over the wire, so
- * the same helpers serve a bare on the shared volume and a repository whose packs and refs are blobs
- * — which is what lets {@code GitHostSuite} run against either backend unchanged. Reading a served
- * bare with {@code rev-parse} was the shortcut that would have made half this suite untranslatable:
- * a {@code DfsRepository} has no directory for the git CLI to open at all.
+ * <p><b>Nothing here reads a directory</b>, because there is none to read. {@link #emptyOrigin} asks
+ * {@link GitRepositoryProvider} to make a repository and every assertion after that goes over the
+ * wire. Reading a served bare with {@code rev-parse} was the shortcut this suite was written away
+ * from: a {@code DfsRepository} has no directory for the git CLI to open at all.
  *
  * <p>The git CLI rather than JGit's porcelain, for the same reason {@code GitHostTest} always shelled
  * it: what is under test is whether the real client can talk to this host, including the parts of
@@ -52,11 +49,9 @@ final class GitHostFixture {
    * freshly provisioned origin has, and the one where the protected ref exists only as a symref.
    * Pushing to it is a CREATE, which protection deliberately allows.
    *
-   * <p><b>This is the backend lever.</b> It is the only method in this class that knows anything
-   * about where a repository lives, and it does not know either: it asks the selected {@link
-   * GitRepositoryProvider}, so the same suite runs against a bare on the volume and against a
-   * repository whose packs and refs are blobs. Everything else here goes over the wire, which is
-   * backend-agnostic by construction.
+   * <p>The only method in this class that knows a repository has to come from somewhere, and it
+   * does not know where either: it asks {@link GitRepositoryProvider}. Everything else here goes
+   * over the wire.
    *
    * <p>The branch is pinned rather than left to {@code init.defaultBranch}, because the protected
    * ref is the repository's own HEAD and a test that does not know its name proves nothing about it.
@@ -71,9 +66,8 @@ final class GitHostFixture {
    * An empty repository with one commit pushed onto {@code main} — a repository as the platform's
    * would be after its first push, and the starting point for most of the suite.
    *
-   * <p>Seeded <b>through the served endpoint</b> rather than by building a bare beside it: that is
-   * the only seeding that exists on both backends, and it is also the honest one, since receive-pack
-   * is the only door a DFS-backed repository has.
+   * <p>Seeded <b>through the served endpoint</b> rather than by building a bare beside it, because
+   * receive-pack is the only door this storage has.
    */
   static String seedOrigin(GitRepositoryProvider provider, URL gitBase) throws Exception {
     String repoId = emptyOrigin(provider);
@@ -88,8 +82,8 @@ final class GitHostFixture {
 
   /**
    * What the served repository says a ref is, or {@code null} if it has none — {@code git ls-remote}
-   * rather than a {@code rev-parse} in a directory, because only one of those two exists on both
-   * backends. It also asks the question the clients actually ask.
+   * rather than a {@code rev-parse} in a directory, because there is no directory. It also asks the
+   * question the clients actually ask.
    */
   static String remoteRefSha(URL gitBase, String repoId, String ref) throws Exception {
     return lsRemote(gitBase, repoId, ref, ref);

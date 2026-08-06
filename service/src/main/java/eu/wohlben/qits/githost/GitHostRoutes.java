@@ -41,8 +41,8 @@ import org.jboss.logging.Logger;
  * which cannot hold a user token — so {@code /artifacts/git/*} deliberately stays on {@code
  * QitsAuthPolicy}'s public list in every auth build variant (container traffic reaches qits directly on qits-net,
  * bypassing any forward-auth proxy — see auth-core's {@code PublicPaths}). Anonymous fetch AND push
- * are both enabled. The git CLI ({@code GitExecutor}) remains the only thing that mutates
- * repositories; JGit here speaks the wire protocol and nothing else.
+ * are both enabled. JGit here speaks the wire protocol and nothing else, and receive-pack is the
+ * only writer this host has — a repository has no directory anyone could run git in.
  *
  * <p>One thing a push is checked against: {@link ProtectedRefHook}, the default branch's seatbelt.
  * It is not authentication and is not an authorization system — it guards exactly one ref per repo
@@ -54,7 +54,7 @@ import org.jboss.logging.Logger;
  *
  * <ul>
  *   <li><b>id-addressed</b> {@code /artifacts/git/:repoId} — the opaque UUID, handed straight to the
- *       storage backend (back-compat: already-provisioned containers, metadata, discovery).
+ *       storage (back-compat: already-provisioned containers, metadata, discovery).
  *   <li><b>name-addressed</b> {@code /artifacts/git/:projectId/:repoName} — a project's
  *       repositories served as siblings, {@code repoName} resolved through the {@link
  *       RepositoryNameResolver} port to a repo id. This is what lets committed relative submodule
@@ -106,7 +106,7 @@ public class GitHostRoutes {
 
   /**
    * Repo ids are UUIDs; allow only their character set, no path separators or leading dash — so a
-   * traversal-shaped id ({@code ..}, a slash, a dotted name) can never escape the data dir.
+   * traversal-shaped id ({@code ..}, a slash, a dotted name) is refused rather than looked up.
    */
   private static final String REPO_ID_PATTERN = "[A-Za-z0-9][A-Za-z0-9-]{0,63}";
 
@@ -161,11 +161,10 @@ public class GitHostRoutes {
   @Inject ProtectedRefHook protectedRefs;
 
   /**
-   * Where repositories live. Two backends ship in the same binary and {@code
-   * qits.repositories.git.storage} picks one; nothing in this class knows which, because {@link
-   * #open} is the only method that has to.
+   * Where repositories live: packs, pack indexes and refs as blobs in this service's own store. The
+   * one seam between these routes and the bytes, and the only class here that knows there is one.
    */
-  @Inject GitRepositoryBackend backend;
+  @Inject GitRepositoryProvider provider;
 
   /** A resolved repository plus the id it resolved to (the post-receive hook needs the id). */
   private record OpenedRepo(String repoId, Repository repo) {}
@@ -192,8 +191,8 @@ public class GitHostRoutes {
   void init(@Observes Router router) {
     // The collection, on the base itself: one segment shorter than every route below, so Vert.x can
     // never dispatch a per-repo request here or a collection request there — the same path-length
-    // argument the two addressing schemes rest on. Blocking like the rest, because enumerating is a
-    // directory read on one backend and a query on the other.
+    // argument the two addressing schemes rest on. Blocking like the rest, because enumerating is
+    // a query against the pack catalog.
     router.get(BASE).blockingHandler(this::listRepositories);
 
     router.get(BASE + "/:repoId/info/refs").blockingHandler(rc -> infoRefs(rc, open(rc, "repoId")));
@@ -352,8 +351,8 @@ public class GitHostRoutes {
   /**
    * {@code GET /artifacts/git} — {@code {"repositories": [...]}}, every repository this host serves.
    *
-   * <p>Sorted here rather than by a backend, so the order is a property of the response and one
-   * answer for both storage engines. Filtered here for the same reason the id check in {@link
+   * <p>Sorted here rather than by the provider, so the order is a property of the response.
+   * Filtered here for the same reason the id check in {@link
    * #open(String)} is: an id that is not a valid slug cannot be served by any route on this host, so
    * listing one would advertise a repository no caller could clone.
    *
@@ -367,7 +366,7 @@ public class GitHostRoutes {
   private void listRepositories(RoutingContext rc) {
     try {
       JsonArray repositories = new JsonArray();
-      backend.provider().repositoryIds().stream()
+      provider.repositoryIds().stream()
           .filter(repoId -> repoId.matches(REPO_ID_PATTERN))
           .sorted()
           .forEach(repositories::add);
@@ -400,7 +399,7 @@ public class GitHostRoutes {
       return;
     }
     try {
-      backend.provider().create(repoId, defaultBranch);
+      provider.create(repoId, defaultBranch);
       respondRepository(rc, 201, repoId);
     } catch (IOException e) {
       // create() throws IOException both for "already exists" and for any other creation failure,
@@ -435,7 +434,7 @@ public class GitHostRoutes {
       rc.response().setStatusCode(400).end();
       return;
     }
-    try (Repository repo = backend.provider().open(repoId)) { // null repo: a no-op close
+    try (Repository repo = provider.open(repoId)) { // null repo: a no-op close
       rc.response().setStatusCode(repo == null ? 404 : 200).end();
     } catch (Exception e) {
       fail(rc, "git-head", e);
@@ -444,12 +443,12 @@ public class GitHostRoutes {
 
   /**
    * Opens {@code repoId} and writes {@code {"repoId", "defaultBranch"}} at {@code status}, or 404 if
-   * the backend holds no such repository. Shared by the create 200/201 arms and by {@link
+   * the store holds no such repository. Shared by the create 200/201 arms and by {@link
    * #describeRepository}, so all three report the repository's own {@code HEAD} rather than trusting
    * whatever a caller asked for.
    */
   private void respondRepository(RoutingContext rc, int status, String repoId) {
-    try (Repository repo = backend.provider().open(repoId)) { // null repo: a no-op close
+    try (Repository repo = provider.open(repoId)) { // null repo: a no-op close
       if (repo == null) {
         rc.response().setStatusCode(404).end();
         return;
@@ -467,9 +466,9 @@ public class GitHostRoutes {
     }
   }
 
-  /** Whether the backend already holds {@code repoId}. */
+  /** Whether the store already holds {@code repoId}. */
   private boolean repositoryExists(String repoId) {
-    try (Repository repo = backend.provider().open(repoId)) { // null repo: a no-op close
+    try (Repository repo = provider.open(repoId)) { // null repo: a no-op close
       return repo != null;
     }
   }
@@ -518,24 +517,22 @@ public class GitHostRoutes {
   }
 
   /**
-   * Validates the id and hands it to the selected {@link GitRepositoryProvider}. Returns {@code
-   * null} (→ 404) for an id that isn't a valid repo-id slug or that the backend does not hold; the
-   * caller closes the returned repo.
+   * Validates the id and hands it to the {@link GitRepositoryProvider}. Returns {@code null} (→
+   * 404) for an id that isn't a valid repo-id slug or that the store does not hold; the caller
+   * closes the returned repo.
    *
    * <p><b>This is the whole storage seam.</b> Everything above it — {@link #infoRefs} and {@link
-   * #service} — takes a {@code Repository} and cannot tell a bare on the shared volume from a
-   * repository whose packs and refs are blobs in this service's own store.
+   * #service} — takes a {@code Repository} and never learns that its packs and refs are blobs.
    *
-   * <p>The slug check stays <b>here</b> rather than moving into a provider, because it is a property
-   * of the url and not of a backend: the file backend joins the id to a path and needs it, the DFS
-   * backend never touches a filesystem and would not — and a traversal-shaped id has to be refused
-   * identically either way.
+   * <p>The slug check stays <b>here</b> rather than moving into the provider, because it is a
+   * property of the url: nothing under this seam touches a filesystem, so a traversal-shaped id
+   * would simply be an unknown id there, and it has to be refused rather than looked up.
    */
   private OpenedRepo open(String repoId) {
     if (repoId == null || !repoId.matches(REPO_ID_PATTERN)) {
       return null;
     }
-    Repository repo = backend.provider().open(repoId);
+    Repository repo = provider.open(repoId);
     return repo == null ? null : new OpenedRepo(repoId, repo);
   }
 
@@ -543,7 +540,7 @@ public class GitHostRoutes {
    * Opens the repository addressed by {@code /artifacts/git/:projectId/:repoName}: strips an
    * optional {@code
    * .git} suffix, resolves {@code (projectId, name)} through the {@link RepositoryNameResolver} to
-   * a repo id, then opens that repo through the storage backend. The path segments are only lookup
+   * a repo id, then opens that repo through the provider. The path segments are only lookup
    * keys (never filesystem paths), and the resolved id is re-validated by {@link
    * #open(String)}, so traversal is impossible. With no resolver configured this is a 404.
    */

@@ -7,45 +7,35 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
-import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 import java.util.Map;
-import java.util.UUID;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@code GET /artifacts/git} on a host that serves nothing yet, against the {@code file} backend.
+ * {@code GET /artifacts/git} on a host that serves nothing yet.
  *
- * <p>A class rather than a case in {@link GitHostSuite}, for the reason {@link GitHostNoCiOptionTest}
- * is one: an empty host is a process configuration. The shared data dir is {@code
- * target/githost-test-repos}, which every other class in this package writes into and which outlives
- * the run, so "empty" cannot be arranged inside the suite — it has to be a {@code @TestProfile} with
- * a data dir of its own.
- *
- * <p>That directory is never created, which is the case worth having: a deployment reads this way
- * before it is ever provisioned, and an absent data dir must be a host with no repositories rather
- * than a 500.
+ * <p>A class rather than a case in {@link GitHostTest}, for the reason {@link GitHostNoCiOptionTest}
+ * is one: an empty host is a process configuration. What has to be private here is the
+ * <b>database</b> — the host answers this question from the pack catalog, the suite's H2 is one
+ * in-memory instance shared by every class in the run, and {@link GitHostTest} fills {@code
+ * git_pack} — so this profile names an instance of its own. Flyway migrates it exactly as it does
+ * the shared one.
  *
  * <p>The body is asserted as an exact string. The field name is a cross-repo contract — qits-ci
  * reads {@code repositories} — and an empty host is the one answer where a typo'd or absent field
  * still looks plausible to a JSON path assertion.
  */
 @QuarkusTest
-@TestProfile(GitHostListingEmptyTest.FreshDataDir.class)
+@TestProfile(GitHostListingEmptyTest.FreshCatalog.class)
 public class GitHostListingEmptyTest {
 
-  public static class FreshDataDir implements QuarkusTestProfile {
+  public static class FreshCatalog implements QuarkusTestProfile {
     @Override
     public Map<String, String> getConfigOverrides() {
-      return Map.of("qits.repositories.data-dir", "target/githost-empty-host/" + UUID.randomUUID());
+      return Map.of(
+          "quarkus.datasource.artifacts.jdbc.url",
+          "jdbc:h2:mem:artifacts-githost-empty;DB_CLOSE_DELAY=-1");
     }
-  }
-
-  @Inject GitRepositoryBackend backend;
-
-  @Test
-  public void theSuiteIsRunningAgainstTheFileBackend() {
-    assertEquals("file", backend.provider().name());
   }
 
   @Test

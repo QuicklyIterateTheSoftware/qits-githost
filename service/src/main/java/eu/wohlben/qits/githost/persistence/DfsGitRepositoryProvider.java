@@ -11,11 +11,12 @@ import org.eclipse.jgit.lib.Repository;
 import org.jboss.logging.Logger;
 
 /**
- * The second backend: a repository with no directory anywhere, whose packs, pack indexes and refs
- * are blobs in the platform's own content-addressed store and whose pack list is rows beside them.
+ * The git host's storage: a repository with no directory anywhere, whose packs, pack indexes and
+ * refs are blobs in the platform's own content-addressed store and whose pack list is rows beside
+ * them.
  *
- * <p>Selected by {@code qits.repositories.git.storage=dfs}, which is <b>not</b> the shipped default.
- * Step one of the rollout is both backends in the binary and nothing changing behaviour.
+ * <p>The only implementation of {@link GitRepositoryProvider}. A second one, bare origins on a
+ * shared volume, ran beside it for one release cycle and is gone — the volume with it.
  *
  * <p><b>The git CLI cannot open one of these.</b> There is no directory to point {@code --git-dir}
  * at, no worktree to add and no config file to write, so every operation on such a repository is
@@ -29,22 +30,14 @@ public class DfsGitRepositoryProvider implements GitRepositoryProvider {
 
   private static final Logger LOG = Logger.getLogger(DfsGitRepositoryProvider.class);
 
-  static final String NAME = "dfs";
-
   @Inject BlobStorePackBlobStore blobs;
 
   @Inject CatalogRepository catalog;
 
-  @Override
-  public String name() {
-    return NAME;
-  }
-
   /**
    * Existence is answered by the ref database, not by a table of its own: a repository that has ever
    * been created has a reftable in the catalog, and one that has not reads as empty. So an unknown
-   * id is a 404 here for the same reason a missing directory is on the file backend, with no extra
-   * row to keep in step.
+   * id is a 404 with no extra row to keep in step.
    */
   @Override
   public Repository open(String repoId) {

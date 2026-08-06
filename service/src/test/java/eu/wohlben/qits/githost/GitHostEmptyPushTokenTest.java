@@ -36,7 +36,7 @@ public class GitHostEmptyPushTokenTest {
     }
   }
 
-  @Inject GitRepositoryBackend backend;
+  @Inject GitRepositoryProvider repositories;
 
   @TestHTTPResource("/artifacts/git")
   URL gitBase;
@@ -47,7 +47,7 @@ public class GitHostEmptyPushTokenTest {
 
   @Test
   public void anEmptyConfiguredTokenIsSatisfiedByNothingAtAll() throws Exception {
-    String repoId = GitHostFixture.seedOrigin(backend.provider(), gitBase);
+    String repoId = GitHostFixture.seedOrigin(repositories, gitBase);
     Path clone = GitHostFixture.clone(gitBase, repoId);
     String before = refSha(repoId, "refs/heads/main");
 

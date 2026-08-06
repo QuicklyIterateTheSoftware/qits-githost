@@ -19,12 +19,11 @@ import org.jboss.logging.Logger;
  * delete of whatever {@code HEAD} points at, so that releasing becomes something the platform does
  * (through qits-workspaces' integrate endpoint) rather than something a person remembers to do.
  *
- * <p><b>This is not a lock and must not pretend to be one.</b> On the file backend, anything with
- * the {@code qits-repositories} volume mounted still moves a ref by writing a file, and that is fine
- * — those are platform components, not accidents. What this guards against is reflex: the muscle
- * memory of {@code git push …/artifacts/git/<repo> main} that every doc in this tree taught first.
- * (On the DFS backend that second door does not exist at all: there is no file to write, so
- * receive-pack — and therefore this hook — is on the only path in.)
+ * <p><b>This is not a lock and must not pretend to be one.</b> What it guards against is reflex:
+ * the muscle memory of {@code git push …/artifacts/git/<repo> main} that every doc in this tree
+ * taught first. There used to be a second door beside it — anything with the {@code
+ * qits-repositories} volume mounted moved a ref by writing a file — and that volume is gone, so
+ * receive-pack, and therefore this hook, is now on the only path in.
  *
  * <p>Why a Java hook and not a {@code hooks/pre-receive} script: this host runs no git. {@link
  * GitHostRoutes} drives JGit's {@link ReceivePack} in-process from raw Vert.x routes — no CGI, no

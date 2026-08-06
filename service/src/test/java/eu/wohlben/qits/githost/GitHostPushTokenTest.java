@@ -42,7 +42,7 @@ public class GitHostPushTokenTest {
     }
   }
 
-  @Inject GitRepositoryBackend backend;
+  @Inject GitRepositoryProvider repositories;
 
   @Inject RepositoryProtectionStore protections;
 
@@ -50,7 +50,7 @@ public class GitHostPushTokenTest {
   URL gitBase;
 
   private String seedOrigin() throws Exception {
-    return GitHostFixture.seedOrigin(backend.provider(), gitBase);
+    return GitHostFixture.seedOrigin(repositories, gitBase);
   }
 
   private String refSha(String repoId, String ref) throws Exception {
