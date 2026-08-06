@@ -15,14 +15,24 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.zip.GZIPInputStream;
+import org.eclipse.jgit.errors.IncorrectObjectTypeException;
+import org.eclipse.jgit.errors.MissingObjectException;
+import org.eclipse.jgit.errors.RevisionSyntaxException;
 import org.eclipse.jgit.lib.Constants;
+import org.eclipse.jgit.lib.FileMode;
+import org.eclipse.jgit.lib.ObjectId;
+import org.eclipse.jgit.lib.ObjectLoader;
 import org.eclipse.jgit.lib.Repository;
+import org.eclipse.jgit.revwalk.RevCommit;
+import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.transport.PacketLineOut;
 import org.eclipse.jgit.transport.ReceivePack;
 import org.eclipse.jgit.transport.RefAdvertiser.PacketLineOutRefAdvertiser;
 import org.eclipse.jgit.transport.UploadPack;
+import org.eclipse.jgit.treewalk.TreeWalk;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
@@ -98,6 +108,20 @@ import org.jboss.logging.Logger;
  * engine has to enumerate candidates before it can fire an event-triggered pipeline, and a caller
  * that cannot ask has to be told out of band by whoever creates a repository. It is one segment
  * shorter than every route above it, so it shadows none of them.
+ *
+ * <p>And two <b>content reads</b>, on the id-addressed base:
+ *
+ * <ul>
+ *   <li>{@code GET …/:repoId/blob/:rev/<path>} — the raw bytes at that path in that revision.
+ *   <li>{@code GET …/:repoId/tree/:rev[/<path>]} — {@code {"entries":[{"name","type"}]}} for the
+ *       directory there; no path is the root tree.
+ * </ul>
+ *
+ * <p>The wire protocol has no blob-at-path verb, so a consumer that wanted one file had to keep a
+ * local clone and re-fetch it. Both routes answer at any revision the repository holds — a full sha
+ * as readily as a branch name — which is what lets a post-receive consumer read the exact pushed
+ * commit instead of racing the branch, and both carry the resolved commit in {@value
+ * #COMMIT_SHA_HEADER}. They are reads, so they are unauthenticated like everything else here.
  */
 @ApplicationScoped
 public class GitHostRoutes {
@@ -122,6 +146,45 @@ public class GitHostRoutes {
 
   private static final String UPLOAD = "git-upload-pack";
   private static final String RECEIVE = "git-receive-pack";
+
+  /**
+   * The resolved commit, on every content response. <b>Not</b> an {@code X-Qits-} name: qits-gateway
+   * strips that whole prefix unconditionally, so a header spelled that way would reach a caller
+   * through qits-net and vanish through the gateway — the same trap that makes the push bypasses
+   * push options rather than headers.
+   *
+   * <p>It is what makes a read at a branch name useful: the caller learns which commit it actually
+   * got, so a later read can be pinned to that sha rather than to a ref that has since moved.
+   */
+  static final String COMMIT_SHA_HEADER = "Git-Commit-Sha";
+
+  /**
+   * The largest blob {@link #serveBlob} hands back; anything larger is a {@code 413} naming this
+   * number. Sized for source files — a pipeline config, a lockfile, a Dockerfile — because that is
+   * what a content read is for; a consumer that wants a repository's bytes in bulk clones it.
+   *
+   * <p>Stated as a constant rather than a config key on purpose: it is a property of what this route
+   * is for, not a deployment's choice, and a knob would invite raising it until the read is a
+   * memory allocation on a deliberately unauthenticated route. The whole blob is held in memory —
+   * the same reason {@link #maxPackSize} sits far below the wire ceiling.
+   */
+  private static final int MAX_BLOB_BYTES = 8 * 1024 * 1024;
+
+  /**
+   * What a {@code :rev} may look like: a full sha or a ref name. No leading dash or dot, no {@code
+   * ..}, no whitespace — the argv-safety discipline every user-supplied ref gets — and no {@code
+   * ^~@{}:}, which keeps a rev a NAME rather than a revision expression. {@code HEAD@{2}} and
+   * {@code main^{tree}} are things {@link Repository#resolve} would happily answer; refusing them
+   * keeps this route's contract to "a sha or a ref" instead of to whatever JGit's parser accepts.
+   *
+   * <p>Slashes are allowed, because {@code feature/x} is a branch name. They cannot arrive as path
+   * separators — {@code :rev} is one path segment — so a slashy ref is written {@code %2F}, decoded
+   * by {@link #decodePercent} before this check runs.
+   */
+  private static final String REV_PATTERN = "[A-Za-z0-9][A-Za-z0-9._/-]{0,254}";
+
+  /** The longest repository-relative path a content read will look up. */
+  private static final int MAX_PATH_LENGTH = 1024;
 
   /**
    * {@code -o qits.no-ci} — skip the CI post-receive POST for this push. Read in {@link
@@ -211,6 +274,18 @@ public class GitHostRoutes {
         .blockingHandler(this::createRepository);
     router.get(BASE + "/:repoId").blockingHandler(this::describeRepository);
     router.head(BASE + "/:repoId").blockingHandler(this::headRepository);
+
+    // The content reads, BEFORE the name-addressed scheme: they carry a literal second segment
+    // (`blob`, `tree`) where that scheme carries a repository NAME, so a project holding a
+    // repository called `blob` is the one place the two overlap — see contentReadIsNotAClone, which
+    // hands that request back to the router rather than answering it. Registered with regexes so
+    // the tail can hold slashes, the MavenPaths/NpmPaths shape: every group is (?<named>…) or
+    // (?:…), because vertx-web silently falls back to positional param0…N when the count disagrees.
+    // The rev group is deliberately LOOSE here and validated in the handler — a malformed rev is a
+    // 400 that says so, not a 404 that sends the caller looking for a repository.
+    router.getWithRegex(blobRoute()).blockingHandler(this::serveBlob);
+    router.getWithRegex(treeRoute("")).blockingHandler(this::serveTree);
+    router.getWithRegex(treeRoute("/(?<path>.*)")).blockingHandler(this::serveTree);
 
     router
         .get(BASE + "/:projectId/:repoName/info/refs")
@@ -346,6 +421,283 @@ public class GitHostRoutes {
   private boolean hasNoCiOption(ReceivePack pack) {
     List<String> options = pack.getPushOptions();
     return options != null && options.contains(NO_CI_OPTION);
+  }
+
+  // --- content reads ------------------------------------------------------------------------------
+
+  /** {@code …/:repoId/blob/:rev/<path>} — the path is required, so the tail is {@code .+}. */
+  private static String blobRoute() {
+    return BASE + "/(?<repoId>" + REPO_ID_PATTERN + ")/blob/(?<rev>[^/]+)/(?<path>.+)";
+  }
+
+  /**
+   * {@code …/:repoId/tree/:rev} plus {@code suffix} — registered twice, with and without a path,
+   * rather than once with an optional group: an unmatched named group is a shape vertx-web's
+   * parameter scraping does not have to handle, and two routes cost nothing.
+   *
+   * <p>A method rather than a constant for the reason {@code MavenPaths.route} is one: a {@code
+   * static final String} built from a constant expression is inlined by javac into every reader.
+   */
+  private static String treeRoute(String suffix) {
+    return BASE + "/(?<repoId>" + REPO_ID_PATTERN + ")/tree/(?<rev>[^/]+)" + suffix;
+  }
+
+  /**
+   * {@code GET …/:repoId/blob/:rev/<path>} — the raw bytes at that path in that revision, {@code
+   * application/octet-stream}, with the resolved commit in {@value #COMMIT_SHA_HEADER}.
+   *
+   * <p>404 for a repository, revision or path that does not resolve, and for a path that resolves
+   * to something other than a file (a directory, a symlink, a submodule gitlink — none of them has
+   * bytes a consumer could use as file content). 400 for a rev or path this route will not look up
+   * at all. 413 for a blob past {@link #MAX_BLOB_BYTES}.
+   *
+   * <p>A revision is anything the repository holds, reachable from a ref or not. That is the point
+   * rather than an oversight: a post-receive consumer reads at the sha it was told about, which the
+   * branch may already have moved past. It is not the {@code UploadPack} want policy being relaxed
+   * — that stays {@code ADVERTISED}, because a want runs a reachability walk and this does not.
+   */
+  private void serveBlob(RoutingContext rc) {
+    String rev = decodePercent(rc.pathParam("rev"));
+    String path = normalizePath(rc.pathParam("path"));
+    if (contentReadIsNotAClone(rc, rev, path)) {
+      return;
+    }
+    if (!isValidRev(rev)) {
+      rc.response().setStatusCode(400).end("rev must match " + REV_PATTERN);
+      return;
+    }
+    if (!isValidPath(path) || path.isEmpty()) {
+      rc.response().setStatusCode(400).end("path must be a repository-relative file path");
+      return;
+    }
+    OpenedRepo opened = open(rc.pathParam("repoId"));
+    if (opened == null) {
+      rc.response().setStatusCode(404).end();
+      return;
+    }
+    try (Repository repo = opened.repo();
+        RevWalk walk = new RevWalk(repo)) {
+      RevCommit commit = resolveCommit(repo, walk, rev);
+      if (commit == null) {
+        rc.response().setStatusCode(404).end();
+        return;
+      }
+      try (TreeWalk found = TreeWalk.forPath(repo, path, commit.getTree())) {
+        if (found == null || !isFile(found.getFileMode(0))) {
+          rc.response().setStatusCode(404).end();
+          return;
+        }
+        ObjectLoader loader = repo.open(found.getObjectId(0), Constants.OBJ_BLOB);
+        if (loader.getSize() > MAX_BLOB_BYTES) {
+          rc.response()
+              .setStatusCode(413)
+              .end("blob is larger than the " + MAX_BLOB_BYTES + " bytes this route serves");
+          return;
+        }
+        rc.response()
+            .putHeader("Content-Type", "application/octet-stream")
+            .putHeader(COMMIT_SHA_HEADER, commit.name())
+            .end(Buffer.buffer(loader.getBytes(MAX_BLOB_BYTES)));
+      }
+    } catch (MissingObjectException | IncorrectObjectTypeException e) {
+      // A well-formed object id this repository does not hold, or holds as the wrong type. Both are
+      // "no such content here", which is a 404 rather than the 500 fail() would make of them.
+      rc.response().setStatusCode(404).end();
+    } catch (Exception e) {
+      fail(rc, "git-blob", e);
+    }
+  }
+
+  /**
+   * {@code GET …/:repoId/tree/:rev[/<path>]} — {@code {"entries":[{"name","type"}]}} for the
+   * directory at that revision, no path meaning the root tree. 404 when the revision or the path
+   * does not resolve, and when the path resolves to something that is not a tree.
+   *
+   * <p>{@code type} is {@code tree} or {@code blob} and nothing else: a symlink and a submodule
+   * gitlink are listed as {@code blob}, because what a caller does with an entry is descend into it
+   * or read it, and neither of those can be descended into. The order is the tree's own — git's
+   * canonical sort — so it is stable across revisions without this route sorting anything.
+   */
+  private void serveTree(RoutingContext rc) {
+    String rev = decodePercent(rc.pathParam("rev"));
+    String path = normalizePath(rc.pathParam("path"));
+    if (contentReadIsNotAClone(rc, rev, path)) {
+      return;
+    }
+    if (!isValidRev(rev)) {
+      rc.response().setStatusCode(400).end("rev must match " + REV_PATTERN);
+      return;
+    }
+    if (!isValidPath(path)) {
+      rc.response().setStatusCode(400).end("path must be a repository-relative directory path");
+      return;
+    }
+    OpenedRepo opened = open(rc.pathParam("repoId"));
+    if (opened == null) {
+      rc.response().setStatusCode(404).end();
+      return;
+    }
+    try (Repository repo = opened.repo();
+        RevWalk walk = new RevWalk(repo)) {
+      RevCommit commit = resolveCommit(repo, walk, rev);
+      if (commit == null) {
+        rc.response().setStatusCode(404).end();
+        return;
+      }
+      ObjectId tree = path.isEmpty() ? commit.getTree() : subtree(repo, commit, path);
+      if (tree == null) {
+        rc.response().setStatusCode(404).end();
+        return;
+      }
+      JsonArray entries = new JsonArray();
+      try (TreeWalk walker = new TreeWalk(repo)) {
+        walker.addTree(tree);
+        walker.setRecursive(false);
+        while (walker.next()) {
+          entries.add(
+              new JsonObject()
+                  .put("name", walker.getNameString())
+                  .put("type", FileMode.TREE.equals(walker.getFileMode(0)) ? "tree" : "blob"));
+        }
+      }
+      rc.response()
+          .putHeader("Content-Type", "application/json")
+          .putHeader(COMMIT_SHA_HEADER, commit.name())
+          .end(new JsonObject().put("entries", entries).encode());
+    } catch (MissingObjectException | IncorrectObjectTypeException e) {
+      rc.response().setStatusCode(404).end();
+    } catch (Exception e) {
+      fail(rc, "git-tree", e);
+    }
+  }
+
+  /** The tree object at {@code path}, or {@code null} if there is none or it is not a tree. */
+  private ObjectId subtree(Repository repo, RevCommit commit, String path) throws IOException {
+    try (TreeWalk found = TreeWalk.forPath(repo, path, commit.getTree())) {
+      return found == null || !FileMode.TREE.equals(found.getFileMode(0))
+          ? null
+          : found.getObjectId(0);
+    }
+  }
+
+  /**
+   * The commit {@code rev} names, or {@code null} if this repository does not hold one.
+   *
+   * <p>{@link Repository#resolve} takes a full sha or a ref name; a full sha is returned <b>without
+   * an existence check</b>, so the miss for a well-formed but unreachable id lands here, in {@code
+   * parseCommit}. An annotated tag is peeled, which is what makes a tag name work as a rev.
+   */
+  private RevCommit resolveCommit(Repository repo, RevWalk walk, String rev) throws IOException {
+    ObjectId id;
+    try {
+      id = repo.resolve(rev);
+    } catch (RevisionSyntaxException e) {
+      // Guarded by REV_PATTERN already; treated as "no such revision" rather than a 500 in case
+      // JGit's parser refuses something the pattern allows.
+      return null;
+    }
+    if (id == null) {
+      return null;
+    }
+    try {
+      return walk.parseCommit(id);
+    } catch (MissingObjectException | IncorrectObjectTypeException e) {
+      return null;
+    }
+  }
+
+  /**
+   * Hands the request back to the router when it is a name-addressed clone rather than a content
+   * read, and reports whether it did.
+   *
+   * <p>{@code /artifacts/git/<projectId>/<repoName>/info/refs} is the one request shape that
+   * matches these routes too — with {@code repoName} spelled {@code blob} or {@code tree}, so
+   * {@code rev} comes out {@code info} and {@code path} {@code refs}. Answering it would make a
+   * repository unclonable because of what it is called, so {@link RoutingContext#next} lets the
+   * name-addressed route have it. Nothing else overlaps: every other route of that scheme is a
+   * POST, and the id-addressed ones differ in segment count.
+   */
+  private boolean contentReadIsNotAClone(RoutingContext rc, String rev, String path) {
+    if ("info".equals(rev) && "refs".equals(path)) {
+      rc.next();
+      return true;
+    }
+    return false;
+  }
+
+  /** Whether the mode names a file whose bytes are its content. */
+  private static boolean isFile(FileMode mode) {
+    return FileMode.REGULAR_FILE.equals(mode) || FileMode.EXECUTABLE_FILE.equals(mode);
+  }
+
+  /** A sha or a ref name, and nothing that would read as an option or a revision expression. */
+  private static boolean isValidRev(String rev) {
+    return rev != null && !rev.contains("..") && rev.matches(REV_PATTERN);
+  }
+
+  /**
+   * A repository-relative path: no leading or doubled slash, no {@code .} or {@code ..} segment, no
+   * control characters, bounded in length. The empty string is valid and means the root — {@link
+   * #serveBlob} refuses it separately, because a blob has no root.
+   *
+   * <p>Dot segments cannot arrive anyway: vertx-web matches against {@code normalizedPath()}, which
+   * collapses them before routing. Checked all the same, because that is a property of the router
+   * this route would rather not inherit silently.
+   */
+  private static boolean isValidPath(String path) {
+    if (path == null || path.length() > MAX_PATH_LENGTH) {
+      return false;
+    }
+    if (path.isEmpty()) {
+      return true;
+    }
+    if (path.startsWith("/") || path.chars().anyMatch(c -> c < 0x20 || c == 0x7f)) {
+      return false;
+    }
+    for (String segment : path.split("/", -1)) {
+      if (segment.isEmpty() || ".".equals(segment) || "..".equals(segment)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /** A path tail with its trailing slashes dropped; {@code null} becomes the root. */
+  private static String normalizePath(String raw) {
+    String path = decodePercent(raw);
+    if (path == null) {
+      return "";
+    }
+    while (path.endsWith("/")) {
+      path = path.substring(0, path.length() - 1);
+    }
+    return path;
+  }
+
+  /**
+   * Percent-decodes one path segment. Hand-rolled rather than {@link java.net.URLDecoder}, which
+   * also turns {@code +} into a space — a ref named {@code 1.0+build} would decode to one that does
+   * not exist. Bytes are collected and read back as UTF-8, so a non-ASCII file name survives.
+   */
+  private static String decodePercent(String raw) {
+    if (raw == null || raw.indexOf('%') < 0) {
+      return raw;
+    }
+    ByteArrayOutputStream bytes = new ByteArrayOutputStream(raw.length());
+    for (int i = 0; i < raw.length(); i++) {
+      char c = raw.charAt(i);
+      if (c == '%' && i + 2 < raw.length()) {
+        int high = Character.digit(raw.charAt(i + 1), 16);
+        int low = Character.digit(raw.charAt(i + 2), 16);
+        if (high >= 0 && low >= 0) {
+          bytes.write((high << 4) + low);
+          i += 2;
+          continue;
+        }
+      }
+      bytes.writeBytes(String.valueOf(c).getBytes(StandardCharsets.UTF_8));
+    }
+    return bytes.toString(StandardCharsets.UTF_8);
   }
 
   /**

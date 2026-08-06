@@ -3,6 +3,7 @@ package eu.wohlben.qits.githost;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.hasItems;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -16,6 +17,7 @@ import io.restassured.http.ContentType;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -217,6 +219,249 @@ public class GitHostTest {
         .get("/artifacts/git/" + projectId + "/no-such-name/info/refs?service=git-upload-pack")
         .then()
         .statusCode(Response.Status.NOT_FOUND.getStatusCode());
+  }
+
+  // --- content reads: blob and tree --------------------------------------------------------------
+  // The verb the wire protocol has not got. Every case here is asked over HTTP against a repository
+  // seeded through a real push, because what is under test is the route grammar and the resolution,
+  // both of which a JGit call in-process would step straight over.
+
+  /** The seeded repository plus a nested directory, so a tree listing has both kinds of entry. */
+  private String contentOrigin() throws Exception {
+    String repoId = seedOrigin();
+    Path clone = GitHostFixture.clone(gitBase, repoId);
+    Files.createDirectories(clone.resolve("docs"));
+    Files.writeString(clone.resolve("docs/guide.md"), "guide\n");
+    GitHostFixture.git(clone, "git", "add", "docs/guide.md");
+    GitHostFixture.commitFile(clone, "pipeline.yml", "steps: []\n", "content");
+    GitHostFixture.git(clone, "git", "push", "origin", "main");
+    return repoId;
+  }
+
+  @Test
+  public void aBlobIsServedBySpaAndByBranchNameWithTheResolvedCommitOnTheResponse()
+      throws Exception {
+    String repoId = contentOrigin();
+    String head = refSha(repoId, "refs/heads/main");
+
+    // By branch name: the answer names the commit it resolved to, which is what lets a caller pin a
+    // later read to that sha instead of to a ref that may have moved.
+    byte[] byBranch =
+        given()
+            .when()
+            .get("/artifacts/git/" + repoId + "/blob/main/pipeline.yml")
+            .then()
+            .statusCode(Response.Status.OK.getStatusCode())
+            .contentType(containsString("application/octet-stream"))
+            .header("Git-Commit-Sha", equalTo(head))
+            .extract()
+            .asByteArray();
+    assertEquals("steps: []\n", new String(byBranch, StandardCharsets.UTF_8));
+
+    // By sha, at a path in a subdirectory. Reading at the exact sha is the point of the route: a
+    // post-receive consumer holds one and must not race the branch.
+    byte[] bySha =
+        given()
+            .when()
+            .get("/artifacts/git/" + repoId + "/blob/" + head + "/docs/guide.md")
+            .then()
+            .statusCode(Response.Status.OK.getStatusCode())
+            .header("Git-Commit-Sha", equalTo(head))
+            .extract()
+            .asByteArray();
+    assertEquals("guide\n", new String(bySha, StandardCharsets.UTF_8));
+  }
+
+  @Test
+  public void aBlobIsAlsoServedAtACommitNoRefPointsAt() throws Exception {
+    // Reachable but not a tip: the shape a consumer reading a pushed sha is in once another push
+    // has landed. UploadPack's want policy refuses this — deliberately, since a want costs a
+    // reachability walk — so a content read that could not do it would send the caller back to
+    // cloning.
+    String repoId = contentOrigin();
+    String parent = refSha(repoId, "refs/heads/main");
+    Path clone = GitHostFixture.clone(gitBase, repoId);
+    GitHostFixture.commitFile(clone, "later.txt", "after\n", "later");
+    GitHostFixture.git(clone, "git", "push", "origin", "main");
+    assertEquals(GitHostFixture.head(clone), refSha(repoId, "refs/heads/main"));
+
+    given()
+        .when()
+        .get("/artifacts/git/" + repoId + "/blob/" + parent + "/pipeline.yml")
+        .then()
+        .statusCode(Response.Status.OK.getStatusCode())
+        .header("Git-Commit-Sha", equalTo(parent));
+  }
+
+  @Test
+  public void theTreeListsTheRootAndASubdirectory() throws Exception {
+    String repoId = contentOrigin();
+    String head = refSha(repoId, "refs/heads/main");
+
+    given()
+        .when()
+        .get("/artifacts/git/" + repoId + "/tree/main")
+        .then()
+        .statusCode(Response.Status.OK.getStatusCode())
+        .contentType(containsString("application/json"))
+        .header("Git-Commit-Sha", equalTo(head))
+        .body("entries.name", hasItems("README.md", "docs", "pipeline.yml"))
+        .body("entries.find { it.name == 'docs' }.type", equalTo("tree"))
+        .body("entries.find { it.name == 'README.md' }.type", equalTo("blob"));
+
+    // A path names the directory to list, and a trailing slash is the same request.
+    given()
+        .when()
+        .get("/artifacts/git/" + repoId + "/tree/" + head + "/docs/")
+        .then()
+        .statusCode(Response.Status.OK.getStatusCode())
+        .body("entries.size()", equalTo(1))
+        .body("entries[0].name", equalTo("guide.md"))
+        .body("entries[0].type", equalTo("blob"));
+  }
+
+  @Test
+  public void aSlashyBranchNameIsReadableAsAnEncodedSegment() throws Exception {
+    // A rev is one path segment, so `feature/x` has to arrive as %2F — the npm scoped-package
+    // lesson, and RestAssured re-encodes the escape unless url encoding is turned off.
+    String repoId = contentOrigin();
+    Path clone = GitHostFixture.clone(gitBase, repoId);
+    GitHostFixture.git(clone, "git", "switch", "-q", "-c", "feature/reads");
+    GitHostFixture.commitFile(clone, "branchy.txt", "on a slashy branch\n", "branchy");
+    GitHostFixture.git(clone, "git", "push", "origin", "feature/reads");
+
+    byte[] body =
+        given()
+            .urlEncodingEnabled(false)
+            .when()
+            .get("/artifacts/git/" + repoId + "/blob/feature%2Freads/branchy.txt")
+            .then()
+            .statusCode(Response.Status.OK.getStatusCode())
+            .header("Git-Commit-Sha", equalTo(GitHostFixture.head(clone)))
+            .extract()
+            .asByteArray();
+    assertEquals("on a slashy branch\n", new String(body, StandardCharsets.UTF_8));
+  }
+
+  @Test
+  public void everythingThatDoesNotResolveIs404() throws Exception {
+    String repoId = contentOrigin();
+    String head = refSha(repoId, "refs/heads/main");
+
+    // A repository this host does not hold.
+    given()
+        .when()
+        .get("/artifacts/git/" + UUID.randomUUID() + "/blob/main/pipeline.yml")
+        .then()
+        .statusCode(Response.Status.NOT_FOUND.getStatusCode());
+    // A ref that is not there.
+    given()
+        .when()
+        .get("/artifacts/git/" + repoId + "/blob/no-such-branch/pipeline.yml")
+        .then()
+        .statusCode(Response.Status.NOT_FOUND.getStatusCode());
+    // A well-formed sha nothing in this repository is. Repository.resolve hands a full id back
+    // WITHOUT checking it exists, so this case is caught by parseCommit and nowhere else.
+    given()
+        .when()
+        .get(
+            "/artifacts/git/"
+                + repoId
+                + "/blob/0123456789abcdef0123456789abcdef01234567/pipeline.yml")
+        .then()
+        .statusCode(Response.Status.NOT_FOUND.getStatusCode());
+    // A path that is not in that commit.
+    given()
+        .when()
+        .get("/artifacts/git/" + repoId + "/blob/" + head + "/nowhere.yml")
+        .then()
+        .statusCode(Response.Status.NOT_FOUND.getStatusCode());
+    // A directory read as a blob, and a file listed as a tree: each resolves, and neither is what
+    // the caller asked for.
+    given()
+        .when()
+        .get("/artifacts/git/" + repoId + "/blob/main/docs")
+        .then()
+        .statusCode(Response.Status.NOT_FOUND.getStatusCode());
+    given()
+        .when()
+        .get("/artifacts/git/" + repoId + "/tree/main/pipeline.yml")
+        .then()
+        .statusCode(Response.Status.NOT_FOUND.getStatusCode());
+    given()
+        .when()
+        .get("/artifacts/git/" + repoId + "/tree/main/no-such-directory")
+        .then()
+        .statusCode(Response.Status.NOT_FOUND.getStatusCode());
+  }
+
+  @Test
+  public void aMalformedRevIs400RatherThan404() throws Exception {
+    // The MavenPaths lesson: an unusable request that missed the route is reported as an absent
+    // resource and sends the caller debugging the wrong thing. So the rev group is loose in the
+    // route and strict in the handler.
+    String repoId = contentOrigin();
+    // The last two are `main^{tree}` and `HEAD@{2}` — revision EXPRESSIONS, which Repository.resolve
+    // would answer and this route will not. They are spelled percent-encoded because `^`, `@` and
+    // the braces are not legal raw in a URI path, and decoding them before the check is exactly
+    // what stops the escape being the way past it.
+    for (String rev : new String[] {"-oops", "a..b", "main%5E%7Btree%7D", "HEAD%40%7B2%7D"}) {
+      given()
+          .urlEncodingEnabled(false)
+          .when()
+          .get("/artifacts/git/" + repoId + "/blob/" + rev + "/pipeline.yml")
+          .then()
+          .statusCode(Response.Status.BAD_REQUEST.getStatusCode());
+      given()
+          .urlEncodingEnabled(false)
+          .when()
+          .get("/artifacts/git/" + repoId + "/tree/" + rev)
+          .then()
+          .statusCode(Response.Status.BAD_REQUEST.getStatusCode());
+    }
+  }
+
+  @Test
+  public void aBlobLargerThanTheRouteServesIs413() throws Exception {
+    // The bound is a constant sized for source files. 9 MB of incompressible bytes clears it; a
+    // compressible file would ride under it in the pack and prove nothing about what is served.
+    String repoId = seedOrigin();
+    Path clone = GitHostFixture.clone(gitBase, repoId);
+    byte[] incompressible = new byte[9 * 1024 * 1024];
+    new Random(20260806L).nextBytes(incompressible);
+    Files.write(clone.resolve("big.bin"), incompressible);
+    GitHostFixture.git(clone, "git", "add", "big.bin");
+    GitHostFixture.commitFile(clone, "small.txt", "beside it\n", "big");
+    GitHostFixture.git(clone, "git", "push", "origin", "main");
+
+    given()
+        .when()
+        .get("/artifacts/git/" + repoId + "/blob/main/big.bin")
+        .then()
+        .statusCode(Response.Status.REQUEST_ENTITY_TOO_LARGE.getStatusCode());
+    // The bound is per blob, not per repository: the small file beside it is still served.
+    given()
+        .when()
+        .get("/artifacts/git/" + repoId + "/blob/main/small.txt")
+        .then()
+        .statusCode(Response.Status.OK.getStatusCode());
+  }
+
+  @Test
+  public void aRepositoryCalledBlobIsStillClonableByName() throws Exception {
+    // The one request shape the content routes and the name-addressed scheme both match:
+    // /artifacts/git/<projectId>/blob/info/refs is a clone of a repository CALLED blob, and it is
+    // registered first. The handler hands it back to the router rather than answering it, so a
+    // repository does not become unclonable because of what it is called.
+    String projectId = UUID.randomUUID().toString();
+    String repoId = seedOrigin();
+    repositoryNames.register(projectId, "blob", repoId);
+
+    Path clone = Files.createTempDirectory("qits-githost-blob-named-clone");
+    Files.delete(clone);
+    GitHostFixture.git(null, "git", "clone", "-q", gitBase + "/" + projectId + "/blob",
+        clone.toString());
+    assertTrue(Files.exists(clone.resolve(".git")), "a repository named blob must still clone");
   }
 
   // --- the default branch's seatbelt (ProtectedRefHook) -------------------------------------------
