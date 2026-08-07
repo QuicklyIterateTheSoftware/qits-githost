@@ -19,26 +19,42 @@ import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
 /**
- * Delivers the git host's post-receive events to ci's HTTP intake (docs/epics/qits-ci/): one {@code
- * {repoId, branch, oldSha, newSha}} POST per successfully updated <b>branch</b> ref (deletions and
- * non-branch refs are ignored). The event stays an HTTP call even while ci lives in-process —
- * that's the wire contract an extracted ci service receives unchanged; only {@code
- * qits.ci.intake-url} moves.
+ * Delivers the git host's post-receive events to the two services that act on a push: ci's HTTP
+ * intake (docs/epics/qits-ci/), which starts a run, and projects' identical intake, which pushes the
+ * repository to its GitHub sync target. Each gets one {@code {repoId, branch, oldSha, newSha}} POST
+ * per successfully updated <b>branch</b> ref (deletions and non-branch refs are ignored; the tag
+ * side of a backup is projects' own sweep). The event stays an HTTP call even while a consumer lives
+ * in-process — that's the wire contract an extracted service receives unchanged; only {@code
+ * qits.ci.intake-url} and {@code qits.projects.intake-url} move.
+ *
+ * <p>One class rather than one per consumer, because the two deliveries share everything that is
+ * hard here: the ref filter, the event body, the fire-and-forget send, and the single outbound
+ * {@link HttpClient} the native image constrains (see the field below). What differs is the
+ * credential, and only ci has one.
+ *
+ * <p><b>{@code -o qits.no-ci} suppresses the ci delivery and nothing else.</b> The projects event
+ * fires for every push, including one the pusher told ci to ignore: the option exists so an imported
+ * history does not queue a run per branch, and a backup must happen for that push exactly as for any
+ * other. {@link GitHostRoutes} reads the option and passes it in.
  *
  * <p>Fire-and-forget, the {@code OtelForwarder} idiom: the hook fires inside {@code
  * ReceivePack.receive(...)} — before the push response is written — so this must never block or
- * throw; failures are swallowed at debug (a missed event just means no advisory run for that push).
+ * throw; failures are swallowed at debug (a missed event just means no advisory run, or a backup
+ * that waits for the next push). The two consumers are independent: an unreachable one costs the
+ * other nothing.
  *
  * <p><b>The credential.</b> qits-ci's intake wants a bearer minted by qits-idp for {@code
  * aud=qits-ci}; quarkus-oidc-client fetches and caches it and this class only attaches it. Both the
  * bearer and the older {@code X-CI-Token} are optional and independent, so a deployment can be on
  * either, both or neither — which is what lets the two services cut over one at a time. With no
  * client credentials configured nothing is fetched and the POST goes out exactly as it always has.
+ * The projects event carries neither: that intake is unguarded on qits-net today, and a token minted
+ * for {@code aud=qits-ci} would be the wrong one to send it anyway.
  */
 @ApplicationScoped
-public class CiPostReceiveNotifier {
+public class PostReceiveNotifier {
 
-  private static final Logger LOG = Logger.getLogger(CiPostReceiveNotifier.class);
+  private static final Logger LOG = Logger.getLogger(PostReceiveNotifier.class);
 
   /**
    * An <b>instance</b> field, not a static one, and that is a native-image constraint rather than a
@@ -47,14 +63,18 @@ public class CiPostReceiveNotifier {
    * 'jdk.internal.net.http.HttpClientFacade' was found in the image heap"). Even if it were allowed
    * it would be wrong — an {@code HttpClient} owns a selector thread and an executor, neither of
    * which survives being frozen into a binary. This bean is {@code @ApplicationScoped}, so there is
-   * still exactly one client per process; it is now created when the process starts rather than
-   * when the image is compiled.
+   * still exactly one client per process — one for both consumers; it is now created when the
+   * process starts rather than when the image is compiled.
    */
   private final HttpClient client =
       HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build();
 
   @ConfigProperty(name = "qits.ci.intake-url")
-  String intakeUrl;
+  String ciIntakeUrl;
+
+  /** Where qits-projects takes the same event and answers it with a backup push. */
+  @ConfigProperty(name = "qits.projects.intake-url")
+  String projectsIntakeUrl;
 
   // The same static secret the intake's CiTokenFilter checks — blank (the dev/test default) sends
   // no header, matching the filter's open mode.
@@ -75,8 +95,15 @@ public class CiPostReceiveNotifier {
 
   @Inject ObjectMapper objectMapper;
 
-  /** The {@code PostReceiveHook} body — one event per updated branch ref of the push. */
-  public void onPostReceive(String repoId, Collection<ReceiveCommand> commands) {
+  /**
+   * The {@code PostReceiveHook} body — one event per updated branch ref of the push, fanned out to
+   * both consumers.
+   *
+   * @param ciSuppressed whether the push carried {@code -o qits.no-ci}. It skips the ci delivery
+   *     only; projects is told either way, because a backup is owed for every push.
+   */
+  public void onPostReceive(
+      String repoId, Collection<ReceiveCommand> commands, boolean ciSuppressed) {
     for (ReceiveCommand command : commands) {
       try {
         if (command.getResult() != ReceiveCommand.Result.OK
@@ -84,26 +111,28 @@ public class CiPostReceiveNotifier {
             || !command.getRefName().startsWith(Constants.R_HEADS)) {
           continue;
         }
-        post(
-            repoId,
-            command.getRefName().substring(Constants.R_HEADS.length()),
-            command.getOldId().name(),
-            command.getNewId().name());
+        String branch = command.getRefName().substring(Constants.R_HEADS.length());
+        String body =
+            eventBody(repoId, branch, command.getOldId().name(), command.getNewId().name());
+        if (!ciSuppressed) {
+          postToCi(repoId, branch, body);
+        }
+        postToProjects(repoId, branch, body);
       } catch (Exception e) {
-        LOG.debugf("CI post-receive event for %s skipped: %s", repoId, e.toString());
+        LOG.debugf("post-receive event for %s skipped: %s", repoId, e.toString());
       }
     }
   }
 
-  private void post(String repoId, String branch, String oldSha, String newSha) throws Exception {
-    String body =
-        objectMapper.writeValueAsString(
-            Map.of("repoId", repoId, "branch", branch, "oldSha", oldSha, "newSha", newSha));
-    HttpRequest.Builder request =
-        HttpRequest.newBuilder(URI.create(intakeUrl))
-            .timeout(Duration.ofSeconds(10))
-            .header("Content-Type", "application/json")
-            .POST(HttpRequest.BodyPublishers.ofString(body));
+  /** The one body both consumers read, serialised once. */
+  private String eventBody(String repoId, String branch, String oldSha, String newSha)
+      throws Exception {
+    return objectMapper.writeValueAsString(
+        Map.of("repoId", repoId, "branch", branch, "oldSha", oldSha, "newSha", newSha));
+  }
+
+  private void postToCi(String repoId, String branch, String body) {
+    HttpRequest.Builder request = request(ciIntakeUrl, body);
     token
         .map(String::trim)
         .filter(t -> !t.isEmpty())
@@ -115,15 +144,27 @@ public class CiPostReceiveNotifier {
         .with(
             bearer -> {
               bearer.ifPresent(b -> request.header("Authorization", "Bearer " + b));
-              send(request.build(), repoId, branch);
+              send(request.build(), "CI", repoId, branch);
             },
             failure -> {
               // A token we could not get is not a reason to drop the event. qits-ci with its gate
               // off takes it either way, and with the gate on it refuses it — which is the right
               // answer for a caller that cannot prove who it is.
               LOG.debugf("CI token for %s@%s unavailable: %s", repoId, branch, failure);
-              send(request.build(), repoId, branch);
+              send(request.build(), "CI", repoId, branch);
             });
+  }
+
+  /** The backup trigger. No credential and no token fetch, so it goes straight out. */
+  private void postToProjects(String repoId, String branch, String body) {
+    send(request(projectsIntakeUrl, body).build(), "projects", repoId, branch);
+  }
+
+  private HttpRequest.Builder request(String intakeUrl, String body) {
+    return HttpRequest.newBuilder(URI.create(intakeUrl))
+        .timeout(Duration.ofSeconds(10))
+        .header("Content-Type", "application/json")
+        .POST(HttpRequest.BodyPublishers.ofString(body));
   }
 
   /** The bearer for qits-ci, or empty when this deployment has no client credentials. */
@@ -134,16 +175,17 @@ public class CiPostReceiveNotifier {
     return oidcClient.getTokens().map(tokens -> Optional.of(tokens.getAccessToken()));
   }
 
-  private void send(HttpRequest request, String repoId, String branch) {
+  private void send(HttpRequest request, String consumer, String repoId, String branch) {
     client
         .sendAsync(request, HttpResponse.BodyHandlers.discarding())
         .whenComplete(
             (response, failure) -> {
               if (failure != null) {
-                LOG.debugf("CI event for %s@%s failed: %s", repoId, branch, failure);
+                LOG.debugf("%s event for %s@%s failed: %s", consumer, repoId, branch, failure);
               } else if (response.statusCode() >= 400) {
                 LOG.debugf(
-                    "CI event for %s@%s rejected: %d", repoId, branch, response.statusCode());
+                    "%s event for %s@%s rejected: %d",
+                    consumer, repoId, branch, response.statusCode());
               }
             });
   }

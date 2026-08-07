@@ -187,7 +187,9 @@ public class GitHostRoutes {
   private static final int MAX_PATH_LENGTH = 1024;
 
   /**
-   * {@code -o qits.no-ci} — skip the CI post-receive POST for this push. Read in {@link
+   * {@code -o qits.no-ci} — skip the CI post-receive POST for this push. It skips <b>only</b> that
+   * one: qits-projects gets its post-receive event either way, because that event triggers the
+   * repository's backup push and a backup is owed even for a push CI ignores. Read in {@link
    * #service}'s post-receive lambda, not by {@link ProtectedRefHook}: it grants no write, so it is
    * not a bypass of anything. See {@code ProtectedRefHook}'s "two bypasses" javadoc, third bullet.
    */
@@ -219,7 +221,7 @@ public class GitHostRoutes {
 
   @Inject Instance<RepositoryNameResolver> repositoryNames;
 
-  @Inject CiPostReceiveNotifier ciNotifier;
+  @Inject PostReceiveNotifier notifier;
 
   @Inject ProtectedRefHook protectedRefs;
 
@@ -394,18 +396,16 @@ public class GitHostRoutes {
         // the repo id rather than handed the ReceivePack alone, because the override is a row keyed
         // on that id and a DFS repository has no directory to derive it from.
         rp.setPreReceiveHook(protectedRefs.forRepository(opened.repoId()));
-        // The literal post-receive event the CI pipelines are named after (docs/epics/qits-ci/):
+        // The literal post-receive event the CI pipelines are named after (docs/epics/qits-ci/),
+        // fanned out to qits-projects as well, where it triggers the repository's backup push:
         // fires after the ref updates land, still inside receive() — the notifier is
-        // fire-and-forget so the push response is never delayed. -o qits.no-ci skips it: an
-        // imported upstream's whole history is one push, and without this every branch in it would
-        // queue a CI run for history that predates the platform.
+        // fire-and-forget so the push response is never delayed. -o qits.no-ci skips the CI half
+        // only: an imported upstream's whole history is one push, and without the option every
+        // branch in it would queue a CI run for history that predates the platform. The backup is
+        // owed for that push too, so the projects half ignores the option.
         rp.setPostReceiveHook(
-            (pack, commands) -> {
-              if (hasNoCiOption(pack)) {
-                return;
-              }
-              ciNotifier.onPostReceive(opened.repoId(), commands);
-            });
+            (pack, commands) ->
+                notifier.onPostReceive(opened.repoId(), commands, hasNoCiOption(pack)));
         rp.receive(in, out, null);
       }
       rc.response()

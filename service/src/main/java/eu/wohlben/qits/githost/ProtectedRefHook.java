@@ -58,8 +58,9 @@ import org.jboss.logging.Logger;
  *       empty"). With protection on and no token configured, direct pushes to the default branch
  *       are simply impossible, and a deployment that wants the dev-loop escape configures one.
  *   <li>{@code -o qits.no-ci} — <b>not</b> a bypass of this hook, and this class never reads it: it
- *       skips the CI post-receive POST for the push ({@code GitHostRoutes.service}'s
- *       post-receive lambda, {@code CiPostReceiveNotifier}). It grants no write this pusher did not
+ *       skips the CI post-receive POST for the push, and only that one — qits-projects still gets
+ *       its event and still backs the repository up ({@code GitHostRoutes.service}'s
+ *       post-receive lambda, {@code PostReceiveNotifier}). It grants no write this pusher did not
  *       already have — a push that could carry it could equally push nothing at all — so it needs no
  *       gate of its own. Named here because it rides the same push-options channel as the two
  *       bypasses above and is easy to look for in the wrong class.
