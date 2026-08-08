@@ -43,7 +43,7 @@ import org.jboss.logging.Logger;
  * that waits for the next push). The two consumers are independent: an unreachable one costs the
  * other nothing.
  *
- * <p><b>The credential.</b> qits-ci's intake wants a bearer minted by qits-idp for {@code
+ * <p><b>The credential.</b> qits-ci's intake wants a bearer minted by qits-platform-idp for {@code
  * aud=qits-ci}; quarkus-oidc-client fetches and caches it and this class only attaches it. Both the
  * bearer and the older {@code X-CI-Token} are optional and independent, so a deployment can be on
  * either, both or neither — which is what lets the two services cut over one at a time. With no

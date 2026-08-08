@@ -710,7 +710,7 @@ public class GitHostRoutes {
    *
    * <p>No authentication, exactly like every other route in this class — repo ids are capability
    * UUIDs and the callers are machines on qits-net. A read surface gated on its own would be the
-   * piecemeal machine auth this platform has decided against; qits-idp gates these together.
+   * piecemeal machine auth this platform has decided against; qits-platform-idp gates these together.
    *
    * <p>An enumeration failure is a 500 by way of {@link #fail}, never an empty list: a trigger
    * engine told "no repositories" stops triggering and reports nothing wrong.

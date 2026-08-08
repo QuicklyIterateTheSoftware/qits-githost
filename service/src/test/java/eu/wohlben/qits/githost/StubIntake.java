@@ -9,9 +9,9 @@ import java.nio.charset.StandardCharsets;
 
 /**
  * Stands in for everything one post-receive delivery touches and this repo does not contain:
- * qits-ci's event intake, qits-projects' event intake, and qits-idp's token endpoint the bearer for
- * ci comes from. None exists in this repo, and the clone-alone rule says the suite may reach none of
- * them over a network.
+ * qits-ci's event intake, qits-projects' event intake, and qits-platform-idp's token endpoint the
+ * bearer for ci comes from. None exists in this repo, and the clone-alone rule says the suite may
+ * reach none of them over a network.
  *
  * <p>One server with three contexts rather than one per consumer, so a test can assert which intake
  * was hit — the whole point of the fan-out is that the two counts differ under {@code -o
