@@ -12,8 +12,10 @@ import java.util.concurrent.ConcurrentHashMap;
  * table is a map the test fills directly.
  *
  * <p>{@code @ApplicationScoped} rather than {@code @Mock}: the port is injected as an {@code
- * Instance<>}, and a plain bean in test sources is exactly the "an implementation is present"
- * configuration production runs in.
+ * Instance<>}, and a plain bean is all it takes to be the one implementation. It <b>overrides</b>
+ * the shipped {@link HttpRepositoryNameResolver}, which carries {@code @DefaultBean} — so on this
+ * classpath there is exactly one bean, this one, and no test dials qits-projects. The HTTP adapter is
+ * covered on its own by {@link HttpRepositoryNameResolverTest}, outside CDI.
  */
 @ApplicationScoped
 public class FakeRepositoryNameResolver implements RepositoryNameResolver {
