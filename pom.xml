@@ -52,7 +52,7 @@
              libs/qits-eventstream into the platform Maven repository, which is why the
              <repositories> block below exists — this is the one dependency here that is not on
              Maven Central and not built in this reactor. -->
-        <qits.eventstream.version>2026.810.103202</qits.eventstream.version>
+        <qits.eventstream.version>2026.810.191553</qits.eventstream.version>
         <qits.maven.repository.url>http://localhost:8081/artifacts/maven/maven</qits.maven.repository.url>
 
         <maven.compiler.release>25</maven.compiler.release>
