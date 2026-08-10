@@ -1,5 +1,7 @@
 package eu.wohlben.qits.githost;
 
+import eu.wohlben.qits.eventstream.CausationHeader;
+import eu.wohlben.qits.eventstream.CausationScope;
 import io.quarkus.runtime.configuration.MemorySize;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.json.JsonArray;
@@ -16,7 +18,9 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.Collection;
 import java.util.List;
+import java.util.UUID;
 import java.util.zip.GZIPInputStream;
 import org.eclipse.jgit.errors.IncorrectObjectTypeException;
 import org.eclipse.jgit.errors.MissingObjectException;
@@ -29,6 +33,7 @@ import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.transport.PacketLineOut;
+import org.eclipse.jgit.transport.ReceiveCommand;
 import org.eclipse.jgit.transport.ReceivePack;
 import org.eclipse.jgit.transport.RefAdvertiser.PacketLineOutRefAdvertiser;
 import org.eclipse.jgit.transport.UploadPack;
@@ -37,18 +42,17 @@ import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
 /**
- * The in-process git smart-HTTP server, mounted at {@code /artifacts/git/*} so workspace containers
- * can clone and push over {@code http://<qits-host>:<port>/artifacts/git/<repoId>}.
+ * The in-process git smart-HTTP server, mounted at {@code /git/*} so workspace containers
+ * can clone and push over {@code http://<qits-host>:<port>/git/<repoId>}.
  *
  * <p>Implemented as plain Vert.x routes driving JGit's {@link UploadPack}/{@link ReceivePack}
  * directly — deliberately NOT as a servlet. qits used to host this with JGit's {@code GitServlet}
- * on {@code quarkus-undertow}, but undertow's presence breaks Quinoa's production static serving of
- * the Angular SPA (bundled assets 404 in the packaged fast-jar; see {@code
- * docs/issues/2026-07-15_packaged-spa-not-served.md}). Keeping the git host off the servlet stack
- * lets Quinoa serve the UI exactly as it does in a plain Quinoa app.
+ * on {@code quarkus-undertow}; that dependency broke the SPA the host used to share a process with,
+ * and it has stayed out since. Raw routes are also what keeps the wire protocol the whole of what
+ * this class does.
  *
  * <p>No authentication: repo ids are capability UUIDs, and the callers are workspace containers,
- * which cannot hold a user token — so {@code /artifacts/git/*} deliberately stays on {@code
+ * which cannot hold a user token — so {@code /git/*} deliberately stays on {@code
  * QitsAuthPolicy}'s public list in every auth build variant (container traffic reaches qits directly on qits-net,
  * bypassing any forward-auth proxy — see auth-core's {@code PublicPaths}). Anonymous fetch AND push
  * are both enabled. JGit here speaks the wire protocol and nothing else, and receive-pack is the
@@ -63,9 +67,9 @@ import org.jboss.logging.Logger;
  * <p>Two addressing schemes, both served:
  *
  * <ul>
- *   <li><b>id-addressed</b> {@code /artifacts/git/:repoId} — the opaque UUID, handed straight to the
+ *   <li><b>id-addressed</b> {@code /git/:repoId} — the opaque UUID, handed straight to the
  *       storage (back-compat: already-provisioned containers, metadata, discovery).
- *   <li><b>name-addressed</b> {@code /artifacts/git/:projectId/:repoName} — a project's
+ *   <li><b>name-addressed</b> {@code /git/:projectId/:repoName} — a project's
  *       repositories served as siblings, {@code repoName} resolved through the {@link
  *       RepositoryNameResolver} port to a repo id. This is what lets committed relative submodule
  *       urls ({@code ../<name>.git}) resolve natively against a sibling — no {@code
@@ -99,7 +103,7 @@ import org.jboss.logging.Logger;
  * <p>And one route on the bare collection:
  *
  * <ul>
- *   <li>{@code GET /artifacts/git} — {@code {"repositories": ["<repoId>", …]}}, every repository
+ *   <li>{@code GET /git} — {@code {"repositories": ["<repoId>", …]}}, every repository
  *       this host serves, sorted lexicographically.
  * </ul>
  *
@@ -135,14 +139,16 @@ public class GitHostRoutes {
   private static final String REPO_ID_PATTERN = "[A-Za-z0-9][A-Za-z0-9-]{0,63}";
 
   /**
-   * The mount point, {@code /<gateway segment>/git}. {@code git} is a second-level segment beside
-   * {@code api} — it is a wire protocol spoken by {@code git}, not a JSON API, and it appears in no
-   * OpenAPI document. Git treats whatever comes before the suffixes as an opaque base and appends
-   * {@code /info/refs}, {@code /git-upload-pack} and {@code /git-receive-pack} itself, so a base of
-   * any depth works; this one is a cross-repo contract (qits-ci's pipeline-config fetch and the
-   * workspace daemon's provisioner both clone from it).
+   * The mount point, and this service's whole gateway segment. It was {@code /artifacts/git} while
+   * the host lived inside qits-artifacts; standing alone it drops the borrowed prefix, because
+   * qits-gateway routes VERBATIM by prefix and {@code /git} is now this service's own entry.
+   *
+   * <p>Git treats whatever comes before the suffixes as an opaque base and appends {@code
+   * /info/refs}, {@code /git-upload-pack} and {@code /git-receive-pack} itself, so a base of any
+   * depth works. This one is a cross-repo contract — qits-ci's pipeline-config fetch and the
+   * workspace daemon's provisioner both clone from it — so moving it is a cutover, not an edit.
    */
-  private static final String BASE = "/artifacts/git";
+  private static final String BASE = "/git";
 
   private static final String UPLOAD = "git-upload-pack";
   private static final String RECEIVE = "git-receive-pack";
@@ -187,11 +193,18 @@ public class GitHostRoutes {
   private static final int MAX_PATH_LENGTH = 1024;
 
   /**
-   * {@code -o qits.no-ci} — skip the CI post-receive POST for this push. It skips <b>only</b> that
-   * one: qits-projects gets its post-receive event either way, because that event triggers the
-   * repository's backup push and a backup is owed even for a push CI ignores. Read in {@link
-   * #service}'s post-receive lambda, not by {@link ProtectedRefHook}: it grants no write, so it is
-   * not a bypass of anything. See {@code ProtectedRefHook}'s "two bypasses" javadoc, third bullet.
+   * {@code -o qits.no-ci} — "do not build this push". It <b>suppresses no event</b>: it becomes
+   * {@code suppressCi} on every {@code SCMPublishCommit} the push produces, and each consumer
+   * decides what that means to it. A run engine skips the build; a backup trigger ignores the flag,
+   * because a backup is owed even for a push CI is meant to leave alone.
+   *
+   * <p>That is the one behaviour change of the move off the HTTP fan-out, and it is deliberate: the
+   * notifier decided FOR its two consumers, which put the option's meaning in the publisher and left
+   * no room for a third consumer to have an opinion.
+   *
+   * <p>Read in {@link #service}'s post-receive lambda, not by {@link ProtectedRefHook}: it grants no
+   * write, so it is not a bypass of anything. See {@code ProtectedRefHook}'s "two bypasses" javadoc,
+   * third bullet.
    */
   private static final String NO_CI_OPTION = "qits.no-ci";
 
@@ -221,7 +234,12 @@ public class GitHostRoutes {
 
   @Inject Instance<RepositoryNameResolver> repositoryNames;
 
-  @Inject PostReceiveNotifier notifier;
+  /**
+   * Who is told about a push. A port with any number of implementations, {@code 0} included: the
+   * shipped one turns the receive commands into {@code SCMPublish*}/{@code SCMDelete*} events and
+   * hands them to the platform bus, and a deployment without it serves git and announces nothing.
+   */
+  @Inject Instance<ScmAnnouncer> announcers;
 
   @Inject ProtectedRefHook protectedRefs;
 
@@ -243,9 +261,9 @@ public class GitHostRoutes {
    * #maxPackSize} rather than by the global wire ceiling, which the OCI registry raised past
    * anything that should be held in memory.
    *
-   * <p>{@link #BASE} is spelled out here as a literal because these are raw Vert.x routes: changing
-   * {@code quarkus.rest.path} moves the JAX-RS surface and leaves these exactly where they were.
-   * The gateway routes {@code /artifacts/*} verbatim, so the segment has to be in the route.
+   * <p>{@link #BASE} is spelled out here as a literal because these are raw Vert.x routes: no
+   * config key moves them, and there is nothing else in this process for them to be relative to.
+   * The gateway routes {@code /git/*} verbatim, so the segment has to be in the route.
    *
    * <p>The two-segment name-addressed routes and the one-segment id-addressed routes never collide:
    * they differ in path length, so Vert.x dispatches each unambiguously. Prefixing both with the
@@ -396,16 +414,20 @@ public class GitHostRoutes {
         // the repo id rather than handed the ReceivePack alone, because the override is a row keyed
         // on that id and a DFS repository has no directory to derive it from.
         rp.setPreReceiveHook(protectedRefs.forRepository(opened.repoId()));
-        // The literal post-receive event the CI pipelines are named after (docs/epics/qits-ci/),
-        // fanned out to qits-projects as well, where it triggers the repository's backup push:
-        // fires after the ref updates land, still inside receive() — the notifier is
-        // fire-and-forget so the push response is never delayed. -o qits.no-ci skips the CI half
-        // only: an imported upstream's whole history is one push, and without the option every
-        // branch in it would queue a CI run for history that predates the platform. The backup is
-        // owed for that push too, so the projects half ignores the option.
+        // The post-receive announcement: fires after the ref updates land, still inside receive(),
+        // so the repository is readable and the pack's objects are there to be measured. The
+        // announcer must not block the push and must not throw — see ScmAnnouncer.
+        //
+        // Run under the CAUSE the pusher was acting on, if it named one. This is the hand-rolled
+        // half of qits-eventstream's causation-over-HTTP: CausationServerFilter does it for every
+        // JAX-RS resource method, and this service has none — these are raw Vert.x routes, so the
+        // header is read here or the chain breaks at the git host. See causationOf.
+        UUID cause = causationOf(rc);
         rp.setPostReceiveHook(
             (pack, commands) ->
-                notifier.onPostReceive(opened.repoId(), commands, hasNoCiOption(pack)));
+                CausationScope.with(
+                    cause,
+                    () -> announce(opened.repoId(), repo, commands, hasNoCiOption(pack))));
         rp.receive(in, out, null);
       }
       rc.response()
@@ -414,6 +436,57 @@ public class GitHostRoutes {
           .end(Buffer.buffer(out.toByteArray()));
     } catch (Exception e) {
       fail(rc, service, e);
+    }
+  }
+
+  /**
+   * The cause this push is being made <b>because of</b>, out of {@value
+   * CausationHeader#NAME}, or {@code null} when the pusher named none.
+   *
+   * <p>qits-eventstream propagates a cause across an HTTP hop with a pair of JAX-RS filters, and
+   * {@code CausationServerFilter} would do exactly this for a resource method. This service has no
+   * JAX-RS surface at all — the git protocol is raw Vert.x routes — so the incoming half is read
+   * here by hand, and a chain that reaches the git host through, say, a workspace integrate keeps
+   * going into the {@code SCMPublish*} events rather than restarting at them.
+   *
+   * <p><b>Lenient, and that is the contract rather than laziness.</b> Blank and malformed both read
+   * as absent: causation is advisory, and a push must never be refused over a field only the chain
+   * graph reads. It mirrors {@code CausationHeader.parse}, which is package-private in the library
+   * and so cannot be called from here; the parsing is four lines and the semantics are what matter.
+   *
+   * <p>The header sits inside the gateway's reserved {@code X-Qits-} namespace, which is what makes
+   * it unforgeable from outside: qits-gateway drops every client-supplied header with that prefix
+   * before it proxies. Service-to-service traffic on qits-net carries it untouched — and that is
+   * also the traffic that has a cause worth carrying.
+   */
+  private static UUID causationOf(RoutingContext rc) {
+    String raw = rc.request().getHeader(CausationHeader.NAME);
+    if (raw == null || raw.isBlank()) {
+      return null;
+    }
+    try {
+      return UUID.fromString(raw.trim());
+    } catch (IllegalArgumentException notAUuid) {
+      return null;
+    }
+  }
+
+  /**
+   * Tells every {@link ScmAnnouncer} on the classpath about a landed push.
+   *
+   * <p>Wrapped so one announcer cannot take a push down with it: this runs inside {@code
+   * ReceivePack.receive}, before the response is written, and the refs are already updated by the
+   * time it is reached. A push that succeeded must be reported as a success even if nobody could be
+   * told about it.
+   */
+  private void announce(
+      String repoId, Repository repo, Collection<ReceiveCommand> commands, boolean suppressCi) {
+    for (ScmAnnouncer announcer : announcers) {
+      try {
+        announcer.onPostReceive(repoId, repo, commands, suppressCi);
+      } catch (Exception e) {
+        LOG.warnf(e, "post-receive announcement for %s failed", repoId);
+      }
     }
   }
 
@@ -610,7 +683,7 @@ public class GitHostRoutes {
    * Hands the request back to the router when it is a name-addressed clone rather than a content
    * read, and reports whether it did.
    *
-   * <p>{@code /artifacts/git/<projectId>/<repoName>/info/refs} is the one request shape that
+   * <p>{@code /git/<projectId>/<repoName>/info/refs} is the one request shape that
    * matches these routes too — with {@code repoName} spelled {@code blob} or {@code tree}, so
    * {@code rev} comes out {@code info} and {@code path} {@code refs}. Answering it would make a
    * repository unclonable because of what it is called, so {@link RoutingContext#next} lets the
@@ -701,7 +774,7 @@ public class GitHostRoutes {
   }
 
   /**
-   * {@code GET /artifacts/git} — {@code {"repositories": [...]}}, every repository this host serves.
+   * {@code GET /git} — {@code {"repositories": [...]}}, every repository this host serves.
    *
    * <p>Sorted here rather than by the provider, so the order is a property of the response.
    * Filtered here for the same reason the id check in {@link
@@ -889,7 +962,7 @@ public class GitHostRoutes {
   }
 
   /**
-   * Opens the repository addressed by {@code /artifacts/git/:projectId/:repoName}: strips an
+   * Opens the repository addressed by {@code /git/:projectId/:repoName}: strips an
    * optional {@code
    * .git} suffix, resolves {@code (projectId, name)} through the {@link RepositoryNameResolver} to
    * a repo id, then opens that repo through the provider. The path segments are only lookup

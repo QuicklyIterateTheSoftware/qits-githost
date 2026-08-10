@@ -57,10 +57,10 @@ public class HttpRepositoryNameResolver implements RepositoryNameResolver {
   static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(5);
 
   /**
-   * An <b>instance</b> field, not a static one. {@link PostReceiveNotifier}'s own client states the
-   * native-image rule in full: a static one is built by the class initialiser, which under GraalVM
-   * runs at image-build time, and the image is then refused over an {@code HttpClientFacade} in its
-   * heap. {@code @ApplicationScoped} still means one client per process.
+   * An <b>instance</b> field, not a static one, and that is a native-image constraint rather than a
+   * style preference: a static {@code HttpClient} is built by the class initialiser, which under
+   * GraalVM runs at image-build time, and native-image then refuses the image over an {@code
+   * HttpClientFacade} in its heap. {@code @ApplicationScoped} still means one client per process.
    */
   private final HttpClient client =
       HttpClient.newBuilder().connectTimeout(CONNECT_TIMEOUT).build();

@@ -20,7 +20,7 @@ import org.jboss.logging.Logger;
  * (through qits-workspaces' integrate endpoint) rather than something a person remembers to do.
  *
  * <p><b>This is not a lock and must not pretend to be one.</b> What it guards against is reflex:
- * the muscle memory of {@code git push …/artifacts/git/<repo> main} that every doc in this tree
+ * the muscle memory of {@code git push …/git/<repo> main} that every doc in this tree
  * taught first. There used to be a second door beside it — anything with the {@code
  * qits-repositories} volume mounted moved a ref by writing a file — and that volume is gone, so
  * receive-pack, and therefore this hook, is now on the only path in.
@@ -58,12 +58,11 @@ import org.jboss.logging.Logger;
  *       empty"). With protection on and no token configured, direct pushes to the default branch
  *       are simply impossible, and a deployment that wants the dev-loop escape configures one.
  *   <li>{@code -o qits.no-ci} — <b>not</b> a bypass of this hook, and this class never reads it: it
- *       skips the CI post-receive POST for the push, and only that one — qits-projects still gets
- *       its event and still backs the repository up ({@code GitHostRoutes.service}'s
- *       post-receive lambda, {@code PostReceiveNotifier}). It grants no write this pusher did not
- *       already have — a push that could carry it could equally push nothing at all — so it needs no
- *       gate of its own. Named here because it rides the same push-options channel as the two
- *       bypasses above and is easy to look for in the wrong class.
+ *       rides through to {@code SCMPublishCommit.suppressCi}, where each consumer decides what it
+ *       means ({@code GitHostRoutes.service}'s post-receive lambda, {@code ScmEventAnnouncer}). It
+ *       grants no write this pusher did not already have — a push that could carry it could equally
+ *       push nothing at all — so it needs no gate of its own. Named here because it rides the same
+ *       push-options channel as the two bypasses above and is easy to look for in the wrong class.
  * </ul>
  *
  * <p>Push options rather than a header, because a header cannot serve all three doors this host is
