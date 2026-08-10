@@ -3,6 +3,7 @@ package eu.wohlben.qits.githost;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.quarkus.oidc.client.OidcClient;
 import io.smallrye.mutiny.Uni;
+import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import java.net.URI;
@@ -11,8 +12,13 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.Collection;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.transport.ReceiveCommand;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
@@ -28,8 +34,8 @@ import org.jboss.logging.Logger;
  * qits.ci.intake-url} and {@code qits.projects.intake-url} move.
  *
  * <p>One class rather than one per consumer, because the two deliveries share everything that is
- * hard here: the ref filter, the event body, the fire-and-forget send, and the single outbound
- * {@link HttpClient} the native image constrains (see the field below). What differs is the
+ * hard here: the ref filter, the event body, the off-thread send with its retries, and the single
+ * outbound {@link HttpClient} the native image constrains (see the field below). What differs is the
  * credential, and only ci has one.
  *
  * <p><b>{@code -o qits.no-ci} suppresses the ci delivery and nothing else.</b> The projects event
@@ -37,19 +43,31 @@ import org.jboss.logging.Logger;
  * history does not queue a run per branch, and a backup must happen for that push exactly as for any
  * other. {@link GitHostRoutes} reads the option and passes it in.
  *
- * <p>Fire-and-forget, the {@code OtelForwarder} idiom: the hook fires inside {@code
- * ReceivePack.receive(...)} — before the push response is written — so this must never block or
- * throw; failures are swallowed at debug (a missed event just means no advisory run, or a backup
- * that waits for the next push). The two consumers are independent: an unreachable one costs the
- * other nothing.
+ * <p><b>Never blocks the caller.</b> The hook fires inside {@code ReceivePack.receive(...)} — before
+ * the push response is written — so nothing here may block or throw. Every send and every retry
+ * runs off-thread; the caller returns the moment the first attempt is handed over. The two
+ * consumers are independent: an unreachable one costs the other nothing.
+ *
+ * <p><b>Retried, not fired and forgotten.</b> A delivery is tried again after each delay in {@code
+ * qits.post-receive.retry-delays} — about 5s, 15s, 45s and 2m, so roughly a three-minute window —
+ * and only then given up on, at WARN. That window exists because a lost event is expensive and was
+ * measured twice: during a bootstrap the database container is redeployed one phase before the next
+ * push, qits-ci's connection pool is severed, its intake answers 500 and no CI run ever starts. The
+ * old behaviour — one attempt, failures swallowed at debug — made that loss invisible on a live
+ * platform, so a give-up now says so in the log. Any 2xx is success; a refused connection and any
+ * other status are both retried, because the two are the same outage seen from different seconds of
+ * a container cutover.
  *
  * <p><b>The credential.</b> qits-ci's intake wants a bearer minted by qits-platform-idp for {@code
- * aud=qits-ci}; quarkus-oidc-client fetches and caches it and this class only attaches it. Both the
- * bearer and the older {@code X-CI-Token} are optional and independent, so a deployment can be on
- * either, both or neither — which is what lets the two services cut over one at a time. With no
- * client credentials configured nothing is fetched and the POST goes out exactly as it always has.
- * The projects event carries neither: that intake is unguarded on qits-net today, and a token minted
- * for {@code aud=qits-ci} would be the wrong one to send it anyway.
+ * aud=qits-ci}; quarkus-oidc-client fetches and caches it and this class only attaches it. It is
+ * asked again on <b>every attempt</b> rather than once per event: a retry that outlives an idp
+ * cutover must not re-present the token the first attempt held, and while the token is still good
+ * the client answers from its cache anyway. Both the bearer and the older {@code X-CI-Token} are
+ * optional and independent, so a deployment can be on either, both or neither — which is what lets
+ * the two services cut over one at a time. With no client credentials configured nothing is fetched
+ * and the POST goes out exactly as it always has. The projects event carries neither: that intake
+ * is unguarded on qits-net today, and a token minted for {@code aud=qits-ci} would be the wrong one
+ * to send it anyway.
  */
 @ApplicationScoped
 public class PostReceiveNotifier {
@@ -68,6 +86,20 @@ public class PostReceiveNotifier {
    */
   private final HttpClient client =
       HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build();
+
+  /**
+   * Waits out a retry delay, and an <b>instance</b> field for the same native-image reason the
+   * client above is one: a started thread pool may not be frozen into the image heap. One daemon
+   * thread is enough — it only sleeps and hands the next attempt back to the client's own executor —
+   * and daemon so a pending retry never holds the process open.
+   */
+  private final ScheduledExecutorService retries =
+      Executors.newSingleThreadScheduledExecutor(
+          runnable -> {
+            Thread thread = new Thread(runnable, "post-receive-retry");
+            thread.setDaemon(true);
+            return thread;
+          });
 
   @ConfigProperty(name = "qits.ci.intake-url")
   String ciIntakeUrl;
@@ -90,10 +122,26 @@ public class PostReceiveNotifier {
   @ConfigProperty(name = "quarkus.oidc-client.client-enabled", defaultValue = "false")
   boolean machineTokenEnabled;
 
+  /**
+   * How long to wait before each retry, one entry per retry — four entries mean up to five attempts.
+   * The shipped schedule spans about three minutes, which comfortably covers a container cutover; a
+   * suite that wants to prove the retry sets millisecond delays instead. One entry is the smallest
+   * useful value: SmallRye reads a configured-empty value as absent, so blanking the key restores
+   * this default rather than turning retrying off.
+   */
+  @ConfigProperty(name = "qits.post-receive.retry-delays", defaultValue = "PT5S,PT15S,PT45S,PT2M")
+  List<Duration> retryDelays;
+
   /** Fetches, caches and refreshes the bearer for qits-ci; see the oidc-client block in config. */
   @Inject OidcClient oidcClient;
 
   @Inject ObjectMapper objectMapper;
+
+  /** Drops the retries still waiting. The process is going down; nothing would deliver them. */
+  @PreDestroy
+  void stopRetrying() {
+    retries.shutdownNow();
+  }
 
   /**
    * The {@code PostReceiveHook} body — one event per updated branch ref of the push, fanned out to
@@ -119,7 +167,8 @@ public class PostReceiveNotifier {
         }
         postToProjects(repoId, branch, body);
       } catch (Exception e) {
-        LOG.debugf("post-receive event for %s skipped: %s", repoId, e.toString());
+        // WARN for the reason the give-up below is: this ref's event is gone and no retry covers it.
+        LOG.warnf("post-receive event for %s skipped: %s", repoId, e.toString());
       }
     }
   }
@@ -132,32 +181,47 @@ public class PostReceiveNotifier {
   }
 
   private void postToCi(String repoId, String branch, String body) {
+    attempt(new Delivery("CI", ciIntakeUrl, repoId, branch, () -> ciRequest(body)), 1);
+  }
+
+  /** The backup trigger. No credential and no token fetch, so it goes straight out. */
+  private void postToProjects(String repoId, String branch, String body) {
+    Delivery delivery =
+        new Delivery(
+            "projects",
+            projectsIntakeUrl,
+            repoId,
+            branch,
+            () -> Uni.createFrom().item(request(projectsIntakeUrl, body).build()));
+    attempt(delivery, 1);
+  }
+
+  /**
+   * One ci request, built fresh per attempt so the bearer is the one that is valid <b>now</b>. The
+   * fetch is a Uni and the send hangs off its completion, so nothing waits for the idp here either.
+   */
+  private Uni<HttpRequest> ciRequest(String body) {
     HttpRequest.Builder request = request(ciIntakeUrl, body);
     token
         .map(String::trim)
         .filter(t -> !t.isEmpty())
         .ifPresent(t -> request.header("X-CI-Token", t));
-    // Non-blocking like everything else on this path: the token fetch is a Uni, and the send hangs
-    // off its completion rather than waiting for it.
-    bearer()
-        .subscribe()
-        .with(
-            bearer -> {
-              bearer.ifPresent(b -> request.header("Authorization", "Bearer " + b));
-              send(request.build(), "CI", repoId, branch);
-            },
+    return bearer()
+        .onFailure()
+        .recoverWithItem(
             failure -> {
               // A token we could not get is not a reason to drop the event. qits-ci with its gate
               // off takes it either way, and with the gate on it refuses it — which is the right
-              // answer for a caller that cannot prove who it is.
-              LOG.debugf("CI token for %s@%s unavailable: %s", repoId, branch, failure);
-              send(request.build(), "CI", repoId, branch);
+              // answer for a caller that cannot prove who it is, and the refusal is retried like
+              // any other, by which time the idp may be back.
+              LOG.debugf("CI token unavailable: %s", failure);
+              return Optional.empty();
+            })
+        .map(
+            bearer -> {
+              bearer.ifPresent(b -> request.header("Authorization", "Bearer " + b));
+              return request.build();
             });
-  }
-
-  /** The backup trigger. No credential and no token fetch, so it goes straight out. */
-  private void postToProjects(String repoId, String branch, String body) {
-    send(request(projectsIntakeUrl, body).build(), "projects", repoId, branch);
   }
 
   private HttpRequest.Builder request(String intakeUrl, String body) {
@@ -175,18 +239,72 @@ public class PostReceiveNotifier {
     return oidcClient.getTokens().map(tokens -> Optional.of(tokens.getAccessToken()));
   }
 
-  private void send(HttpRequest request, String consumer, String repoId, String branch) {
-    client
-        .sendAsync(request, HttpResponse.BodyHandlers.discarding())
-        .whenComplete(
-            (response, failure) -> {
-              if (failure != null) {
-                LOG.debugf("%s event for %s@%s failed: %s", consumer, repoId, branch, failure);
-              } else if (response.statusCode() >= 400) {
-                LOG.debugf(
-                    "%s event for %s@%s rejected: %d",
-                    consumer, repoId, branch, response.statusCode());
-              }
-            });
+  /** One event on its way to one consumer: everything a retry has to be able to redo. */
+  private record Delivery(
+      String consumer,
+      String url,
+      String repoId,
+      String branch,
+      Supplier<Uni<HttpRequest>> request) {}
+
+  /** Sends one attempt. Returns at once; the outcome is handled on the client's own thread. */
+  private void attempt(Delivery delivery, int attempt) {
+    delivery
+        .request()
+        .get()
+        .subscribe()
+        .with(
+            request ->
+                client
+                    .sendAsync(request, HttpResponse.BodyHandlers.discarding())
+                    .whenComplete(
+                        (response, failure) -> {
+                          if (failure != null) {
+                            retryOrGiveUp(delivery, attempt, String.valueOf(failure));
+                          } else if (response.statusCode() / 100 == 2) {
+                            if (attempt > 1) {
+                              LOG.infof(
+                                  "%s event for %s@%s delivered on attempt %d",
+                                  delivery.consumer(),
+                                  delivery.repoId(),
+                                  delivery.branch(),
+                                  attempt);
+                            }
+                          } else {
+                            retryOrGiveUp(delivery, attempt, "status " + response.statusCode());
+                          }
+                        }),
+            // Building the request failed — a malformed url, say. Retrying costs nothing and the
+            // give-up log is the same one, which is the whole point of routing it here.
+            failure -> retryOrGiveUp(delivery, attempt, String.valueOf(failure)));
+  }
+
+  private void retryOrGiveUp(Delivery delivery, int attempt, String reason) {
+    if (attempt > retryDelays.size()) {
+      // WARN, not debug: this is a CI run that will never start, or a backup that will never
+      // happen, and it has to be findable in a log without knowing to look for it.
+      LOG.warnf(
+          "%s event for %s@%s LOST after %d attempts to %s: %s",
+          delivery.consumer(),
+          delivery.repoId(),
+          delivery.branch(),
+          attempt,
+          delivery.url(),
+          reason);
+      return;
+    }
+    Duration delay = retryDelays.get(attempt - 1);
+    LOG.debugf(
+        "%s event for %s@%s failed (attempt %d, retrying in %s): %s",
+        delivery.consumer(), delivery.repoId(), delivery.branch(), attempt, delay, reason);
+    try {
+      retries.schedule(
+          () -> attempt(delivery, attempt + 1), delay.toMillis(), TimeUnit.MILLISECONDS);
+    } catch (Exception e) {
+      // Shutting down. Nothing left to deliver on, and this must not throw at any caller.
+      LOG.debugf(
+          "%s event for %s@%s dropped: %s",
+          delivery.consumer(), delivery.repoId(), delivery.branch(), e.toString());
+    }
   }
 }

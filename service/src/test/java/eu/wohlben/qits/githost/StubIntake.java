@@ -17,6 +17,10 @@ import java.nio.charset.StandardCharsets;
  * was hit — the whole point of the fan-out is that the two counts differ under {@code -o
  * qits.no-ci}.
  *
+ * <p>Either intake can be told to <b>refuse</b> its next few requests, which is how {@link
+ * PostReceiveRetryTest} plays the outage the retry exists for. So each intake counts two things: the
+ * requests it saw (attempts, refused ones included) and the ones it took (deliveries).
+ *
  * <p><b>Everything crosses through system properties</b>, and that is not laziness. Quarkus builds a
  * {@code QuarkusTestProfile} in two classloaders — the JUnit one, whose config overrides reach the
  * application, and the Quarkus runtime one, where the test class itself lives — so a static field
@@ -30,13 +34,23 @@ final class StubIntake {
   /** Where the server listens. Set by whichever classloader starts it first. */
   private static final String BASE_URL = "qits.test.intake.base-url";
 
-  /** The Authorization header of the last ci delivery, or absent when it carried none. */
+  /** The Authorization header of the last ci <i>attempt</i>, or absent when it carried none. */
   static final String LAST_AUTHORIZATION = "qits.test.intake.ci.authorization";
 
   /** How many events each intake has taken, so a test can wait for one. */
   private static final String CI_DELIVERIES = "qits.test.intake.ci.deliveries";
 
   private static final String PROJECTS_DELIVERIES = "qits.test.intake.projects.deliveries";
+
+  /** How many requests each intake saw, including the ones it refused. */
+  private static final String CI_ATTEMPTS = "qits.test.intake.ci.attempts";
+
+  private static final String PROJECTS_ATTEMPTS = "qits.test.intake.projects.attempts";
+
+  /** How many further requests each intake refuses before it starts taking them again. */
+  private static final String CI_REFUSALS = "qits.test.intake.ci.refusals";
+
+  private static final String PROJECTS_REFUSALS = "qits.test.intake.projects.refusals";
 
   private static HttpServer server;
 
@@ -63,6 +77,10 @@ final class StubIntake {
     System.clearProperty(LAST_AUTHORIZATION);
     System.setProperty(CI_DELIVERIES, "0");
     System.setProperty(PROJECTS_DELIVERIES, "0");
+    System.setProperty(CI_ATTEMPTS, "0");
+    System.setProperty(PROJECTS_ATTEMPTS, "0");
+    System.setProperty(CI_REFUSALS, "0");
+    System.setProperty(PROJECTS_REFUSALS, "0");
   }
 
   static int ciDeliveries() {
@@ -71,6 +89,23 @@ final class StubIntake {
 
   static int projectsDeliveries() {
     return count(PROJECTS_DELIVERIES);
+  }
+
+  static int ciAttempts() {
+    return count(CI_ATTEMPTS);
+  }
+
+  static int projectsAttempts() {
+    return count(PROJECTS_ATTEMPTS);
+  }
+
+  /** Plays a consumer that is down: the next {@code requests} answer 503, later ones are taken. */
+  static void ciRefusesNext(int requests) {
+    System.setProperty(CI_REFUSALS, String.valueOf(requests));
+  }
+
+  static void projectsRefusesNext(int requests) {
+    System.setProperty(PROJECTS_REFUSALS, String.valueOf(requests));
   }
 
   static String lastAuthorization() {
@@ -97,9 +132,22 @@ final class StubIntake {
     Thread.sleep(300);
   }
 
+  /** Waits for an intake to have seen this many requests, refused ones included. */
+  static boolean awaitCiAttempts(int wanted) throws InterruptedException {
+    return awaitAtLeast(CI_ATTEMPTS, wanted);
+  }
+
+  static boolean awaitProjectsAttempts(int wanted) throws InterruptedException {
+    return awaitAtLeast(PROJECTS_ATTEMPTS, wanted);
+  }
+
   private static boolean await(String counter) throws InterruptedException {
+    return awaitAtLeast(counter, 1);
+  }
+
+  private static boolean awaitAtLeast(String counter, int wanted) throws InterruptedException {
     for (int attempt = 0; attempt < 50; attempt++) {
-      if (count(counter) > 0) {
+      if (count(counter) >= wanted) {
         return true;
       }
       Thread.sleep(100);
@@ -131,23 +179,49 @@ final class StubIntake {
   }
 
   private static void recordCiDelivery(HttpExchange exchange) throws java.io.IOException {
+    bump(CI_ATTEMPTS);
+    // Read on every attempt, not only an accepted one: the bearer is fetched again per attempt, so
+    // a refused attempt's credential is a thing a test may want to look at.
     String authorization = exchange.getRequestHeaders().getFirst("Authorization");
     if (authorization == null) {
       System.clearProperty(LAST_AUTHORIZATION);
     } else {
       System.setProperty(LAST_AUTHORIZATION, authorization);
     }
+    if (refused(exchange, CI_REFUSALS)) {
+      return;
+    }
     accept(exchange, CI_DELIVERIES);
   }
 
   private static void recordProjectsDelivery(HttpExchange exchange) throws java.io.IOException {
+    bump(PROJECTS_ATTEMPTS);
+    if (refused(exchange, PROJECTS_REFUSALS)) {
+      return;
+    }
     accept(exchange, PROJECTS_DELIVERIES);
   }
 
+  /** Answers 503 while refusals are owed, counting one off. 503 is what a severed pool gives. */
+  private static boolean refused(HttpExchange exchange, String refusals) throws java.io.IOException {
+    int owed = count(refusals);
+    if (owed <= 0) {
+      return false;
+    }
+    System.setProperty(refusals, String.valueOf(owed - 1));
+    exchange.sendResponseHeaders(503, -1);
+    exchange.close();
+    return true;
+  }
+
   private static void accept(HttpExchange exchange, String counter) throws java.io.IOException {
-    System.setProperty(counter, String.valueOf(count(counter) + 1));
+    bump(counter);
     exchange.sendResponseHeaders(202, -1);
     exchange.close();
+  }
+
+  private static void bump(String counter) {
+    System.setProperty(counter, String.valueOf(count(counter) + 1));
   }
 
   private static void issueToken(HttpExchange exchange) throws java.io.IOException {
