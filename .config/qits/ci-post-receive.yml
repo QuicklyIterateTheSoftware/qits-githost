@@ -1,0 +1,42 @@
+# The pipeline qits-ci runs on every push to a tracked branch of this repository.
+#
+# ONE STEP, and that is the whole shape — qits-platform-dns' pipeline, name for name: this service
+# serves no page, so there is nothing to install from the platform's npm registry and nothing to
+# prepare in the build context. The Dockerfile's builder stage does everything.
+#
+# THE TWO FLAGS THAT dns DOES NOT NEED. This repository depends on `qits-eventstream`, a jar
+# published to the platform's own Maven repository and available from nowhere else, so the builder
+# stage has to be able to reach it:
+#
+#   --network qits-net    puts the build's containers on the network where that registry answers. A
+#                         RUN step otherwise reaches the public internet and nothing else — not the
+#                         qits-net alias, not localhost:8081, not host.docker.internal.
+#   --build-arg           names the address on that network. The Dockerfile turns it into
+#                         -Dqits.maven.repository.url, which the pom's `qits-maven` repository reads
+#                         and .qits-maven-settings.xml mirrors, so a source-only build resolves the
+#                         one dependency that is not on Maven Central.
+#
+# Publish under the tag that is the whole contract with qits-deployments —
+# <registry>/<repository>/<this repo's name>:<sha>. The step's own container only drives the docker
+# CLI; the build and the push happen in the host's daemon through the socket this step declares
+# (docker: true).
+#
+# `set -eu` is load-bearing rather than tidy: the daemon runs this with `bash -c` and no -e, so
+# without it a failed build is swallowed by the next command's exit code — the push fails,
+# `docker rmi || true` answers 0, and the run reports SUCCESS. The deployer is then told an image
+# exists that does not. -u makes an unset registry variable stop the step too.
+#
+# A DEPLOY OF THIS SERVICE BLINKS THE GIT HOST, which is the host every other repository's builds
+# clone from. It is deployed alone, with nothing else in the queue.
+steps:
+  - image: qits/build-images/ci-base:latest
+    docker: true
+    timeout-seconds: 3600
+    script: |
+      set -eu
+      ref="$QITS_REGISTRY/$QITS_IMAGE_REPOSITORY/qits-githost:$QITS_CI_SHA"
+      docker build --network qits-net \
+        --build-arg QITS_MAVEN_REPOSITORY_URL=http://qits-platform-artifacts:8080/artifacts/maven/maven \
+        -t "$ref" -f docker/Dockerfile .
+      docker push "$ref"
+      docker rmi "$ref" || true

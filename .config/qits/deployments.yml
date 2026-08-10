@@ -1,0 +1,50 @@
+# How qits-deployments deploys this repo. It reads this file from the git host at the built sha, so
+# the answer travels with the commit.
+#
+# CARRYING THE FILE AT ALL is the other thing it says. qits-workspaces reads it on a release to
+# decide whether this repository deploys — a library or an SPA carries none and its release is the
+# trunk push alone.
+#
+# ENVIRONMENT service, and that is the change this repository exists to make. The git host used to
+# ride inside qits-platform-artifacts, which is platform-scoped because it held the pull-through
+# caches; a git repository is not an artifact, it only shared the blob store's storage layout. Every
+# consumer — qits-ci, qits-deployments, qits-workspaces, the daemons, the workspace containers — is
+# an env service, so an env-scoped git host is the consistent shape. A green build deploys into
+# whichever tier listens to the built branch.
+deployment_target: environment
+
+# TWO DATABASES, because this application opens two datasources with two Flyway lineages.
+# qits-deployments creates a login role and a database for each on the postgres of this tier before
+# the container starts and injects QITS_RESOURCE_<NAME>_URL / _USERNAME / _PASSWORD — the generic
+# contract the application and the qits-eventstream jar map onto quarkus.datasource.* in their own
+# shipped defaults.
+#
+# `db` takes the DERIVED default database, qits_githost: `qits_` plus the application name without
+# its qits- prefix, dashes to underscores. It holds the pack catalog (git_pack, git_pack_file) and
+# the per-repository protection override — the tables that were V4 and V5 of qits-platform-artifacts'
+# chain, restarted here at V1 because a lineage is owned by a service.
+#
+# THE EVENTSTREAM ENTRY IS NOT OPTIONAL AND ITS NAME IS LOAD-BEARING. A push publishes
+# SCMPublishCommit, SCMPublishTag, SCMDeleteBranch and SCMDeleteTag through the qits-eventstream
+# outbox, which is what replaced the post-receive HTTP fan-out that retried in memory and then lost
+# the event. The jar reads QITS_RESOURCE_EVENTSTREAM_*, so the resource NAME here is what makes those
+# variables exist; rename it and the expression is unresolvable and the process refuses to boot at
+# Flyway. Being dark (`qits.eventstream.enabled`) would not save it — dark stops publishing, sweeping
+# and dialling, never the datasource, which Quarkus opens and migrates at boot regardless.
+#
+# It NAMES its database, and has to: the default is derived from the application, so both entries
+# would otherwise have asked for qits_githost and the parser refuses that after resolution.
+resources: postgresql:db, postgresql:eventstream:qits_githost_eventstream
+
+# THE PROBE THE DEPLOY GATES ON, SPELLED OUT BECAUSE THE DERIVED DEFAULT IS WRONG. The default would
+# be /githost/q/health/ready — the repository name minus `qits-`; this application serves its
+# non-application root at /git/q (quarkus.http.non-application-root-path), because /git is the prefix
+# git itself speaks to and the health surface sits under this service's own gateway segment beside
+# it. A derived default is only ever right where the route prefix and the served prefix are the same
+# string.
+#
+# Readiness rather than liveness: quarkus-agroal registers a readiness check per datasource as soon
+# as a health extension is present, so this path is red while either database above is unreachable.
+# Liveness answers UP with an empty check list — a git host that boots and cannot read its pack
+# catalog would pass it, and that container serves an empty ref advertisement to every clone.
+health_path: /git/q/health/ready

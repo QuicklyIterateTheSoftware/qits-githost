@@ -1,0 +1,57 @@
+# The release pipeline: this repository reacts to its OWN release and pushes the image under the
+# released VERSION. qits-platform-dns' file, name for name — see that repository for the long form of
+# each rule; the short form of the ones that bite:
+#
+# - The selection naming this repository is not a loop: SCMRelease comes from qits-workspaces, and
+#   nothing in this file publishes it.
+# - `artifacts:` is a declaration, not a report — qits-ci announces on the strength of it. Keep it
+#   true.
+# - The name is unqualified on purpose; the reader supplies its own registry host.
+# - The build below is ci-post-receive.yml's, and the two must stay matched: one image content, two
+#   coordinates. That includes --network and --build-arg, which this repository needs because
+#   qits-eventstream lives only in the platform's own Maven repository.
+# - This file is inert until an SCMRelease for this repository exists, and it lands first on purpose
+#   — the bus is at-most-once, so the trigger must precede the event it selects.
+#
+# WHAT IS NOT DECLARED HERE. This repository also publishes two library jars — qits-githost-events
+# (the event vocabulary a consumer depends on) and qits-githost-git-storage — and neither is in
+# `artifacts:` below, because this pipeline does not publish them. A Maven release of those jars is
+# its own step and its own declaration, and announcing an artifact nothing pushed is exactly what
+# `artifacts:` must never do.
+event: SCMRelease
+when:
+  - repository: { exact: qits-githost }
+artifacts:
+  - { type: docker, name: qits/qits-githost }
+steps:
+    # node is here to read the event payload, which is JSON; the docker CLI to build and push.
+  - image: qits/build-images/node-docker-base:latest
+    docker: true
+    timeout-seconds: 3600
+    script: |
+      # Without -e a failed docker build is swallowed and a green release run makes qits-ci announce
+      # an artifact that was never pushed. -u makes an unset registry variable stop the step.
+      set -eu
+
+      # The event, read as data: the payload reaches the container verbatim in $QITS_EVENT_PAYLOAD.
+      version=$(node -p 'JSON.parse(process.env.QITS_EVENT_PAYLOAD).version')
+      # A version here is a calver or a semver, and nothing legitimate needs a character outside
+      # this set. Refused rather than quoted, because it reaches a shell and a docker reference.
+      case "$version" in
+        ''|*[!0-9A-Za-z._+-]*) echo "refusing an implausible version: $version" >&2; exit 1 ;;
+      esac
+      echo "releasing qits/qits-githost:$version"
+
+      # The tag is the checkout target: an event-triggered run is cloned at the head of main, which
+      # a later push moves — the tag does not. The clone is shallow and carries no tags, hence the
+      # explicit refspec; the URL rather than `origin` because every address a step needs arrives
+      # as environment.
+      git fetch "$QITS_CI_REPOSITORY_URL" "refs/tags/$version:refs/tags/$version"
+      git checkout --detach "$version"
+
+      ref="$QITS_REGISTRY/$QITS_IMAGE_REPOSITORY/qits-githost:$version"
+      docker build --network qits-net \
+        --build-arg QITS_MAVEN_REPOSITORY_URL=http://qits-platform-artifacts:8080/artifacts/maven/maven \
+        -t "$ref" -f docker/Dockerfile .
+      docker push "$ref"
+      docker rmi "$ref" || true

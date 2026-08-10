@@ -132,6 +132,24 @@ whole `X-Qits-` prefix, so a header would behave differently through the front d
 - `-o qits.token=<value>` — push the protected branch anyway, if the value matches.
 - `-o qits.no-ci` — not a bypass. It rides through to `SCMPublishCommit.suppressCi`.
 
+## Deployment
+
+A push builds `docker/Dockerfile` — a Mandrel builder stage that native-compiles `service`, a
+`ubi-minimal` runtime stage that carries only the binary — and pushes it as
+`qits/qits-githost:<sha>`; a release rebuilds the same content under the released version
+(`.config/qits/ci-post-receive.yml` and `.config/qits/ci-event-release.yml`). Both builds run
+`--network qits-net` with `--build-arg QITS_MAVEN_REPOSITORY_URL=…`, because `qits-eventstream`
+exists only in the platform's own Maven repository and a docker build reaches no other address for
+it. `.config/qits/deployments.yml` is the deploy answer: **an environment service** — every tier
+runs its own git host, and a green build deploys into whichever tier listens to the built branch —
+with `resources: postgresql:db, postgresql:eventstream:qits_githost_eventstream` and the health gate
+at `/git/q/health/ready`. Those two resource **names** are load-bearing: they are what makes
+`QITS_RESOURCE_DB_*` and `QITS_RESOURCE_EVENTSTREAM_*` exist, and neither triple has a default, so a
+missing one kills the boot at Flyway rather than opening a store nobody meant. The blob directory
+(`QITS_ARTIFACTS_BLOBS_DIR`) and the volume behind it are run-args, written by the bootstrap CLI —
+the deployment grammar has no key for a mount. Deploy this service alone: replacing it blinks the
+host every other repository's build clones from.
+
 ## Storage
 
 A repository has no directory anywhere. Its packs, pack indexes and reftables are blobs in this
@@ -153,3 +171,16 @@ Needs no docker and no network: the suite drives the real `git` CLI against the 
 and both databases are real PostgreSQL binaries resolved as Maven artifacts and spawned as a child
 process (zonky). `qits-eventstream` resolves from the platform Maven repository; everything else is
 Maven Central or this reactor.
+
+`service` compiles to a GraalVM native image, which is what a deployment runs:
+
+```
+sdk env && ./mvnw -B verify -Dnative
+```
+
+`.sdkmanrc` names `25.0.2-graalce`, so this needs no container. Without a GraalVM on the path Quarkus
+falls back to a 1.8 GB Mandrel image over docker and stays green either way — recognise the fallback
+by the image pull. The four `--initialize-at-run-time` flags in `application.properties` are JGit's,
+and `bus/EventWireReflection` is the event vocabulary's: JGit is not a Quarkus extension and
+`CanonicalJson` builds its own `ObjectMapper`, so nothing registers either on their behalf and both
+failures land at runtime in the binary while every `@QuarkusTest` stays green.
