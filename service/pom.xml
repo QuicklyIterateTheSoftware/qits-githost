@@ -1,0 +1,186 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>eu.wohlben.qits</groupId>
+        <artifactId>qits-githost</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <!-- The deployable: the git smart-HTTP routes at /git/*, the two storage adapters that put the
+         `git-storage` engine's packs and reftables into qits-blobstore, the schema those adapters'
+         rows live in, and the publisher that turns a post-receive hook into platform events.
+
+         NO JAX-RS AND NO WEB UI. Everything this service serves is a wire protocol spoken by `git`,
+         so there is no quarkus.rest.path, no OpenAPI document and no Quinoa. Health is the one
+         non-git surface, at /git/q/health/ready.
+
+         The adapters can only live HERE: `git-storage` declares the two ports and may not depend on
+         qits-blobstore, qits-blobstore knows nothing of git, and this is the one module that
+         depends on both. -->
+    <artifactId>qits-githost-service</artifactId>
+    <name>qits-githost :: service</name>
+    <packaging>quarkus</packaging>
+
+    <dependencies>
+        <dependency>
+            <!-- /git/q/health/ready — the readiness endpoint qits-cd's health gate curls. -->
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-smallrye-health</artifactId>
+        </dependency>
+        <dependency>
+            <!-- The git host's storage engine (a JGit DfsRepository over blobs). -->
+            <groupId>${project.groupId}</groupId>
+            <artifactId>qits-githost-git-storage</artifactId>
+        </dependency>
+        <dependency>
+            <!-- The event vocabulary this service publishes. It carries qits-eventstream with it,
+                 which is where QitsEventBus, the outbox and their datasource come from. -->
+            <groupId>${project.groupId}</groupId>
+            <artifactId>qits-githost-events</artifactId>
+        </dependency>
+        <dependency>
+            <!-- The content-addressed blob store: BlobStore is where a pack, a pack index and a
+                 reftable are written. Nothing else in this jar is used — this service maps no
+                 artifact repository and serves no artifact. -->
+            <groupId>${project.groupId}</groupId>
+            <artifactId>qits-blobstore</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-arc</artifactId>
+        </dependency>
+        <dependency>
+            <!-- The Router these routes register on. Brought in by health too; named because
+                 GitHostRoutes observes io.vertx.ext.web.Router directly. -->
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-vertx-http</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-hibernate-orm-panache</artifactId>
+        </dependency>
+        <dependency>
+            <!-- QuarkusTransaction, which every adapter here opens its own transaction with: the
+                 post-receive path runs on a Vert.x worker with none bound. -->
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-narayana-jta</artifactId>
+        </dependency>
+        <dependency>
+            <!-- The ObjectMapper HttpRepositoryNameResolver reads its one lookup response with. -->
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-jackson</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-jdbc-postgresql</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-flyway</artifactId>
+        </dependency>
+        <dependency>
+            <!-- Flyway 10 split its database support out of core; without this the postgres
+                 lineages have no dialect and migrate-at-start fails at the first statement. -->
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-database-postgresql</artifactId>
+        </dependency>
+        <dependency>
+            <!-- OTLP export to qits-observability, on the same settings every other service ships.
+                 Dark outside a deployment (see application.properties). -->
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-opentelemetry</artifactId>
+        </dependency>
+        <dependency>
+            <!-- JGit core only (UploadPack/ReceivePack + the pkt-line protocol). GitHostRoutes
+                 drives these directly from Vert.x routes, so we need NEITHER a servlet container
+                 NOR jgit.http.server. JGit speaks the wire protocol ONLY. -->
+            <groupId>org.eclipse.jgit</groupId>
+            <artifactId>org.eclipse.jgit</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-junit5</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.rest-assured</groupId>
+            <artifactId>rest-assured</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.zonky.test</groupId>
+            <artifactId>embedded-postgres</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <!-- Named per architecture on purpose: the binaries are separate artifacts and zonky
+                 picks one at run time, so an unnamed arch fails in the middle of a suite rather
+                 than during resolution. -->
+            <groupId>io.zonky.test.postgres</groupId>
+            <artifactId>embedded-postgres-binaries-linux-amd64</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.zonky.test.postgres</groupId>
+            <artifactId>embedded-postgres-binaries-linux-arm64v8</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.zonky.test.postgres</groupId>
+            <artifactId>embedded-postgres-binaries-darwin-arm64v8</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <!-- This module is the DEPLOYABLE, and `<packaging>quarkus</packaging>` above is
+                     what says so: it binds generate-code, generate-code-tests and build into the
+                     lifecycle, so augmentation is not an execution someone can misplace. -->
+                <groupId>${quarkus.platform.group-id}</groupId>
+                <artifactId>quarkus-maven-plugin</artifactId>
+                <extensions>true</extensions>
+            </plugin>
+            <plugin>
+                <artifactId>maven-compiler-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <systemPropertyVariables>
+                        <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>io.smallrye</groupId>
+                <artifactId>jandex-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <!-- GraalVM native build: `-Dnative` disables the fast-jar and enables the native image. It
+             lives in THIS module because only this module is an application. -->
+        <profile>
+            <id>native</id>
+            <activation>
+                <property>
+                    <name>native</name>
+                </property>
+            </activation>
+            <properties>
+                <quarkus.package.jar.enabled>false</quarkus.package.jar.enabled>
+                <skipITs>false</skipITs>
+                <quarkus.native.enabled>true</quarkus.native.enabled>
+            </properties>
+        </profile>
+    </profiles>
+</project>

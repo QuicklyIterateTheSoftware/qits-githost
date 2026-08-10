@@ -1,0 +1,189 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- qits-githost — the platform's git smart-HTTP host, an env service
+         (byte-plane-split-plan.md phase 3).
+
+         It moved out of qits-platform-artifacts whole, with its history: a git repository is not an
+         artifact, it only shared the blob store's storage layout. Every consumer — qits-ci,
+         qits-deployments, qits-workspaces, the daemons, the workspace containers — is an env
+         service, so an env-scoped git host is the consistent shape.
+
+         WHAT CHANGED ON THE WAY OUT: the post-receive HTTP fan-out is gone. A push now publishes
+         DURABLE DOMAIN EVENTS through the qits-eventstream outbox — SCMPublishCommit,
+         SCMPublishTag, SCMDeleteBranch, SCMDeleteTag — so a consumer that was down while a push
+         landed reads the event back rather than losing it. The events are `githost-events`, a jar a
+         consumer depends on to get the vocabulary and nothing else.
+
+         Three modules, and the edges are the whole reason there are three:
+
+           git-storage      the JGit DfsRepository engine. Plain library jar, ONE compile
+                            dependency (JGit), two ports it declares and does not implement.
+           githost-events   the event vocabulary. Depends on qits-eventstream and nothing else —
+                            a consumer gets these records plus the bus and no part of this service.
+           service          the deployable: the Vert.x routes, the port adapters over
+                            qits-blobstore, the schema, and the publisher that turns a post-receive
+                            hook into events.
+
+         Versions that must stay in step with the rest of the platform (Quarkus platform, JDK
+         release, JGit) are duplicated here on purpose: a clone of THIS repo alone must build, with
+         no monorepo and no parent to inherit from. -->
+    <groupId>eu.wohlben.qits</groupId>
+    <artifactId>qits-githost</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+    <name>qits-githost</name>
+
+    <modules>
+        <!-- Libraries before the app. `service` depends on both; neither depends on the other. -->
+        <module>git-storage</module>
+        <module>githost-events</module>
+        <module>service</module>
+    </modules>
+
+    <properties>
+        <!-- The content-addressed blob store, extracted in phase 1. This service stores packs, pack
+             indexes and reftables in it and uses nothing else it offers. -->
+        <qits.blobstore.version>1.0.0-SNAPSHOT</qits.blobstore.version>
+        <!-- The event bus: the outbox, the idempotent PUT, the durable listener. Published by
+             libs/qits-eventstream into the platform Maven repository, which is why the
+             <repositories> block below exists — this is the one dependency here that is not on
+             Maven Central and not built in this reactor. -->
+        <qits.eventstream.version>2026.810.103202</qits.eventstream.version>
+        <qits.maven.repository.url>http://localhost:8081/artifacts/maven/maven</qits.maven.repository.url>
+
+        <maven.compiler.release>25</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+
+        <quarkus.platform.artifact-id>quarkus-bom</quarkus.platform.artifact-id>
+        <quarkus.platform.group-id>io.quarkus.platform</quarkus.platform.group-id>
+        <quarkus.platform.version>3.34.6</quarkus.platform.version>
+
+        <compiler-plugin.version>3.15.0</compiler-plugin.version>
+        <surefire-plugin.version>3.5.4</surefire-plugin.version>
+        <jandex-plugin.version>3.4.0</jandex-plugin.version>
+        <failsafe-plugin.version>${surefire-plugin.version}</failsafe-plugin.version>
+
+        <!-- Not in the platform BOM, so pinned here exactly as qits-platform-artifacts pinned it.
+             Read git-storage/README.md before bumping it: everything in that module extends
+             org.eclipse.jgit.internal.storage.dfs, which carries no API stability promise. -->
+        <jgit.version>7.3.0.202506031305-r</jgit.version>
+
+        <!-- Real PostgreSQL binaries, resolved as ordinary Maven artifacts and spawned as a child
+             process by the suite. The platform convention: a clone must test green with no docker,
+             and two schemas — this service's own and the eventstream outbox — still have to be
+             exercised against the database they ship on. -->
+        <zonky.embedded-postgres.version>2.2.2</zonky.embedded-postgres.version>
+        <zonky.postgres-binaries.version>18.4.0</zonky.postgres-binaries.version>
+
+        <!-- Integration tests run against a PACKAGED artifact, so a plain `mvn verify` skips them. -->
+        <skipITs>true</skipITs>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>${quarkus.platform.group-id}</groupId>
+                <artifactId>${quarkus.platform.artifact-id}</artifactId>
+                <version>${quarkus.platform.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>io.zonky.test.postgres</groupId>
+                <artifactId>embedded-postgres-binaries-bom</artifactId>
+                <version>${zonky.postgres-binaries.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>io.zonky.test</groupId>
+                <artifactId>embedded-postgres</artifactId>
+                <version>${zonky.embedded-postgres.version}</version>
+                <scope>test</scope>
+            </dependency>
+            <dependency>
+                <groupId>org.eclipse.jgit</groupId>
+                <artifactId>org.eclipse.jgit</artifactId>
+                <version>${jgit.version}</version>
+            </dependency>
+            <!-- The platform jars this repo consumes. -->
+            <dependency>
+                <groupId>${project.groupId}</groupId>
+                <artifactId>qits-blobstore</artifactId>
+                <version>${qits.blobstore.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>${project.groupId}</groupId>
+                <artifactId>qits-eventstream</artifactId>
+                <version>${qits.eventstream.version}</version>
+            </dependency>
+            <!-- The reactor's own modules, so `service` depends on them version-less. -->
+            <dependency>
+                <groupId>${project.groupId}</groupId>
+                <artifactId>qits-githost-git-storage</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>${project.groupId}</groupId>
+                <artifactId>qits-githost-events</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <repositories>
+        <!-- The platform's own Maven repository, where qits-eventstream is published. The id is
+             what a locally cached copy is recorded under, so it has to stay `qits-maven` or an
+             offline build refuses an artifact it already has. -->
+        <repository>
+            <id>qits-maven</id>
+            <url>${qits.maven.repository.url}</url>
+        </repository>
+    </repositories>
+
+    <build>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>${quarkus.platform.group-id}</groupId>
+                    <artifactId>quarkus-maven-plugin</artifactId>
+                    <version>${quarkus.platform.version}</version>
+                </plugin>
+                <plugin>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <version>${compiler-plugin.version}</version>
+                    <configuration>
+                        <parameters>true</parameters>
+                        <useIncrementalCompilation>false</useIncrementalCompilation>
+                    </configuration>
+                </plugin>
+                <plugin>
+                    <artifactId>maven-surefire-plugin</artifactId>
+                    <version>${surefire-plugin.version}</version>
+                </plugin>
+                <plugin>
+                    <artifactId>maven-failsafe-plugin</artifactId>
+                    <version>${failsafe-plugin.version}</version>
+                </plugin>
+                <plugin>
+                    <groupId>io.smallrye</groupId>
+                    <artifactId>jandex-maven-plugin</artifactId>
+                    <version>${jandex-plugin.version}</version>
+                    <executions>
+                        <execution>
+                            <id>make-index</id>
+                            <goals>
+                                <goal>jandex</goal>
+                            </goals>
+                        </execution>
+                    </executions>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+    </build>
+</project>
