@@ -46,7 +46,7 @@ public class GitHostPushTokenTest {
 
   @Inject RepositoryProtectionStore protections;
 
-  @TestHTTPResource("/artifacts/git")
+  @TestHTTPResource("/git")
   URL gitBase;
 
   private String seedOrigin() throws Exception {

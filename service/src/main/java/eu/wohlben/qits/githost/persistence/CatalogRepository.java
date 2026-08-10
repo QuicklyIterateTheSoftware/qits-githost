@@ -47,7 +47,7 @@ public class CatalogRepository implements PackCatalog {
 
   /**
    * Every repository this catalog holds, by id — the DFS backend's half of {@code GET
-   * /artifacts/git}.
+   * /git}.
    *
    * <p>Not part of {@link PackCatalog}: that port is what JGit reaches through, one repository at a
    * time, and it has no reason to know the catalog holds more than one. This is the git host asking

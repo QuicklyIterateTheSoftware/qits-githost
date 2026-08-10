@@ -58,7 +58,7 @@ public class GitHostTest {
 
   @Inject RepositoryProtectionStore protections;
 
-  @TestHTTPResource("/artifacts/git")
+  @TestHTTPResource("/git")
   URL gitBase;
 
   @BeforeEach
@@ -132,7 +132,7 @@ public class GitHostTest {
     String repoId = seedOrigin();
     given()
         .when()
-        .get("/artifacts/git/" + repoId + "/info/refs?service=git-upload-pack")
+        .get("/git/" + repoId + "/info/refs?service=git-upload-pack")
         .then()
         .statusCode(Response.Status.OK.getStatusCode())
         .contentType(containsString("git-upload-pack-advertisement"));
@@ -145,7 +145,7 @@ public class GitHostTest {
     String repoId = seedOrigin();
     given()
         .when()
-        .get("/artifacts/git/" + repoId + "/info/refs")
+        .get("/git/" + repoId + "/info/refs")
         .then()
         .statusCode(Response.Status.FORBIDDEN.getStatusCode());
   }
@@ -157,7 +157,7 @@ public class GitHostTest {
     // repository and look like a repository that lost its history.
     given()
         .when()
-        .get("/artifacts/git/" + UUID.randomUUID() + "/info/refs?service=git-upload-pack")
+        .get("/git/" + UUID.randomUUID() + "/info/refs?service=git-upload-pack")
         .then()
         .statusCode(Response.Status.NOT_FOUND.getStatusCode());
   }
@@ -169,7 +169,7 @@ public class GitHostTest {
     // under it touches a filesystem, so a traversal-shaped id would merely be an unknown id there.
     given()
         .when()
-        .get("/artifacts/git/foo.bar/info/refs?service=git-upload-pack")
+        .get("/git/foo.bar/info/refs?service=git-upload-pack")
         .then()
         .statusCode(Response.Status.NOT_FOUND.getStatusCode());
   }
@@ -177,8 +177,8 @@ public class GitHostTest {
   @Test
   public void nameAddressedCloneResolvesThroughTheAliasTable() throws Exception {
     // A repository import registers the repo's url-basename ("testing-repo") as a project-scoped
-    // name alias, so it is servable at /artifacts/git/<projectId>/<name> as well as
-    // /artifacts/git/<repoId>. The two schemes still differ in path length under the new prefix,
+    // name alias, so it is servable at /git/<projectId>/<name> as well as
+    // /git/<repoId>. The two schemes still differ in path length under the new prefix,
     // which is what keeps Vert.x dispatching them unambiguously.
     String projectId = UUID.randomUUID().toString();
     String repoId = seedOrigin();
@@ -206,7 +206,7 @@ public class GitHostTest {
     // The id-addressed route keeps working for the same repo (back-compat).
     given()
         .when()
-        .get("/artifacts/git/" + repoId + "/info/refs?service=git-upload-pack")
+        .get("/git/" + repoId + "/info/refs?service=git-upload-pack")
         .then()
         .statusCode(Response.Status.OK.getStatusCode());
   }
@@ -216,7 +216,7 @@ public class GitHostTest {
     String projectId = UUID.randomUUID().toString();
     given()
         .when()
-        .get("/artifacts/git/" + projectId + "/no-such-name/info/refs?service=git-upload-pack")
+        .get("/git/" + projectId + "/no-such-name/info/refs?service=git-upload-pack")
         .then()
         .statusCode(Response.Status.NOT_FOUND.getStatusCode());
   }
@@ -249,7 +249,7 @@ public class GitHostTest {
     byte[] byBranch =
         given()
             .when()
-            .get("/artifacts/git/" + repoId + "/blob/main/pipeline.yml")
+            .get("/git/" + repoId + "/blob/main/pipeline.yml")
             .then()
             .statusCode(Response.Status.OK.getStatusCode())
             .contentType(containsString("application/octet-stream"))
@@ -263,7 +263,7 @@ public class GitHostTest {
     byte[] bySha =
         given()
             .when()
-            .get("/artifacts/git/" + repoId + "/blob/" + head + "/docs/guide.md")
+            .get("/git/" + repoId + "/blob/" + head + "/docs/guide.md")
             .then()
             .statusCode(Response.Status.OK.getStatusCode())
             .header("Git-Commit-Sha", equalTo(head))
@@ -287,7 +287,7 @@ public class GitHostTest {
 
     given()
         .when()
-        .get("/artifacts/git/" + repoId + "/blob/" + parent + "/pipeline.yml")
+        .get("/git/" + repoId + "/blob/" + parent + "/pipeline.yml")
         .then()
         .statusCode(Response.Status.OK.getStatusCode())
         .header("Git-Commit-Sha", equalTo(parent));
@@ -300,7 +300,7 @@ public class GitHostTest {
 
     given()
         .when()
-        .get("/artifacts/git/" + repoId + "/tree/main")
+        .get("/git/" + repoId + "/tree/main")
         .then()
         .statusCode(Response.Status.OK.getStatusCode())
         .contentType(containsString("application/json"))
@@ -312,7 +312,7 @@ public class GitHostTest {
     // A path names the directory to list, and a trailing slash is the same request.
     given()
         .when()
-        .get("/artifacts/git/" + repoId + "/tree/" + head + "/docs/")
+        .get("/git/" + repoId + "/tree/" + head + "/docs/")
         .then()
         .statusCode(Response.Status.OK.getStatusCode())
         .body("entries.size()", equalTo(1))
@@ -334,7 +334,7 @@ public class GitHostTest {
         given()
             .urlEncodingEnabled(false)
             .when()
-            .get("/artifacts/git/" + repoId + "/blob/feature%2Freads/branchy.txt")
+            .get("/git/" + repoId + "/blob/feature%2Freads/branchy.txt")
             .then()
             .statusCode(Response.Status.OK.getStatusCode())
             .header("Git-Commit-Sha", equalTo(GitHostFixture.head(clone)))
@@ -351,13 +351,13 @@ public class GitHostTest {
     // A repository this host does not hold.
     given()
         .when()
-        .get("/artifacts/git/" + UUID.randomUUID() + "/blob/main/pipeline.yml")
+        .get("/git/" + UUID.randomUUID() + "/blob/main/pipeline.yml")
         .then()
         .statusCode(Response.Status.NOT_FOUND.getStatusCode());
     // A ref that is not there.
     given()
         .when()
-        .get("/artifacts/git/" + repoId + "/blob/no-such-branch/pipeline.yml")
+        .get("/git/" + repoId + "/blob/no-such-branch/pipeline.yml")
         .then()
         .statusCode(Response.Status.NOT_FOUND.getStatusCode());
     // A well-formed sha nothing in this repository is. Repository.resolve hands a full id back
@@ -365,7 +365,7 @@ public class GitHostTest {
     given()
         .when()
         .get(
-            "/artifacts/git/"
+            "/git/"
                 + repoId
                 + "/blob/0123456789abcdef0123456789abcdef01234567/pipeline.yml")
         .then()
@@ -373,24 +373,24 @@ public class GitHostTest {
     // A path that is not in that commit.
     given()
         .when()
-        .get("/artifacts/git/" + repoId + "/blob/" + head + "/nowhere.yml")
+        .get("/git/" + repoId + "/blob/" + head + "/nowhere.yml")
         .then()
         .statusCode(Response.Status.NOT_FOUND.getStatusCode());
     // A directory read as a blob, and a file listed as a tree: each resolves, and neither is what
     // the caller asked for.
     given()
         .when()
-        .get("/artifacts/git/" + repoId + "/blob/main/docs")
+        .get("/git/" + repoId + "/blob/main/docs")
         .then()
         .statusCode(Response.Status.NOT_FOUND.getStatusCode());
     given()
         .when()
-        .get("/artifacts/git/" + repoId + "/tree/main/pipeline.yml")
+        .get("/git/" + repoId + "/tree/main/pipeline.yml")
         .then()
         .statusCode(Response.Status.NOT_FOUND.getStatusCode());
     given()
         .when()
-        .get("/artifacts/git/" + repoId + "/tree/main/no-such-directory")
+        .get("/git/" + repoId + "/tree/main/no-such-directory")
         .then()
         .statusCode(Response.Status.NOT_FOUND.getStatusCode());
   }
@@ -409,13 +409,13 @@ public class GitHostTest {
       given()
           .urlEncodingEnabled(false)
           .when()
-          .get("/artifacts/git/" + repoId + "/blob/" + rev + "/pipeline.yml")
+          .get("/git/" + repoId + "/blob/" + rev + "/pipeline.yml")
           .then()
           .statusCode(Response.Status.BAD_REQUEST.getStatusCode());
       given()
           .urlEncodingEnabled(false)
           .when()
-          .get("/artifacts/git/" + repoId + "/tree/" + rev)
+          .get("/git/" + repoId + "/tree/" + rev)
           .then()
           .statusCode(Response.Status.BAD_REQUEST.getStatusCode());
     }
@@ -436,13 +436,13 @@ public class GitHostTest {
 
     given()
         .when()
-        .get("/artifacts/git/" + repoId + "/blob/main/big.bin")
+        .get("/git/" + repoId + "/blob/main/big.bin")
         .then()
         .statusCode(Response.Status.REQUEST_ENTITY_TOO_LARGE.getStatusCode());
     // The bound is per blob, not per repository: the small file beside it is still served.
     given()
         .when()
-        .get("/artifacts/git/" + repoId + "/blob/main/small.txt")
+        .get("/git/" + repoId + "/blob/main/small.txt")
         .then()
         .statusCode(Response.Status.OK.getStatusCode());
   }
@@ -450,7 +450,7 @@ public class GitHostTest {
   @Test
   public void aRepositoryCalledBlobIsStillClonableByName() throws Exception {
     // The one request shape the content routes and the name-addressed scheme both match:
-    // /artifacts/git/<projectId>/blob/info/refs is a clone of a repository CALLED blob, and it is
+    // /git/<projectId>/blob/info/refs is a clone of a repository CALLED blob, and it is
     // registered first. The handler hands it back to the router rather than answering it, so a
     // repository does not become unclonable because of what it is called.
     String projectId = UUID.randomUUID().toString();
@@ -482,7 +482,7 @@ public class GitHostTest {
     String repoId = seedOrigin();
     given()
         .when()
-        .get("/artifacts/git/" + repoId + "/info/refs?service=git-receive-pack")
+        .get("/git/" + repoId + "/info/refs?service=git-receive-pack")
         .then()
         .statusCode(Response.Status.OK.getStatusCode())
         .contentType(containsString("git-receive-pack-advertisement"))
@@ -709,7 +709,7 @@ public class GitHostTest {
 
     given()
         .when()
-        .get("/artifacts/git/" + repoId + "/info/refs?service=git-receive-pack")
+        .get("/git/" + repoId + "/info/refs?service=git-receive-pack")
         .then()
         .statusCode(Response.Status.OK.getStatusCode())
         .body(containsString("atomic"));
@@ -829,7 +829,7 @@ public class GitHostTest {
         "and main moved anyway — the two commands are independent");
   }
 
-  // --- the lifecycle routes: PUT/GET/HEAD /artifacts/git/:repoId (workstream BM) -------------------
+  // --- the lifecycle routes: PUT/GET/HEAD /git/:repoId (workstream BM) -------------------
 
   @Test
   public void putCreatesANewRepositoryAnd201s() {
@@ -838,7 +838,7 @@ public class GitHostTest {
         .contentType(ContentType.JSON)
         .body("{\"defaultBranch\":\"main\"}")
         .when()
-        .put("/artifacts/git/" + repoId)
+        .put("/git/" + repoId)
         .then()
         .statusCode(Response.Status.CREATED.getStatusCode())
         .body("repoId", equalTo(repoId))
@@ -854,7 +854,7 @@ public class GitHostTest {
         .contentType(ContentType.JSON)
         .body("{\"defaultBranch\":\"main\"}")
         .when()
-        .put("/artifacts/git/" + repoId)
+        .put("/git/" + repoId)
         .then()
         .statusCode(Response.Status.CREATED.getStatusCode());
 
@@ -862,7 +862,7 @@ public class GitHostTest {
         .contentType(ContentType.JSON)
         .body("{\"defaultBranch\":\"other\"}")
         .when()
-        .put("/artifacts/git/" + repoId)
+        .put("/git/" + repoId)
         .then()
         .statusCode(Response.Status.OK.getStatusCode())
         .body("repoId", equalTo(repoId))
@@ -876,7 +876,7 @@ public class GitHostTest {
         .contentType(ContentType.JSON)
         .body("{\"defaultBranch\":\"-oops\"}")
         .when()
-        .put("/artifacts/git/" + UUID.randomUUID())
+        .put("/git/" + UUID.randomUUID())
         .then()
         .statusCode(Response.Status.BAD_REQUEST.getStatusCode());
   }
@@ -888,13 +888,13 @@ public class GitHostTest {
         .contentType(ContentType.JSON)
         .body("{\"defaultBranch\":\"main\"}")
         .when()
-        .put("/artifacts/git/" + repoId)
+        .put("/git/" + repoId)
         .then()
         .statusCode(Response.Status.CREATED.getStatusCode());
 
     given()
         .when()
-        .get("/artifacts/git/" + repoId)
+        .get("/git/" + repoId)
         .then()
         .statusCode(Response.Status.OK.getStatusCode())
         .body("repoId", equalTo(repoId))
@@ -905,7 +905,7 @@ public class GitHostTest {
   public void getOnAnUnknownIdIs404OnTheLifecycleRoute() {
     given()
         .when()
-        .get("/artifacts/git/" + UUID.randomUUID())
+        .get("/git/" + UUID.randomUUID())
         .then()
         .statusCode(Response.Status.NOT_FOUND.getStatusCode());
   }
@@ -916,14 +916,14 @@ public class GitHostTest {
     // traversal-shaped id looks identical to an unknown one from outside.
     given()
         .when()
-        .get("/artifacts/git/foo.bar")
+        .get("/git/foo.bar")
         .then()
         .statusCode(Response.Status.BAD_REQUEST.getStatusCode());
     given()
         .contentType(ContentType.JSON)
         .body("{\"defaultBranch\":\"main\"}")
         .when()
-        .put("/artifacts/git/foo.bar")
+        .put("/git/foo.bar")
         .then()
         .statusCode(Response.Status.BAD_REQUEST.getStatusCode());
   }
@@ -931,32 +931,32 @@ public class GitHostTest {
   @Test
   public void headReportsExistenceWithNoBody() {
     String repoId = UUID.randomUUID().toString();
-    given().when().head("/artifacts/git/" + repoId).then().statusCode(
+    given().when().head("/git/" + repoId).then().statusCode(
         Response.Status.NOT_FOUND.getStatusCode());
 
     given()
         .contentType(ContentType.JSON)
         .body("{\"defaultBranch\":\"main\"}")
         .when()
-        .put("/artifacts/git/" + repoId)
+        .put("/git/" + repoId)
         .then()
         .statusCode(Response.Status.CREATED.getStatusCode());
 
-    given().when().head("/artifacts/git/" + repoId).then().statusCode(
+    given().when().head("/git/" + repoId).then().statusCode(
         Response.Status.OK.getStatusCode());
   }
 
-  // --- the collection listing: GET /artifacts/git ------------------------------------------------
+  // --- the collection listing: GET /git ------------------------------------------------
   // A host is never empty by the time these run — the suite has created repositories above, and the
   // pack catalog is one H2 instance for the whole run — so every case here is stated as a property
   // of the whole answer rather than as an equality against one. The empty host is a process configuration
   // of its own: GitHostListingEmptyTest.
 
-  /** {@code GET /artifacts/git}, as the ordered list of ids it carries. */
+  /** {@code GET /git}, as the ordered list of ids it carries. */
   private List<String> listRepositories() {
     return given()
         .when()
-        .get("/artifacts/git")
+        .get("/git")
         .then()
         .statusCode(Response.Status.OK.getStatusCode())
         .contentType(containsString("application/json"))
@@ -974,7 +974,7 @@ public class GitHostTest {
         .contentType(ContentType.JSON)
         .body("{\"defaultBranch\":\"main\"}")
         .when()
-        .put("/artifacts/git/" + repoId)
+        .put("/git/" + repoId)
         .then()
         .statusCode(Response.Status.CREATED.getStatusCode());
 
@@ -1013,13 +1013,13 @@ public class GitHostTest {
 
     given()
         .when()
-        .get("/artifacts/git/" + repoId + "/info/refs?service=git-upload-pack")
+        .get("/git/" + repoId + "/info/refs?service=git-upload-pack")
         .then()
         .statusCode(Response.Status.OK.getStatusCode())
         .contentType(containsString("git-upload-pack-advertisement"));
     given()
         .when()
-        .get("/artifacts/git/" + repoId)
+        .get("/git/" + repoId)
         .then()
         .statusCode(Response.Status.OK.getStatusCode())
         .body("repoId", equalTo(repoId));
@@ -1032,7 +1032,7 @@ public class GitHostTest {
         .contentType(ContentType.JSON)
         .body("{\"defaultBranch\":\"main\"}")
         .when()
-        .put("/artifacts/git/" + repoId)
+        .put("/git/" + repoId)
         .then()
         .statusCode(Response.Status.CREATED.getStatusCode());
 

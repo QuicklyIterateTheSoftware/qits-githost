@@ -34,7 +34,7 @@ public interface GitRepositoryProvider {
    * Creates an empty repository whose {@code HEAD} names {@code defaultBranch}, which need not exist
    * yet — the shape a freshly provisioned origin has, and what makes the first push a create.
    *
-   * <p>{@code PUT /artifacts/git/:repoId} ({@link GitHostRoutes}) is the route that calls this — the
+   * <p>{@code PUT /git/:repoId} ({@link GitHostRoutes}) is the route that calls this — the
    * git-host lifecycle API ({@code projects-volume-decoupling-plan.md} §2) that replaced "creation
    * reaches this host as {@code git clone --mirror} or {@code git init --bare} on the shared
    * volume". It is also the only door a repository can be provisioned through — no directory exists
@@ -46,7 +46,7 @@ public interface GitRepositoryProvider {
 
   /**
    * Every repository this host currently holds, by id — the enumeration {@code GET
-   * /artifacts/git} answers, and what qits-ci's trigger engine reads to know which repositories an
+   * /git} answers, and what qits-ci's trigger engine reads to know which repositories an
    * event-triggered pipeline could fire for.
    *
    * <p><b>Order is not part of this contract and the route does not trust it.</b> The wire answer is

@@ -38,7 +38,7 @@ public class GitHostEmptyPushTokenTest {
 
   @Inject GitRepositoryProvider repositories;
 
-  @TestHTTPResource("/artifacts/git")
+  @TestHTTPResource("/git")
   URL gitBase;
 
   private String refSha(String repoId, String ref) throws Exception {

@@ -12,7 +12,7 @@ import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@code GET /artifacts/git} on a host that serves nothing yet.
+ * {@code GET /git} on a host that serves nothing yet.
  *
  * <p>A class rather than a case in {@link GitHostTest}, for the reason {@link GitHostNoCiOptionTest}
  * is one: an empty host is a process configuration. What has to be private here is the
@@ -43,7 +43,7 @@ public class GitHostListingEmptyTest {
     String body =
         given()
             .when()
-            .get("/artifacts/git")
+            .get("/git")
             .then()
             .statusCode(Response.Status.OK.getStatusCode())
             .contentType(containsString("application/json"))
