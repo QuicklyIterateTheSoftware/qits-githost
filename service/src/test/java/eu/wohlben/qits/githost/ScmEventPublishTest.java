@@ -168,8 +168,9 @@ public class ScmEventPublishTest {
 
   @Test
   public void aPushCarryingACauseChainsItsEventsOntoIt() throws Exception {
-    // qits-eventstream propagates a cause across an HTTP hop with a pair of JAX-RS filters. This
-    // service has no JAX-RS surface, so GitHostRoutes reads the header itself — and this is what
+    // qits-eventstream propagates a cause across an HTTP hop with a pair of JAX-RS filters. A push
+    // is not a JAX-RS request — the git routes are raw Vert.x, which no filter sees, and the API at
+    // /githost/api publishes nothing — so GitHostRoutes reads the header itself, and this is what
     // says the hand-rolled half really works, over a real `git push` rather than a synthetic
     // request. `http.extraHeader` is git's own way of putting one on every HTTP request it makes.
     String cause = UUID.randomUUID().toString();

@@ -10,9 +10,16 @@
 #
 # Build from the repo root, on the network where the platform's Maven repository answers:
 #
+#     git submodule update --init service/src/main/webui
+#     (cd service/src/main/webui && npm ci && npm run build)
 #     docker build --network host \
 #       --build-arg QITS_MAVEN_REPOSITORY_URL="http://$QITS_REGISTRY/artifacts/maven/maven" \
 #       -t qits/githost:latest -f docker/Dockerfile .
+#
+# THE FIRST TWO LINES ARE NOT A CONVENIENCE. This image carries the git host's client
+# (service/src/main/webui = the qits-spa-githost submodule), and the builder stage below packages a
+# bundle that was ALREADY BUILT rather than building one. See the Quinoa flags on the mvnw line for
+# why that stage cannot build it.
 #
 # BOTH FLAGS ARE REQUIRED and neither has a workable default. This reactor's `service` module depends
 # on `qits-eventstream`, a jar published to the platform's own Maven repository and available from
@@ -105,11 +112,65 @@ COPY . .
 # `-s .qits-maven-settings.xml` is what lets the `qits-maven` repository be an http:// URL at all:
 # Maven blocks external http repositories by default, and an exact repository-id mirror is the one
 # thing that outranks the blocker. The settings file permits that one id and nothing else.
+#
+# --- the Quinoa flags, and why this stage does NOT build the client -------------------------------
+#
+# package-manager-install: the Mandrel builder image ships no node at all, so this stage installs its
+# own — from nodejs.org, which a docker build can reach. It lives here rather than in
+# application.properties on purpose: a developer machine already has node and should keep using its
+# own, and only this stage has to be told, so no build silently downloads a toolchain. 22.22.0 is
+# the PLATFORM pin. It is deliberately NOT the step container's node (node-docker-base is
+# node:24-alpine, and the bundle this image consumes was built there); the two need not agree,
+# because nothing here builds a bundle.
+#
+# The three command overrides are the load-bearing part, and the reason this file deviates from the
+# platform's Quinoa recipe (docs/project-setup-quinoa-angular.md in the qits monorepo, which has the
+# builder run the client's real install and build):
+#
+#   service/src/main/webui is qits-spa-githost, and it depends on @qits/ui-components. That package
+#   exists ONLY on the platform's own npm registry, which a RUN step in a docker build reaches by NO
+#   address — not the qits-net alias, not localhost:8081, not host.docker.internal. So the install
+#   cannot happen here, and one that "worked" would have resolved the @qits scope against npmjs.org,
+#   where that name does not exist and never will.
+#
+# The bundle is therefore built BEFORE this image, by the step in .config/qits/ci-post-receive.yml
+# and .config/qits/ci-event-release.yml, and arrives in the build context as
+# service/src/main/webui/dist/ (see .dockerignore, where that path is the one client output kept).
+# `--version` is the null command: it proves the package manager is really there and does nothing
+# else.
+#
+# THE `test -f` GUARD IS WHAT STOPS THIS FAILING QUIETLY. With no bundle and no package.json Quinoa
+# disables itself with a warning, and this stage would stay GREEN while shipping no client — a
+# service that boots, answers /githost/ with a 404 and looks deployed. A forgotten submodule init or
+# a forgotten `npm run build` is now a red build, stopped before the multi-minute native compile
+# rather than found in production.
+#
+# --- and why the bundle is copied onto itself first -----------------------------------------------
+# Quinoa does not copy build-dir into target/quinoa/build, it MOVES it, and overlayfs cannot rename a
+# directory that still lives in a LOWER image layer. It answers EXDEV, the JDK falls back to its
+# cross-file-store path, and that path refuses a non-empty directory — the build dies seconds in with
+# `DirectoryNotEmptyException: …/dist/qits-spa-githost/browser`, which names the source and explains
+# nothing. A builder stage that *creates* dist itself is immune by accident; ours arrives by COPY.
+#
+# One `cp` re-materialises it in the layer that is about to move it. It has to be in THIS `RUN` and
+# not a tidier one of its own — a layer boundary is exactly what it is undoing.
 ARG QITS_MAVEN_REPOSITORY_URL=http://localhost:8081/artifacts/maven/maven
 ENV QITS_MAVEN_REPOSITORY_URL=$QITS_MAVEN_REPOSITORY_URL
-RUN ./mvnw -B -ntp -s .qits-maven-settings.xml -pl service -am package -Dnative -DskipTests \
+RUN d=service/src/main/webui/dist/qits-spa-githost/browser; \
+    test -f "$d/index.html" || { \
+      echo "No built client at $d." >&2; \
+      echo "The build context must carry one: run 'npm ci && npm run build'" >&2; \
+      echo "in service/src/main/webui first — this stage cannot, see the Quinoa flags above." >&2; \
+      exit 1; }; \
+    cp -a "$d" "$d.layer" && rm -rf "$d" && mv "$d.layer" "$d" && \
+    ./mvnw -B -ntp -s .qits-maven-settings.xml -pl service -am package -Dnative -DskipTests \
       -Dqits.maven.repository.url="$QITS_MAVEN_REPOSITORY_URL" \
-      -Dquarkus.native.native-image-xmx=4g
+      -Dquarkus.native.native-image-xmx=4g \
+      -Dquarkus.quinoa.package-manager-install=true \
+      -Dquarkus.quinoa.package-manager-install.node-version=22.22.0 \
+      -Dquarkus.quinoa.package-manager-command.install=--version \
+      -Dquarkus.quinoa.package-manager-command.ci=--version \
+      -Dquarkus.quinoa.package-manager-command.build=--version
 
 # --- runtime --------------------------------------------------------------------------------------
 # `localhost:8082/redhat/…` is the same mirror, pointed at registry.access.redhat.com.
@@ -136,8 +197,8 @@ RUN mkdir -p /data && chown -R 1001:root /data && chmod -R 775 /data
 # Nothing is named here: no QUARKUS_DATASOURCE_*, no QITS_ARTIFACTS_BLOBS_DIR. All of it belongs to
 # the deployment's storage, and this image refuses to start until a deployment says where it goes.
 
-# One port for all of it — /git/** (raw Vert.x) and /git/q/** (health) are two route stacks in one
-# process, not two listeners.
+# One port for all of it — /git/** (raw Vert.x), /githost/api/** (JAX-RS), /githost/** (the SPA's
+# static files) and /githost/q/** (health) are four route stacks in one process, not four listeners.
 EXPOSE 8080
 USER 1001
 

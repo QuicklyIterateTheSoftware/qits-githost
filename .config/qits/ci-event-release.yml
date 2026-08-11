@@ -9,7 +9,10 @@
 # - The name is unqualified on purpose; the reader supplies its own registry host.
 # - The build below is ci-post-receive.yml's, and the two must stay matched: one image content, two
 #   coordinates. That includes --network and --build-arg, which this repository needs because
-#   qits-eventstream lives only in the platform's own Maven repository.
+#   qits-eventstream lives only in the platform's own Maven repository, AND the whole first half —
+#   the webui submodule fetch, the lockfile origin swap and the `npm_config_*` environment. That
+#   file is where each of those is explained at length; this one carries the short form rather than
+#   a second copy of the reasoning to drift.
 # - This file is inert until an SCMRelease for this repository exists, and it lands first on purpose
 #   — the bus is at-most-once, so the trigger must precede the event it selects.
 #
@@ -24,7 +27,8 @@ when:
 artifacts:
   - { type: docker, name: qits/qits-githost }
 steps:
-    # node is here to read the event payload, which is JSON; the docker CLI to build and push.
+    # node and npm build the client and read the event payload, which is JSON; git fetches the tag
+    # and the webui submodule; the docker CLI builds and pushes.
   - image: qits/build-images/node-docker-base:latest
     docker: true
     timeout-seconds: 3600
@@ -45,10 +49,41 @@ steps:
       # The tag is the checkout target: an event-triggered run is cloned at the head of main, which
       # a later push moves — the tag does not. The clone is shallow and carries no tags, hence the
       # explicit refspec; the URL rather than `origin` because every address a step needs arrives
-      # as environment.
+      # as environment. `checkout --detach` peels the annotated tag to its commit — and it is what
+      # makes the submodule fetch below land on the gitlink the RELEASE recorded rather than on
+      # main's.
       git fetch "$QITS_CI_REPOSITORY_URL" "refs/tags/$version:refs/tags/$version"
       git checkout --detach "$version"
 
+      # --- half one: the bundle -----------------------------------------------------------------
+      # The daemon's clone is shallow and does not recurse, so qits-spa-githost arrives as an empty
+      # directory and Quinoa's client never gets built — the Dockerfile's `test -f` guard is what
+      # turns that into a red build instead of an image with no page. See ci-post-receive.yml for
+      # why the lockfile origins are rewritten and why the registry is passed as environment rather
+      # than as a file: that repo's committed .npmrc outranks any ~/.npmrc this step could write.
+      frontend_url="${QITS_CI_REPOSITORY_URL%/*}/qits-spa-githost"
+      git -c submodule.qits-spa-githost.url="$frontend_url" submodule update --init service/src/main/webui
+
+      cd service/src/main/webui
+      # TWO SERVICES since the byte-plane split, so the swap reads the PATH: an entry under the
+      # hosted registry's own pathname ($QITS_NPM_REGISTRY_URL's) gets the hosted origin and
+      # everything else gets the proxy's, and the broad expression has to run before the narrow one.
+      npm_hosted_origin=$(node -p 'new URL(process.env.QITS_NPM_REGISTRY_URL).origin')
+      npm_proxy_origin=$(node -p 'new URL(process.env.QITS_NPM_PROXY_URL).origin')
+      npm_hosted_path=$(node -p 'new URL(process.env.QITS_NPM_REGISTRY_URL).pathname')
+      sed -i -E \
+        -e "s#(\"resolved\": \")https?://[^/\"]+#\1$npm_proxy_origin#" \
+        -e "s#(\"resolved\": \")https?://[^/\"]+($npm_hosted_path)#\1$npm_hosted_origin\2#" \
+        package-lock.json
+
+      env npm_config_registry="$QITS_NPM_PROXY_URL" \
+          "npm_config_@qits:registry=$QITS_NPM_REGISTRY_URL" \
+          npm ci --no-audit --no-fund
+
+      npm run build
+      cd -
+
+      # --- half two: the image ------------------------------------------------------------------
       ref="$QITS_REGISTRY/$QITS_IMAGE_REPOSITORY/qits-githost:$version"
       docker build --network host \
         --build-arg QITS_MAVEN_REPOSITORY_URL="http://$QITS_REGISTRY/artifacts/maven/maven" \

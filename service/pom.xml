@@ -15,9 +15,13 @@
          `git-storage` engine's packs and reftables into qits-blobstore, the schema those adapters'
          rows live in, and the publisher that turns a post-receive hook into platform events.
 
-         NO JAX-RS AND NO WEB UI. Everything this service serves is a wire protocol spoken by `git`,
-         so there is no quarkus.rest.path, no OpenAPI document and no Quinoa. Health is the one
-         non-git surface, at /git/q/health/ready.
+         FOUR SURFACES ON ONE PORT, and the git one is still the reason the others are shaped as
+         they are: /git/** is the wire protocol spoken by `git` (raw Vert.x routes, a literal
+         prefix no config key moves), /githost/api is JAX-RS, /githost/ is the Angular client
+         Quinoa builds out of src/main/webui (the qits-spa-githost submodule), and /githost/q is
+         Quarkus' own non-application root, health included.
+
+         The SPA is why quarkus-undertow must stay out — see the quinoa dependency below.
 
          The adapters can only live HERE: `git-storage` declares the two ports and may not depend on
          qits-blobstore, qits-blobstore knows nothing of git, and this is the one module that
@@ -28,7 +32,7 @@
 
     <dependencies>
         <dependency>
-            <!-- /git/q/health/ready — the readiness endpoint qits-cd's health gate curls. -->
+            <!-- /githost/q/health/ready — the readiness endpoint qits-cd's health gate curls. -->
             <groupId>io.quarkus</groupId>
             <artifactId>quarkus-smallrye-health</artifactId>
         </dependency>
@@ -74,6 +78,31 @@
             <!-- The ObjectMapper HttpRepositoryNameResolver reads its one lookup response with. -->
             <groupId>io.quarkus</groupId>
             <artifactId>quarkus-jackson</artifactId>
+        </dependency>
+        <dependency>
+            <!-- The REST surface at /githost/api (quarkus.rest.path), which the SPA reads and no
+                 `git` client ever touches. quarkus-rest-jackson brings quarkus-rest with it and
+                 adds the body writer that turns a record into JSON — the same Jackson the resolver
+                 above already uses, so nothing new arrives in the image for it.
+
+                 REST rather than another Vert.x route: the git routes are literals because git
+                 owns their spelling, and nothing about that argument applies to an API a browser
+                 calls. -->
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-rest-jackson</artifactId>
+        </dependency>
+        <dependency>
+            <!-- The SPA. Quinoa runs the npm build in src/main/webui (the qits-spa-githost
+                 submodule) during augmentation and serves the result as static resources — see the
+                 quarkus.quinoa.* block in application.properties for the paths.
+
+                 It is why quarkus-undertow must stay out: Quinoa's production static serving goes
+                 through Quarkus' own static-resource route, which undertow's servlet stack takes
+                 over and then cannot find (the monorepo's
+                 docs/issues/2026-07-15_packaged-spa-not-served.md). Every git wire here is a raw
+                 Vert.x route, which is what keeps that dependency absent. -->
+            <groupId>io.quarkiverse.quinoa</groupId>
+            <artifactId>quarkus-quinoa</artifactId>
         </dependency>
         <dependency>
             <groupId>io.quarkus</groupId>

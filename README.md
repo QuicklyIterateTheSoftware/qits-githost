@@ -4,6 +4,10 @@ The platform's git smart-HTTP host. Every repository qits serves is here: worksp
 clone and push over HTTP, qits-ci reads a pipeline config out of one file, qits-workspaces releases
 through it, and a push announces itself to the platform as a durable domain event.
 
+It also serves a page. Since the client landed, this is not a wire-protocol-only service: it carries
+its own Angular SPA at `/githost/` and the REST API that SPA reads at `/githost/api`, in the same
+process and on the same port as the git protocol at `/git`.
+
 It moved out of `qits-platform-artifacts` with its history (byte-plane-split-plan.md phase 3). A git
 repository is not an artifact — it only shared the blob store's storage layout — and every consumer
 is an env service, so an env-scoped git host is the consistent shape.
@@ -14,13 +18,24 @@ is an env service, so an env-scoped git host is the consistent shape.
 |---|---|
 | `git-storage` | The storage engine: a JGit `DfsRepository` whose packs, pack indexes and reftables are content-addressed blobs. A plain library jar with ONE compile dependency (JGit) and two ports it declares and does not implement. |
 | `githost-events` | The event vocabulary. Depends on `qits-eventstream` and nothing else. **This is the jar a consumer depends on.** |
-| `service` | The deployable: the Vert.x routes, the two port adapters over `qits-blobstore`, the schema, and the publisher. |
+| `service` | The deployable: the Vert.x routes, the REST API, the Angular client (`src/main/webui`, the `qits-spa-githost` submodule, served by Quinoa), the two port adapters over `qits-blobstore`, the schema, and the publisher. |
 
-## Routes
+## Addresses
 
-Everything is a plain Vert.x route at `/git`, spelled as a literal in `GitHostRoutes` — git treats
-the base as opaque, so no config key can move it. There is no JAX-RS surface, no OpenAPI document
-and no UI.
+Four surfaces, one port, two prefixes. **`/githost` is this service's gateway segment**; `/git` is an
+extra prefix on the same gateway entry, carried because git itself owns that spelling.
+
+| Address | What it is |
+|---|---|
+| `/git/**` | The git wire protocol. Plain Vert.x routes, the prefix a literal in `GitHostRoutes` — git treats the base as opaque, so no config key can move it. |
+| `/githost/api/**` | The REST API (`quarkus.rest.path`), read by the client and by nothing that speaks git. |
+| `/githost/` | The Angular client, built and served by Quinoa out of `service/src/main/webui` (the `qits-spa-githost` submodule). Bare `/githost` with no trailing slash is a 404 — upstream quinoa #960, identical for every client on the platform. |
+| `/githost/q/**` | Quarkus' non-application root: health, and nothing else here. |
+
+It **was** `/git/q` for the non-application root, when `/git` was read as the whole segment. The
+health gate in `.config/qits/deployments.yml` moved with it.
+
+### The git routes
 
 | Route | What it does |
 |---|---|
@@ -36,15 +51,42 @@ and no UI.
 | `GET /git/:projectId/:repoName/info/refs?service=…` | The name-addressed scheme. |
 | `POST /git/:projectId/:repoName/git-upload-pack` | Fetch, name-addressed. |
 | `POST /git/:projectId/:repoName/git-receive-pack` | Push, name-addressed. |
-| `GET /git/q/health/ready` | Readiness, for qits-cd's health gate. |
+| `GET /githost/q/health/ready` | Readiness, for qits-cd's health gate. |
 
 **The prefix changed.** It was `/artifacts/git` while the host lived inside qits-artifacts; standing
-alone it drops the borrowed segment. qits-gateway routes verbatim by prefix, so `/git` is this
-service's own entry, and every client that names the old path has to be moved with the cutover.
+alone it drops the borrowed segment. qits-gateway routes verbatim by prefix, so `/git` is carried as
+an extra prefix on this service's entry, and every client that names the old path has to be moved
+with the cutover.
 
 The name-addressed scheme resolves `(projectId, repoName)` through qits-projects
 (`qits.projects.name-resolver-url`) and is what makes a committed relative submodule url
 (`../<name>.git`) work. Unset, that scheme answers 404 and the id-addressed one keeps serving.
+
+### The API
+
+| Route | What it does |
+|---|---|
+| `GET /githost/api/repositories` | `{"repositories":[{"id", "protectDefaultBranch"}, …]}` — every repository this host serves, sorted, as records. |
+
+It answers the same question as `GET /git` and is not a duplicate of it: that one is a wire the
+platform's machines read and its shape is fixed by them, this one is the browser's and may grow a
+field. **`id` is the whole contract**; the client renders anything else that arrives and assumes
+nothing about it, so a field is added here when it is honest and cheap and never as a placeholder.
+`protectDefaultBranch` is the effective answer — the platform switch with the repository's override
+applied — which is why it is not simply "there is a row".
+
+**A read this API cannot make is a 5xx, never an empty list and never a 404.** Both halves of it
+throw rather than fall back, which is the 2026-08-11 lesson (`fe26a6c`) applied one surface further
+out: a page told "no repositories" shows an empty host, and nothing on it says the service could not
+ask.
+
+### The client
+
+`service/src/main/webui` is the `qits-spa-githost` submodule, an Angular 21 SPA that Quinoa builds
+during `mvn package` and serves at `/githost/`. Its `baseHref` is `"/githost/"` and it is spelled in
+two repositories — here as `quarkus.quinoa.ui-root-path`, there in `angular.json` — so a mismatch
+serves a page whose every asset 404s. `docs/project-setup-quinoa-angular.md` in the superproject is
+the doctrine; `application.properties` carries the per-key reasoning.
 
 ## Events
 
@@ -81,9 +123,11 @@ A push may name the event it is being made **because of**, in the `X-Qits-Causat
 envelope's `parentId`, so a chain that reaches the git host — a workspace integrate, a bot acting on
 an announcement — keeps going into the SCM events rather than restarting at them.
 
-qits-eventstream propagates a cause with a pair of JAX-RS filters. This service has no JAX-RS
-surface, so `GitHostRoutes.causationOf` reads the header itself and wraps the post-receive
-announcement in `CausationScope.with(...)`. Blank and malformed both read as absent: causation is
+qits-eventstream propagates a cause with a pair of JAX-RS filters, and **a push is not a JAX-RS
+request** — the git routes are raw Vert.x, which no filter sees. So `GitHostRoutes.causationOf`
+reads the header itself and wraps the post-receive announcement in `CausationScope.with(...)`.
+(There is a JAX-RS surface here now, at `/githost/api`, where those filters do apply; it publishes
+nothing, so nothing about the push path changed.) Blank and malformed both read as absent: causation is
 advisory and a push is never refused over it. Only the receive-pack path reads it — the content GETs
 publish nothing.
 
@@ -138,12 +182,21 @@ A push builds `docker/Dockerfile` — a Mandrel builder stage that native-compil
 `ubi-minimal` runtime stage that carries only the binary — and pushes it as
 `qits/qits-githost:<sha>`; a release rebuilds the same content under the released version
 (`.config/qits/ci-post-receive.yml` and `.config/qits/ci-event-release.yml`). Both builds run
-`--network qits-net` with `--build-arg QITS_MAVEN_REPOSITORY_URL=…`, because `qits-eventstream`
+`--network host` with `--build-arg QITS_MAVEN_REPOSITORY_URL=…`, because `qits-eventstream`
 exists only in the platform's own Maven repository and a docker build reaches no other address for
-it. `.config/qits/deployments.yml` is the deploy answer: **an environment service** — every tier
+it.
+
+**Each pipeline is one step with two halves**, and the split is not cosmetic: the client depends on
+`@qits/ui-components`, which lives only on the platform's own npm registry, and a docker `RUN` can
+reach that registry by no address at all. So the step container builds the bundle first, and the
+image build packages one that already exists — its Quinoa install/ci/build commands are neutered to
+`--version`, and a missing bundle is a red build at a `test -f` guard rather than an image that
+boots and serves `/githost/` as a 404.
+
+`.config/qits/deployments.yml` is the deploy answer: **an environment service** — every tier
 runs its own git host, and a green build deploys into whichever tier listens to the built branch —
 with `resources: postgresql:db, postgresql:eventstream:qits_githost_eventstream` and the health gate
-at `/git/q/health/ready`. Those two resource **names** are load-bearing: they are what makes
+at `/githost/q/health/ready`. Those two resource **names** are load-bearing: they are what makes
 `QITS_RESOURCE_DB_*` and `QITS_RESOURCE_EVENTSTREAM_*` exist, and neither triple has a default, so a
 missing one kills the boot at Flyway rather than opening a store nobody meant. The blob directory
 (`QITS_ARTIFACTS_BLOBS_DIR`) and the volume behind it are run-args, written by the bootstrap CLI —
@@ -163,14 +216,34 @@ three blobs and three rows per push.
 
 ## Building
 
+**Clone AND initialise the submodule.** `verify` runs `package` on its way to failsafe, and
+`package` is where Quinoa builds the client — an uninitialised `service/src/main/webui` is an empty
+directory, which Quinoa stops on (`No package.json found in Web UI directory`).
+
 ```
+git submodule update --init service/src/main/webui
+(cd service/src/main/webui && npm ci)
 ./mvnw -B verify
 ```
 
-Needs no docker and no network: the suite drives the real `git` CLI against the in-process routes,
-and both databases are real PostgreSQL binaries resolved as Maven artifacts and spawned as a child
-process (zonky). `qits-eventstream` resolves from the platform Maven repository; everything else is
-Maven Central or this reactor.
+`mvn test` alone needs neither node nor the submodule: Quinoa is disabled by default in test mode.
+That is also why no `@QuarkusTest` can prove anything about what `/githost/` serves — only the
+packaged artifact can, and this service needs both its databases to boot, so those probes ride a
+platform bootstrap.
+
+`npm ci` needs the platform's npm registries (localhost:8081 for the `@qits` scope, localhost:8082
+for the npmjs cache — the client's committed `.npmrc`); Quinoa itself reuses the `node_modules` it
+finds and runs the host's node.
+
+Otherwise the build needs no docker: the suite drives the real `git` CLI against the in-process
+routes, and both databases are real PostgreSQL binaries resolved as Maven artifacts and spawned as a
+child process (zonky). `qits-eventstream` resolves from the platform Maven repository; everything
+else is Maven Central or this reactor.
+
+On the deployment host add `-Dquarkus.http.test-port=0`: Quarkus' default test port 8081 is the
+platform's npm registry there, and the whole suite otherwise dies with `Port already bound: 8081`,
+which reads like a code failure and is not one. (`src/test/resources/application.properties` already
+sets it; the flag is for anything that overrides that file.)
 
 `service` compiles to a GraalVM native image, which is what a deployment runs:
 

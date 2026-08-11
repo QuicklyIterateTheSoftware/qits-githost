@@ -139,9 +139,12 @@ public class GitHostRoutes {
   private static final String REPO_ID_PATTERN = "[A-Za-z0-9][A-Za-z0-9-]{0,63}";
 
   /**
-   * The mount point, and this service's whole gateway segment. It was {@code /artifacts/git} while
-   * the host lived inside qits-artifacts; standing alone it drops the borrowed prefix, because
-   * qits-gateway routes VERBATIM by prefix and {@code /git} is now this service's own entry.
+   * The mount point. It was {@code /artifacts/git} while the host lived inside qits-artifacts;
+   * standing alone it drops the borrowed prefix, because qits-gateway routes VERBATIM by prefix.
+   *
+   * <p><b>It is not this service's segment.</b> The segment is {@code /githost} — the SPA, the REST
+   * API and the non-application root are all under it — and {@code /git} is an EXTRA prefix on the
+   * same gateway entry, carried because git owns this spelling and no config key can move it.
    *
    * <p>Git treats whatever comes before the suffixes as an opaque base and appends {@code
    * /info/refs}, {@code /git-upload-pack} and {@code /git-receive-pack} itself, so a base of any

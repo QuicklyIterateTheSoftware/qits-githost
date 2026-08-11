@@ -84,6 +84,13 @@
              org.eclipse.jgit.internal.storage.dfs, which carries no API stability promise. -->
         <jgit.version>7.3.0.202506031305-r</jgit.version>
 
+        <!-- Quinoa is a Quarkiverse extension: not in quarkus-bom either, and its version does NOT
+             track the platform's. 2.8.2 is built against Quarkus 3.27.3 LTS — older than the 3.34.6
+             above, which is the direction that works, since a Quarkus extension compiled against an
+             older core runs on a newer one. 2.8.3 is built against 3.36.2 and would be an extension
+             asking this core for API it may not have. Bump it only past a platform bump. -->
+        <quinoa.version>2.8.2</quinoa.version>
+
         <!-- Real PostgreSQL binaries, resolved as ordinary Maven artifacts and spawned as a child
              process by the suite. The platform convention: a clone must test green with no docker,
              and two schemas — this service's own and the eventstream outbox — still have to be
@@ -121,6 +128,11 @@
                 <groupId>org.eclipse.jgit</groupId>
                 <artifactId>org.eclipse.jgit</artifactId>
                 <version>${jgit.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.quarkiverse.quinoa</groupId>
+                <artifactId>quarkus-quinoa</artifactId>
+                <version>${quinoa.version}</version>
             </dependency>
             <!-- The platform jars this repo consumes. -->
             <dependency>

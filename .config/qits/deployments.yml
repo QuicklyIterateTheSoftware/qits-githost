@@ -36,15 +36,16 @@ deployment_target: environment
 # would otherwise have asked for qits_githost and the parser refuses that after resolution.
 resources: postgresql:db, postgresql:eventstream:qits_githost_eventstream
 
-# THE PROBE THE DEPLOY GATES ON, SPELLED OUT BECAUSE THE DERIVED DEFAULT IS WRONG. The default would
-# be /githost/q/health/ready — the repository name minus `qits-`; this application serves its
-# non-application root at /git/q (quarkus.http.non-application-root-path), because /git is the prefix
-# git itself speaks to and the health surface sits under this service's own gateway segment beside
-# it. A derived default is only ever right where the route prefix and the served prefix are the same
-# string.
+# THE PROBE THE DEPLOY GATES ON. It is the derived default — /githost/q/health/ready, the repository
+# name minus `qits-` — and it is spelled out anyway, because it was NOT the default for most of this
+# repository's life: the non-application root sat at /git/q while /git was read as this service's
+# whole segment. The gateway settled that the other way (segment /githost, with /git as an extra
+# prefix carried because git owns that spelling), so the root moved with the segment
+# (quarkus.http.non-application-root-path) and this line moved with it. Written out, a future change
+# to either is a diff here rather than a deploy that gates on a 404.
 #
 # Readiness rather than liveness: quarkus-agroal registers a readiness check per datasource as soon
 # as a health extension is present, so this path is red while either database above is unreachable.
 # Liveness answers UP with an empty check list — a git host that boots and cannot read its pack
 # catalog would pass it, and that container serves an empty ref advertisement to every clone.
-health_path: /git/q/health/ready
+health_path: /githost/q/health/ready
