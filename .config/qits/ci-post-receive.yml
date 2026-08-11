@@ -8,10 +8,12 @@
 # published to the platform's own Maven repository and available from nowhere else, so the builder
 # stage has to be able to reach it:
 #
-#   --network qits-net    puts the build's containers on the network where that registry answers. A
-#                         RUN step otherwise reaches the public internet and nothing else — not the
-#                         qits-net alias, not localhost:8081, not host.docker.internal.
-#   --build-arg           names the address on that network. The Dockerfile turns it into
+#   --network host        NOT a custom network: buildkit — the builder format the platform targets,
+#                         because a swarm cannot assume the legacy builder — refuses custom networks
+#                         on a build. Host networking is buildkit-supported and reaches the
+#                         registry's host-published address.
+#   --build-arg           names that address, derived from the same injected env the image tag uses,
+#                         so no address is stated here. The Dockerfile turns it into
 #                         -Dqits.maven.repository.url, which the pom's `qits-maven` repository reads
 #                         and .qits-maven-settings.xml mirrors, so a source-only build resolves the
 #                         one dependency that is not on Maven Central.
@@ -35,8 +37,8 @@ steps:
     script: |
       set -eu
       ref="$QITS_REGISTRY/$QITS_IMAGE_REPOSITORY/qits-githost:$QITS_CI_SHA"
-      docker build --network qits-net \
-        --build-arg QITS_MAVEN_REPOSITORY_URL="$QITS_MAVEN_REGISTRY_URL" \
+      docker build --network host \
+        --build-arg QITS_MAVEN_REPOSITORY_URL="http://$QITS_REGISTRY/artifacts/maven/maven" \
         -t "$ref" -f docker/Dockerfile .
       docker push "$ref"
       docker rmi "$ref" || true
