@@ -53,6 +53,15 @@
              <repositories> block below exists — this is the one dependency here that is not on
              Maven Central and not built in this reactor. -->
         <qits.eventstream.version>2026.810.191553</qits.eventstream.version>
+        <!-- The platform's datasource resilience, released together out of
+             libs/qits-integrations-quarkus, which is why the two versions are the same string:
+             qits-db-core carries PatientPgDriver (the pool's connections are opened through it and
+             held while postgres comes back) and DbRetry (the read-seam retry for a connection lost
+             mid-flight); qits-arch-rules carries the assertion that this service configured the
+             first one. They move together — the rule names the driver as a string, so a driver that
+             moved without the rule would pass a build it should fail. -->
+        <qits.db-core.version>2026.811.152803</qits.db-core.version>
+        <qits.arch-rules.version>2026.811.152803</qits.arch-rules.version>
         <qits.maven.repository.url>http://localhost:8081/artifacts/maven/maven</qits.maven.repository.url>
 
         <maven.compiler.release>25</maven.compiler.release>
@@ -121,6 +130,18 @@
                 <groupId>${project.groupId}</groupId>
                 <artifactId>qits-eventstream</artifactId>
                 <version>${qits.eventstream.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>${project.groupId}</groupId>
+                <artifactId>qits-db-core</artifactId>
+                <version>${qits.db-core.version}</version>
+            </dependency>
+            <dependency>
+                <!-- Test scope at every declaration site: the rules run in the build and ship in
+                     nothing. -->
+                <groupId>${project.groupId}</groupId>
+                <artifactId>qits-arch-rules</artifactId>
+                <version>${qits.arch-rules.version}</version>
             </dependency>
             <!-- The reactor's own modules, so `service` depends on them version-less. -->
             <dependency>
