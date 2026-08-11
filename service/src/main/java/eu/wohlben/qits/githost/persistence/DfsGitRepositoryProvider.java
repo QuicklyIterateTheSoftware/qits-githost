@@ -1,5 +1,6 @@
 package eu.wohlben.qits.githost.persistence;
 
+import eu.wohlben.qits.db.DbRetry;
 import eu.wohlben.qits.githost.GitRepositoryProvider;
 import eu.wohlben.qits.githost.storage.QitsDfsRepository;
 import eu.wohlben.qits.githost.storage.QitsDfsRepositoryBuilder;
@@ -7,8 +8,10 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.time.Duration;
 import java.util.List;
 import org.eclipse.jgit.lib.Repository;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
 /**
@@ -36,6 +39,13 @@ public class DfsGitRepositoryProvider implements GitRepositoryProvider {
   @Inject CatalogRepository catalog;
 
   /**
+   * How long an existence check holds while the datasource is gone. The shipped 15s covers a
+   * postgres cutover; the suite shortens it, so a test proving the give-up does not pay for it.
+   */
+  @ConfigProperty(name = "qits.githost.db-retry-deadline", defaultValue = "15S")
+  Duration dbRetryDeadline;
+
+  /**
    * Existence is answered by the ref database, not by a table of its own: a repository that has ever
    * been created has a reftable in the catalog, and one that has not reads as empty. So an unknown
    * id is a 404 with no extra row to keep in step.
@@ -44,9 +54,23 @@ public class DfsGitRepositoryProvider implements GitRepositoryProvider {
    * that cannot answer throws instead, so the routes make a 500 of it. Reading a failed read as
    * absence cost a platform bootstrap: postgres was cut over mid-run, the severed pool made the
    * existence check throw, and a push to a repository that exists was told 404.
+   *
+   * <p><b>Patience first, then that honest failure.</b> This is the incident's own seam, so the
+   * check is wrapped in {@link DbRetry}: a connection lost mid-flight costs the request a pause
+   * instead of an answer. It is a read, so re-running it is safe. Nothing is softened — after the
+   * deadline the exception propagates exactly as before, and the route still answers 500.
    */
   @Override
   public Repository open(String repoId) {
+    // Each attempt builds its own repository, so no attempt inherits state a half-read one cached,
+    // and the whole of it sits OUTSIDE the catalog's transactions — see CatalogRepository, whose
+    // own reads retry within the same deadline rather than adding a second one to it.
+    return DbRetry.call(
+        "existence check for git repository " + repoId, () -> openOnce(repoId), dbRetryDeadline);
+  }
+
+  /** One attempt at {@link #open}: build, ask, and close whatever is not handed back. */
+  private Repository openOnce(String repoId) {
     QitsDfsRepository repo = build(repoId);
     boolean exists;
     try {
@@ -77,6 +101,8 @@ public class DfsGitRepositoryProvider implements GitRepositoryProvider {
   /**
    * The catalog's own repository ids. Nothing is opened and no blob is read — enumerating a host is
    * one query, not one repository open per row.
+   *
+   * <p>No retry here: the one query holds through a short outage in the catalog itself.
    */
   @Override
   public List<String> repositoryIds() {

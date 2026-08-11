@@ -1,14 +1,17 @@
 package eu.wohlben.qits.githost.persistence;
 
+import eu.wohlben.qits.db.DbRetry;
 import eu.wohlben.qits.githost.storage.PackCatalog;
 import eu.wohlben.qits.githost.storage.PackDescription;
 import eu.wohlben.qits.githost.storage.PackFile;
 import io.quarkus.narayana.jta.QuarkusTransaction;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.context.control.ActivateRequestContext;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
 /**
@@ -33,16 +36,47 @@ import org.jboss.logging.Logger;
  * its own request context and opens its own transaction, the same shape the {@code
  * RepositoryNameResolver} port documents. Inside a {@code @QuarkusTest} the request context is
  * already active and the annotation is a no-op.
+ *
+ * <h2>Patience</h2>
+ *
+ * <p><b>The reads hold through a short outage; the write does not.</b> {@link #list} and {@link
+ * #repositoryIds} are wrapped in {@link DbRetry}, so a connection lost <i>mid-flight</i> — after the
+ * statements ran, which is where the pool's own patient driver cannot help — costs a caller a pause
+ * rather than an error. {@link #commit} is deliberately left bare: a write whose commit
+ * acknowledgement was lost still committed, and a second attempt would write it twice.
+ *
+ * <p>The retry sits <b>outside</b> {@code requiringNew}, never inside it, so every attempt runs in a
+ * fresh transaction on a freshly borrowed connection. Inside one it would re-run statements in a
+ * transaction the severed connection already doomed, and retry forever against a dead thing.
  */
 @ApplicationScoped
 public class CatalogRepository implements PackCatalog {
 
   private static final Logger LOG = Logger.getLogger(CatalogRepository.class);
 
+  /**
+   * How long a read holds while the datasource is gone. The shipped 15s covers a postgres cutover;
+   * the suite shortens it, because a test proving the give-up must not pay for it.
+   */
+  @ConfigProperty(name = "qits.githost.db-retry-deadline", defaultValue = "15S")
+  Duration dbRetryDeadline;
+
   @Override
   @ActivateRequestContext
   public List<PackDescription> list(String repositoryId) {
-    return QuarkusTransaction.requiringNew().call(() -> read(repositoryId));
+    return DbRetry.call(
+        "pack catalog read for git repository " + repositoryId,
+        () -> QuarkusTransaction.requiringNew().call(() -> read(repositoryId)),
+        retryDeadline());
+  }
+
+  /**
+   * The configured deadline, or the library's default for an instance nobody injected — which is
+   * how a test's {@code QuarkusMock} subclass arrives, built with {@code new} and calling {@code
+   * super} for the part it does not fake.
+   */
+  private Duration retryDeadline() {
+    return dbRetryDeadline == null ? DbRetry.DEFAULT_DEADLINE : dbRetryDeadline;
   }
 
   /**
@@ -63,12 +97,17 @@ public class CatalogRepository implements PackCatalog {
    */
   @ActivateRequestContext
   public List<String> repositoryIds() {
-    return QuarkusTransaction.requiringNew()
-        .call(
-            () ->
-                GitPack.getEntityManager()
-                    .createQuery("select distinct p.repositoryId from GitPack p", String.class)
-                    .getResultList());
+    return DbRetry.call(
+        "pack catalog enumeration",
+        () ->
+            QuarkusTransaction.requiringNew()
+                .call(
+                    () ->
+                        GitPack.getEntityManager()
+                            .createQuery(
+                                "select distinct p.repositoryId from GitPack p", String.class)
+                            .getResultList()),
+        retryDeadline());
   }
 
   /**
