@@ -10,8 +10,8 @@
 #
 # Build from the repo root, on the network where the platform's Maven repository answers:
 #
-#     docker build --network qits-net \
-#       --build-arg QITS_MAVEN_REPOSITORY_URL=http://qits-platform-artifacts:8080/artifacts/maven/maven \
+#     docker build --network host \
+#       --build-arg QITS_MAVEN_REPOSITORY_URL="http://$QITS_REGISTRY/artifacts/maven/maven" \
 #       -t qits/githost:latest -f docker/Dockerfile .
 #
 # BOTH FLAGS ARE REQUIRED and neither has a workable default. This reactor's `service` module depends
