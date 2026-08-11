@@ -82,9 +82,10 @@
         <dependency>
             <!-- The datasource resilience jar, and it is a RUNTIME concern spelled at compile
                  scope because both halves are used here: application.properties names
-                 PatientPgDriver as the pool's driver, and the catalog reads are wrapped in
-                 DbRetry. It brings pgjdbc in provided scope only — quarkus-jdbc-postgresql above
-                 is where the real driver comes from. -->
+                 PatientPgDriver as the pool's driver, the catalog reads are wrapped in DbRetry,
+                 and the catalog write in DbRetry.inNewTx. It brings pgjdbc and narayana-jta in
+                 provided scope only — quarkus-jdbc-postgresql above is where the real driver comes
+                 from, and this service already has JTA. -->
             <groupId>${project.groupId}</groupId>
             <artifactId>qits-db-core</artifactId>
         </dependency>

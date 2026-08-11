@@ -56,12 +56,14 @@
         <!-- The platform's datasource resilience, released together out of
              libs/qits-integrations-quarkus, which is why the two versions are the same string:
              qits-db-core carries PatientPgDriver (the pool's connections are opened through it and
-             held while postgres comes back) and DbRetry (the read-seam retry for a connection lost
-             mid-flight); qits-arch-rules carries the assertion that this service configured the
-             first one. They move together — the rule names the driver as a string, so a driver that
-             moved without the rule would pass a build it should fail. -->
-        <qits.db-core.version>2026.811.152803</qits.db-core.version>
-        <qits.arch-rules.version>2026.811.152803</qits.arch-rules.version>
+             held while postgres comes back), DbRetry (the read-seam retry for a connection lost
+             mid-flight) and DbRetry.inNewTx (the same patience for a write, which owns the
+             transaction so it can retry only the attempts that certainly did not commit);
+             qits-arch-rules carries the assertion that this service configured the first one. They
+             move together — the rule names the driver as a string, so a driver that moved without
+             the rule would pass a build it should fail. -->
+        <qits.db-core.version>2026.811.165001</qits.db-core.version>
+        <qits.arch-rules.version>2026.811.165001</qits.arch-rules.version>
         <qits.maven.repository.url>http://localhost:8081/artifacts/maven/maven</qits.maven.repository.url>
 
         <maven.compiler.release>25</maven.compiler.release>

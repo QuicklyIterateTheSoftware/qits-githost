@@ -39,15 +39,19 @@ import org.jboss.logging.Logger;
  *
  * <h2>Patience</h2>
  *
- * <p><b>The reads hold through a short outage; the write does not.</b> {@link #list} and {@link
- * #repositoryIds} are wrapped in {@link DbRetry}, so a connection lost <i>mid-flight</i> — after the
- * statements ran, which is where the pool's own patient driver cannot help — costs a caller a pause
- * rather than an error. {@link #commit} is deliberately left bare: a write whose commit
- * acknowledgement was lost still committed, and a second attempt would write it twice.
+ * <p><b>Reads and the write both hold through a short outage, by two different mechanisms.</b>
+ * {@link #list} and {@link #repositoryIds} are wrapped in {@link DbRetry#call}, so a connection lost
+ * <i>mid-flight</i> — after the statements ran, which is where the pool's own patient driver cannot
+ * help — costs a caller a pause rather than an error. {@link #commit} is wrapped in {@link
+ * DbRetry#runInNewTx}, which owns the transaction and therefore retries only the attempts that
+ * certainly did not commit. That is what makes a connection lost in the middle of a push survivable:
+ * the pack bytes are already promoted, and the row that makes them visible is the last thing left.
  *
- * <p>The retry sits <b>outside</b> {@code requiringNew}, never inside it, so every attempt runs in a
- * fresh transaction on a freshly borrowed connection. Inside one it would re-run statements in a
- * transaction the severed connection already doomed, and retry forever against a dead thing.
+ * <p>For a read the retry sits <b>outside</b> {@code requiringNew}, never inside it, so every
+ * attempt runs in a fresh transaction on a freshly borrowed connection. Inside one it would re-run
+ * statements in a transaction the severed connection already doomed, and retry forever against a
+ * dead thing. {@code runInNewTx} keeps exactly that property with the loop on the other side of the
+ * boundary — it opens the fresh transaction itself, once per attempt.
  */
 @ApplicationScoped
 public class CatalogRepository implements PackCatalog {
@@ -112,24 +116,52 @@ public class CatalogRepository implements PackCatalog {
 
   /**
    * Adds and removes in <b>one</b> transaction, because a reader that saw only half of a repack
-   * would find objects in no pack at all. Removes go first: a name is never reused, so the two sets
-   * cannot overlap, but doing it in this order makes that assumption harmless if it ever stops
-   * holding.
+   * would find objects in no pack at all.
+   *
+   * <p><b>And it holds through a short outage.</b> {@link DbRetry#runInNewTx} opens that transaction
+   * itself, once per attempt, and retries an attempt only when the failure came out of the body and
+   * was a connection loss — the one position from which "nothing was written" is known. A commit
+   * whose acknowledgement was lost is still reported, because it may have landed. This is the last
+   * database step of a push: the pack's bytes are promoted by the time it runs, so a connection lost
+   * here is the difference between a push that survives a cutover and one that reports a pack it
+   * wrote and cannot list.
    */
   @Override
   @ActivateRequestContext
   public void commit(
       String repositoryId, Collection<PackDescription> add, Collection<PackDescription> remove) {
-    QuarkusTransaction.requiringNew()
-        .run(
-            () -> {
-              for (PackDescription pack : remove) {
-                delete(repositoryId, pack.packName());
-              }
-              for (PackDescription pack : add) {
-                insert(repositoryId, pack);
-              }
-            });
+    DbRetry.runInNewTx(
+        "pack catalog write for git repository " + repositoryId,
+        () -> writePacks(repositoryId, add, remove),
+        retryDeadline());
+  }
+
+  /**
+   * The whole database unit of {@link #commit}, and <b>nothing else</b>: no blob is promoted here,
+   * no event published, no counter bumped. That is the rule {@code runInNewTx} rests on — the retry
+   * re-runs this method, so anything in it that is not a database write would happen once per
+   * attempt.
+   *
+   * <p>Removes go first: a name is never reused, so the two sets cannot overlap, but doing it in
+   * this order makes that assumption harmless if it ever stops holding.
+   *
+   * <p>The closing {@code flush} is load-bearing rather than tidy. Hibernate flushes at commit by
+   * default, which would put every insert on the far side of the commit boundary, where a lost
+   * connection is undecidable and therefore reported instead of retried. Flushing here moves the
+   * inserts into the statement phase, where the classification is certain.
+   *
+   * <p>Not private, so the suite can sever it mid-write — the retry is on this side of the call, so
+   * a fault installed over {@link #commit} would never reach it.
+   */
+  void writePacks(
+      String repositoryId, Collection<PackDescription> add, Collection<PackDescription> remove) {
+    for (PackDescription pack : remove) {
+      delete(repositoryId, pack.packName());
+    }
+    for (PackDescription pack : add) {
+      insert(repositoryId, pack);
+    }
+    GitPack.getEntityManager().flush();
   }
 
   /**
