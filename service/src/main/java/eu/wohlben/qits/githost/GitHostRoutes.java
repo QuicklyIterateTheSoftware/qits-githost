@@ -952,6 +952,10 @@ public class GitHostRoutes {
    * <p>The slug check stays <b>here</b> rather than moving into the provider, because it is a
    * property of the url: nothing under this seam touches a filesystem, so a traversal-shaped id
    * would simply be an unknown id there, and it has to be refused rather than looked up.
+   *
+   * <p>A store that cannot answer <b>throws</b> rather than returning null, and nothing here catches
+   * it: the blocking handler hands it to Vert.x, which answers 500. Only a clean "no such
+   * repository" is a 404.
    */
   private OpenedRepo open(String repoId) {
     if (repoId == null || !repoId.matches(REPO_ID_PATTERN)) {

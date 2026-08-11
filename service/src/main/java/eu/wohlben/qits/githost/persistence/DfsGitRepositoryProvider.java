@@ -6,6 +6,7 @@ import eu.wohlben.qits.githost.storage.QitsDfsRepositoryBuilder;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.List;
 import org.eclipse.jgit.lib.Repository;
 import org.jboss.logging.Logger;
@@ -38,19 +39,39 @@ public class DfsGitRepositoryProvider implements GitRepositoryProvider {
    * Existence is answered by the ref database, not by a table of its own: a repository that has ever
    * been created has a reftable in the catalog, and one that has not reads as empty. So an unknown
    * id is a 404 with no extra row to keep in step.
+   *
+   * <p><b>Null means one thing: the catalog answered, and it holds no such repository.</b> A catalog
+   * that cannot answer throws instead, so the routes make a 500 of it. Reading a failed read as
+   * absence cost a platform bootstrap: postgres was cut over mid-run, the severed pool made the
+   * existence check throw, and a push to a repository that exists was told 404.
    */
   @Override
   public Repository open(String repoId) {
     QitsDfsRepository repo = build(repoId);
+    boolean exists;
     try {
-      if (repo.exists()) {
-        return repo;
-      }
-    } catch (Exception e) {
-      LOG.debugf(e, "git repository %s could not be read from the pack catalog", repoId);
+      exists = repo.exists();
+    } catch (IOException | RuntimeException e) {
+      repo.close();
+      LOG.warnf(e, "the pack catalog could not say whether git repository %s exists", repoId);
+      throw unchecked(repoId, e);
+    }
+    if (exists) {
+      return repo;
     }
     repo.close();
     return null;
+  }
+
+  /**
+   * Passes a runtime failure through unchanged, and makes a checked one throwable from a port method
+   * that declares nothing.
+   */
+  private static RuntimeException unchecked(String repoId, Exception e) {
+    return e instanceof RuntimeException runtime
+        ? runtime
+        : new UncheckedIOException(
+            "cannot read git repository " + repoId + " from the pack catalog", (IOException) e);
   }
 
   /**

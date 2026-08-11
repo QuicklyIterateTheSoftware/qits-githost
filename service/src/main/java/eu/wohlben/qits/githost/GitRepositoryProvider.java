@@ -23,10 +23,11 @@ public interface GitRepositoryProvider {
    * routes answer as a 404, the same answer an id that is not a valid slug gets. The caller closes
    * what it gets back.
    *
-   * <p>Never throws: a repository that exists but will not open is a deployment fact this process
-   * cannot act on, so it is logged at debug and reads as absent. That distinction has already
-   * mattered once — a native build in which JGit could open nothing looked exactly like a host full
-   * of unknown ids.
+   * <p><b>Null is an answer, not a failure.</b> A store that cannot say whether the repository is
+   * there throws — unchecked, so this signature stays as narrow as it is — and the routes make a 500
+   * of it. A store that cannot answer must never claim absence: this used to read a failed lookup as
+   * "no such repository", and a postgres cutover that severed the connection pool then made a live
+   * repository answer 404 to a push.
    */
   Repository open(String repoId);
 
