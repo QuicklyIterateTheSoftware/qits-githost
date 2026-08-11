@@ -52,7 +52,7 @@
              libs/qits-eventstream into the platform Maven repository, which is why the
              <repositories> block below exists — this is the one dependency here that is not on
              Maven Central and not built in this reactor. -->
-        <qits.eventstream.version>2026.810.191553</qits.eventstream.version>
+        <qits.eventstream.version>2026.811.155429</qits.eventstream.version>
         <!-- The platform's datasource resilience, released together out of
              libs/qits-integrations-quarkus, which is why the two versions are the same string:
              qits-db-core carries PatientPgDriver (the pool's connections are opened through it and
