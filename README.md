@@ -154,9 +154,10 @@ knows those types are serialized. A fifth event means a fifth entry, and
 
 ## Configuration
 
-The library jars ship their own defaults at ordinal 100 (`qits-blobstore`: the blob directory;
-`qits-eventstream`: the bus url, the outbox datasource and lineage, the retry budget). What this
-service owns is in `service/src/main/resources/application.properties`.
+The library jars ship their own defaults at ordinal 100 (`qits-blobstore`: the blob datasource, the
+grace period and the staging TTL; `qits-eventstream`: the bus url, the outbox datasource and
+lineage, the retry budget). What this service owns is in
+`service/src/main/resources/application.properties`.
 
 | Key / variable | Meaning |
 |---|---|
@@ -167,7 +168,9 @@ service owns is in `service/src/main/resources/application.properties`.
 | `QITS_REPOSITORIES_GIT_PROTECT_DEFAULT_BRANCH` | The default branch's seatbelt. Ships `false`. |
 | `QITS_REPOSITORIES_GIT_PUSH_TOKEN` | What `-o qits.token=<value>` must match. No default: unset means no token matches. |
 | `QITS_REPOSITORIES_GIT_MAX_PACK_SIZE` | The largest push this host accepts. Ships `64M`. |
-| `QITS_ARTIFACTS_BLOBS_DIR` | Where packs, pack indexes and reftables live on disk. |
+
+There is no variable for where the bytes go any more. `qits.artifacts.blobs-datasource=githost`
+points the blob store at this service's own database, and a deployment has no reason to move it.
 
 Push options, all read inside the pack protocol rather than as headers (qits-gateway strips the
 whole `X-Qits-` prefix, so a header would behave differently through the front door):
@@ -198,16 +201,35 @@ runs its own git host, and a green build deploys into whichever tier listens to 
 with `resources: postgresql:db, postgresql:eventstream:qits_githost_eventstream` and the health gate
 at `/githost/q/health/ready`. Those two resource **names** are load-bearing: they are what makes
 `QITS_RESOURCE_DB_*` and `QITS_RESOURCE_EVENTSTREAM_*` exist, and neither triple has a default, so a
-missing one kills the boot at Flyway rather than opening a store nobody meant. The blob directory
-(`QITS_ARTIFACTS_BLOBS_DIR`) and the volume behind it are run-args, written by the bootstrap CLI —
-the deployment grammar has no key for a mount. Deploy this service alone: replacing it blinks the
-host every other repository's build clones from.
+missing one kills the boot at Flyway rather than opening a store nobody meant. **There is no blobs
+volume any more**: the container is stateless except for its two databases, so a deployment still
+mounting one is carrying dead bytes. Deploy this service alone: replacing it blinks the host every
+other repository's build clones from.
 
 ## Storage
 
-A repository has no directory anywhere. Its packs, pack indexes and reftables are blobs in this
-service's own content-addressed store; the pack list is rows in `git_pack` / `git_pack_file`. So
-receive-pack is the only writer, and no ref moves without the post-receive hook firing.
+A repository has no directory anywhere, and no file anywhere either. Its packs, pack indexes and
+reftables are blobs in this service's own content-addressed store; the pack list is rows in
+`git_pack` / `git_pack_file`. So receive-pack is the only writer, and no ref moves without the
+post-receive hook firing.
+
+**The blobs are rows too, on the same database.** `V2__blob_tables.sql` adds the store's three
+tables — `blob`, `blob_content` and `blob_chunk` — and it is a **verbatim copy** of `qits-blobstore`'s
+`src/main/resources/db/blobstore-tables.sql`, because a library owns no schema and ships no Flyway
+migrations: the canonical text lives there and each consumer copies it into its own lineage, which
+keeps a later drift readable as a diff. `qits.artifacts.blobs-datasource=githost` is what points the
+store at them.
+
+**So this service is stateless and the container holds nothing.** A pack's bytes and the row that
+indexes it commit or fail together — the split-brain a blob directory invited, a pack file whose row
+did not survive or a row whose file did not, cannot happen. A restart loses nothing.
+
+A pack is written through a **scratch blob**, not a temp file: JGit's pack parser reads deltas back
+out of a pack it has not finished storing, so `BlobStorePackBlobStore` stages into `blob_chunk` rows
+it can also read from — flushed chunks from the database, the unflushed tail from the one buffered
+chunk in memory. `ScratchBlob.openRead()` seals the staging (it writes the final short chunk, and a
+write after it throws), which is why the adapter hashes before promoting and never the other way
+round.
 
 **The platform does not garbage collect git**, deliberately. The blob store has no delete on this
 path, so `DfsGarbageCollector` does not reclaim, it duplicates — measured once on the platform's
@@ -238,7 +260,9 @@ finds and runs the host's node.
 Otherwise the build needs no docker: the suite drives the real `git` CLI against the in-process
 routes, and both databases are real PostgreSQL binaries resolved as Maven artifacts and spawned as a
 child process (zonky). `qits-eventstream` resolves from the platform Maven repository; everything
-else is Maven Central or this reactor.
+else is Maven Central or this reactor. `qits-blobstore` is pinned to
+`1.0.0-pgblobs-SNAPSHOT` while the PostgreSQL blob store is on its branch, so a build here needs
+that branch installed (`./mvnw install` in `libs/qits-blobstore`) until it releases.
 
 On the deployment host add `-Dquarkus.http.test-port=0`: Quarkus' default test port 8081 is the
 platform's npm registry there, and the whole suite otherwise dies with `Port already bound: 8081`,

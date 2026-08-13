@@ -44,26 +44,16 @@
 # creates a role and a database for each on the tier's postgres before the successor container starts
 # and injects all six variables.
 #
-# One more path has no safe default, and it is the one that holds the bytes:
+# THOSE TWO DATABASES ARE THE WHOLE OF THIS CONTAINER'S STATE. Packs, pack indexes and reftables are
+# chunk rows beside the git_pack / git_pack_file rows that index them (V2__blob_tables.sql, and
+# qits.artifacts.blobs-datasource=githost), so there is NO blobs directory and NO volume to mount. A
+# restart loses nothing: every repository this host serves lives in the database.
 #
-#   QITS_ARTIFACTS_BLOBS_DIR   Where packs, pack indexes and reftables live. A repository has no
-#                              directory anywhere — its objects are content-addressed blobs here, and
-#                              the rows in the database above are their only index. So the two travel
-#                              together, and blobs whose index did not survive are not data, they are
-#                              orphans. The shipped default is ${user.home}/.qits/data/githost/blobs,
-#                              which inside this image resolves to nothing usable: UID 1001 has no
-#                              /etc/passwd entry in ubi-minimal and a native image reads user.home
-#                              through getpwuid, so setting HOME does not fix it.
-#
-# So a deployment mounts a volume at /data (which this image owns, see the runtime stage) and names
-# all of it:
-#
-#   docker run -v qits-githost-data:/data \
+#   docker run \
 #     -e QITS_RESOURCE_DB_URL=jdbc:postgresql://some-postgres:5432/qits_githost \
 #     -e QITS_RESOURCE_DB_USERNAME=... -e QITS_RESOURCE_DB_PASSWORD=... \
 #     -e QITS_RESOURCE_EVENTSTREAM_URL=jdbc:postgresql://some-postgres:5432/qits_githost_eventstream \
 #     -e QITS_RESOURCE_EVENTSTREAM_USERNAME=... -e QITS_RESOURCE_EVENTSTREAM_PASSWORD=... \
-#     -e QITS_ARTIFACTS_BLOBS_DIR=/data/githost/blobs \
 #     -e QITS_PROJECTS_NAME_RESOLVER_URL=http://<env>-qits-projects:8080/projects/api/projects \
 #     qits/githost:latest
 #
@@ -186,16 +176,12 @@ WORKDIR /work
 COPY --from=build --chown=1001:root /src/service/target/qits-githost /work/qits-githost
 RUN chmod +x /work/qits-githost
 
-# The mount point for the blobs, created here so it is OWNED. Docker seeds a fresh named volume from
-# whatever the image has at the mount path, ownership included; with no such directory it makes one
-# root-owned 0755 and the first push dies on an AccessDeniedException instead of anything that names
-# the cause. Group-writable and group-root because a ubi image is meant to survive being assigned an
-# arbitrary UID with GID 0. (A bind mount still takes its ownership from the host — nothing in an
-# image can fix that.)
-RUN mkdir -p /data && chown -R 1001:root /data && chmod -R 775 /data
-
-# Nothing is named here: no QUARKUS_DATASOURCE_*, no QITS_ARTIFACTS_BLOBS_DIR. All of it belongs to
-# the deployment's storage, and this image refuses to start until a deployment says where it goes.
+# NO /data AND NO VOLUME. This image used to own a mount point for the pack files; pack bytes are
+# PostgreSQL rows now, so the container writes nothing it needs to keep and there is nothing to
+# mount. A deployment that still mounts the old volume is carrying dead bytes.
+#
+# Nothing is named here either: no QUARKUS_DATASOURCE_*. The two databases belong to the deployment,
+# and this image refuses to start until a deployment says where they are.
 
 # One port for all of it — /git/** (raw Vert.x), /githost/api/** (JAX-RS), /githost/** (the SPA's
 # static files) and /githost/q/** (health) are four route stacks in one process, not four listeners.
