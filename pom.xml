@@ -46,8 +46,11 @@
 
     <properties>
         <!-- The content-addressed blob store, extracted in phase 1. This service stores packs, pack
-             indexes and reftables in it and uses nothing else it offers. -->
-        <qits.blobstore.version>2026.813.161828</qits.blobstore.version>
+             indexes and reftables in it and uses nothing else it offers.
+             PG-ONLY SINCE THE PGBLOBS BRANCH: the store moved its bytes out of the filesystem and
+             into three PostgreSQL tables, so the pin is that branch's snapshot until the campaign
+             releases. -->
+        <qits.blobstore.version>1.0.0-pgblobs-SNAPSHOT</qits.blobstore.version>
         <!-- The event bus: the outbox, the idempotent PUT, the durable listener. Published by
              libs/qits-eventstream into the platform Maven repository — the same place the blob
              store above and qits-db-core below come from, and why the <repositories> block below
