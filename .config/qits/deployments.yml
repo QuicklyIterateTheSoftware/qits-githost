@@ -49,3 +49,11 @@ resources: postgresql:db, postgresql:eventstream:qits_githost_eventstream
 # Liveness answers UP with an empty check list — a git host that boots and cannot read its pack
 # catalog would pass it, and that container serves an empty ref advertisement to every clone.
 health_path: /githost/q/health/ready
+
+# STOP-FIRST, because this deployment publishes a host port. Under start-first the successor
+# waits in Pending for a port the predecessor only frees by stopping — which start-first never
+# does — so a one-node swarm deadlocks on the first rolling update. A single binder cannot have
+# the lossless-rollback overlap; the deploy takes the brief gap instead. Measured live on
+# qits-platform-mirror's 2026.813.163303 deploy, the first host-port update since the swarm
+# cutover (2026-08-13).
+update_order: stop-first
