@@ -55,6 +55,8 @@
              store above and qits-db-core below come from, and why the <repositories> block below
              exists: none of the three is on Maven Central or built in this reactor. -->
         <qits.eventstream.version>2026.811.155429</qits.eventstream.version>
+        <!-- Shared OIDC and forwarded-header authentication. -->
+        <qits.integrations-quarkus.version>2026.815.140812</qits.integrations-quarkus.version>
         <!-- The platform's datasource resilience, released together out of
              libs/qits-integrations-quarkus, which is why the two versions are the same string:
              qits-db-core carries PatientPgDriver (the pool's connections are opened through it and
@@ -158,6 +160,10 @@
                 <groupId>${project.groupId}</groupId>
                 <artifactId>qits-arch-rules</artifactId>
                 <version>${qits.arch-rules.version}</version>
+            </dependency>
+            <dependency>
+                <artifactId>qits-auth-core</artifactId>
+                <version>${qits.integrations-quarkus.version}</version>
             </dependency>
             <!-- The reactor's own modules, so `service` depends on them version-less. -->
             <dependency>

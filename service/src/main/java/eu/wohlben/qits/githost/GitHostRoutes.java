@@ -9,6 +9,8 @@ import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.Router;
 import io.vertx.ext.web.RoutingContext;
 import io.vertx.ext.web.handler.BodyHandler;
+import io.quarkus.security.identity.SecurityIdentity;
+import io.quarkus.vertx.http.runtime.security.QuarkusHttpUser;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
 import jakarta.enterprise.inject.Instance;
@@ -33,11 +35,13 @@ import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.transport.PacketLineOut;
+import org.eclipse.jgit.transport.PreReceiveHook;
 import org.eclipse.jgit.transport.ReceiveCommand;
 import org.eclipse.jgit.transport.ReceivePack;
 import org.eclipse.jgit.transport.RefAdvertiser.PacketLineOutRefAdvertiser;
 import org.eclipse.jgit.transport.UploadPack;
 import org.eclipse.jgit.treewalk.TreeWalk;
+import org.eclipse.microprofile.jwt.JsonWebToken;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
@@ -51,11 +55,11 @@ import org.jboss.logging.Logger;
  * and it has stayed out since. Raw routes are also what keeps the wire protocol the whole of what
  * this class does.
  *
- * <p>No authentication: repo ids are capability UUIDs, and the callers are workspace containers,
- * which cannot hold a user token — so {@code /git/*} deliberately stays on {@code
- * QitsAuthPolicy}'s public list in every auth build variant (container traffic reaches qits directly on qits-net,
- * bypassing any forward-auth proxy — see auth-core's {@code PublicPaths}). Anonymous fetch AND push
- * are both enabled. JGit here speaks the wire protocol and nothing else, and receive-pack is the
+ * <p>Every Git route requires either {@code qits:admin} from an authenticated browser session,
+ * {@code qits:system} from a machine token, or {@code qits:git:external} from a workstation token.
+ * An external token may push only {@code refs/heads/external/*}; repository ids remain identifiers,
+ * not capabilities.
+ * JGit here speaks the wire protocol and nothing else, and receive-pack is the
  * only writer this host has — a repository has no directory anyone could run git in.
  *
  * <p>One thing a push is checked against: {@link ProtectedRefHook}, the default branch's seatbelt.
@@ -125,7 +129,8 @@ import org.jboss.logging.Logger;
  * local clone and re-fetch it. Both routes answer at any revision the repository holds — a full sha
  * as readily as a branch name — which is what lets a post-receive consumer read the exact pushed
  * commit instead of racing the branch, and both carry the resolved commit in {@value
- * #COMMIT_SHA_HEADER}. They are reads, so they are unauthenticated like everything else here.
+ * #COMMIT_SHA_HEADER}. They are reads, but follow the same Git HTTP authentication policy as every
+ * other route here.
  */
 @ApplicationScoped
 public class GitHostRoutes {
@@ -156,6 +161,11 @@ public class GitHostRoutes {
   private static final String UPLOAD = "git-upload-pack";
   private static final String RECEIVE = "git-receive-pack";
 
+  private static final String ADMIN_ROLE = "qits:admin";
+  private static final String SYSTEM_ROLE = "qits:system";
+  private static final String EXTERNAL_GIT_ROLE = "qits:git:external";
+  private static final String PUSH_ACCESS_KEY = GitHostRoutes.class.getName() + ".pushAccess";
+
   /**
    * The resolved commit, on every content response. <b>Not</b> an {@code X-Qits-} name: qits-gateway
    * strips that whole prefix unconditionally, so a header spelled that way would reach a caller
@@ -174,7 +184,7 @@ public class GitHostRoutes {
    *
    * <p>Stated as a constant rather than a config key on purpose: it is a property of what this route
    * is for, not a deployment's choice, and a knob would invite raising it until the read is a
-   * memory allocation on a deliberately unauthenticated route. The whole blob is held in memory —
+   * memory allocation on an authenticated route. The whole blob is held in memory —
    * the same reason {@link #maxPackSize} sits far below the wire ceiling.
    */
   private static final int MAX_BLOB_BYTES = 8 * 1024 * 1024;
@@ -230,7 +240,7 @@ public class GitHostRoutes {
    * <p>It must also stay well below {@code quarkus.http.limits.max-body-size}, which the OCI
    * registry raised to 1088M. That ceiling is sized for a layer that streams to disk; a pack goes
    * through a {@link BodyHandler} into memory, so inheriting it would turn a large push into a
-   * gigabyte-sized heap allocation on a deliberately unauthenticated route.
+   * gigabyte-sized heap allocation on an authenticated route.
    */
   @ConfigProperty(name = "qits.repositories.git.max-pack-size", defaultValue = "64M")
   MemorySize maxPackSize;
@@ -254,6 +264,26 @@ public class GitHostRoutes {
 
   /** A resolved repository plus the id it resolved to (the post-receive hook needs the id). */
   private record OpenedRepo(String repoId, Repository repo) {}
+
+  /**
+   * A snapshot of the verified HTTP identity made before Vert.x moves receive-pack work to a worker
+   * thread. External is deliberately a restriction, not a grant: an identity that also holds an
+   * ordinary admin or system role keeps that privileged role's established behaviour.
+   */
+  record PushAccess(boolean externalOnly, String externalRefPattern) {
+    static PushAccess from(SecurityIdentity identity) {
+      boolean privileged =
+          identity != null && (identity.hasRole(ADMIN_ROLE) || identity.hasRole(SYSTEM_ROLE));
+      if (privileged || identity == null || !identity.hasRole(EXTERNAL_GIT_ROLE)) {
+        return new PushAccess(false, null);
+      }
+      String pattern =
+          identity.getPrincipal() instanceof JsonWebToken jwt
+              ? jwt.claim("git_ref_pattern").map(String::valueOf).orElse(null)
+              : null;
+      return new PushAccess(true, pattern);
+    }
+  }
 
   /**
    * Register the routes on the main Vert.x router (root path — NOT under {@code
@@ -289,6 +319,7 @@ public class GitHostRoutes {
     router
         .post(BASE + "/:repoId/git-receive-pack")
         .handler(packBodyHandler())
+        .handler(this::snapshotPushAccess)
         .blockingHandler(rc -> service(rc, RECEIVE, open(rc, "repoId")));
 
     router
@@ -320,6 +351,7 @@ public class GitHostRoutes {
     router
         .post(BASE + "/:projectId/:repoName/git-receive-pack")
         .handler(packBodyHandler())
+        .handler(this::snapshotPushAccess)
         .blockingHandler(rc -> service(rc, RECEIVE, openByName(rc)));
   }
 
@@ -401,7 +433,7 @@ public class GitHostRoutes {
         up.setBiDirectionalPipe(false);
         // The want policy stays JGit's default ADVERTISED. Relaxing it to REACHABLE_COMMIT would
         // make every want for a non-tip object run a reachability walk on this shared worker
-        // thread — a DoS lever on a route that is deliberately unauthenticated. ci therefore
+        // thread — a DoS lever even on an authenticated route. ci therefore
         // fetches the BRANCH REF and verifies reachability itself (see GitConfigFetcher).
         up.upload(in, out, null);
       } else {
@@ -416,7 +448,7 @@ public class GitHostRoutes {
         // (or this repository's own protection row) says otherwise — see ProtectedRefHook. Bound to
         // the repo id rather than handed the ReceivePack alone, because the override is a row keyed
         // on that id and a DFS repository has no directory to derive it from.
-        rp.setPreReceiveHook(protectedRefs.forRepository(opened.repoId()));
+        rp.setPreReceiveHook(preReceiveHook(opened.repoId(), pushAccess(rc)));
         // The post-receive announcement: fires after the ref updates land, still inside receive(),
         // so the repository is readable and the pack's objects are there to be measured. The
         // announcer must not block the push and must not throw — see ScmAnnouncer.
@@ -440,6 +472,37 @@ public class GitHostRoutes {
     } catch (Exception e) {
       fail(rc, service, e);
     }
+  }
+
+  /** Capture the authenticated role decision while the request still runs on the event loop. */
+  private void snapshotPushAccess(RoutingContext rc) {
+    SecurityIdentity identity =
+        rc.user() instanceof QuarkusHttpUser user ? user.getSecurityIdentity() : null;
+    rc.put(PUSH_ACCESS_KEY, PushAccess.from(identity));
+    rc.next();
+  }
+
+  /**
+   * The external namespace check runs before the default-branch hook. It rejects every command in
+   * a mixed push, so protected-ref policy cannot accidentally leave a permitted command behind.
+   */
+  private PreReceiveHook preReceiveHook(String repoId, PushAccess access) {
+    PreReceiveHook protectedHook = protectedRefs.forRepository(repoId);
+    if (!access.externalOnly()) {
+      return protectedHook;
+    }
+    return (pack, commands) -> {
+      if (!ExternalRefHook.rejectOutsideExternalBranches(commands, access.externalRefPattern())) {
+        protectedHook.onPreReceive(pack, commands);
+      }
+    };
+  }
+
+  private static PushAccess pushAccess(RoutingContext rc) {
+    PushAccess access = rc.get(PUSH_ACCESS_KEY);
+    // A protected route always runs snapshotPushAccess first. Failing closed for a route wiring
+    // regression is safer than treating an external caller as privileged on a worker thread.
+    return access == null ? new PushAccess(true, "") : access;
   }
 
   /**
@@ -784,7 +847,7 @@ public class GitHostRoutes {
    * #open(String)} is: an id that is not a valid slug cannot be served by any route on this host, so
    * listing one would advertise a repository no caller could clone.
    *
-   * <p>No authentication, exactly like every other route in this class — repo ids are capability
+   * <p>The class-wide Git HTTP policy applies here too — repo ids are identifiers rather than
    * UUIDs and the callers are machines on qits-net. A read surface gated on its own would be the
    * piecemeal machine auth this platform has decided against; qits-platform-idp gates these together.
    *

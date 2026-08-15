@@ -33,6 +33,13 @@
     <dependencies>
         <dependency>
             <!-- /githost/q/health/ready — the readiness endpoint qits-cd's health gate curls. -->
+        </dependency>
+        <dependency>
+            <groupId>${project.groupId}</groupId>
+            <artifactId>qits-auth-core</artifactId>
+        </dependency>
+        <dependency>
+            <!-- /githost/q/health/ready — the readiness endpoint qits-cd's health gate curls. -->
             <groupId>io.quarkus</groupId>
             <artifactId>quarkus-smallrye-health</artifactId>
         </dependency>
@@ -63,6 +70,10 @@
                  GitHostRoutes observes io.vertx.ext.web.Router directly. -->
             <groupId>io.quarkus</groupId>
             <artifactId>quarkus-vertx-http</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-oidc</artifactId>
         </dependency>
         <dependency>
             <groupId>io.quarkus</groupId>
