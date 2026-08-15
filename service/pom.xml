@@ -32,9 +32,6 @@
 
     <dependencies>
         <dependency>
-            <!-- /githost/q/health/ready — the readiness endpoint qits-cd's health gate curls. -->
-        </dependency>
-        <dependency>
             <groupId>${project.groupId}</groupId>
             <artifactId>qits-auth-core</artifactId>
         </dependency>

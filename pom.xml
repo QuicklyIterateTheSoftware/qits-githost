@@ -162,6 +162,7 @@
                 <version>${qits.arch-rules.version}</version>
             </dependency>
             <dependency>
+                <groupId>${project.groupId}</groupId>
                 <artifactId>qits-auth-core</artifactId>
                 <version>${qits.integrations-quarkus.version}</version>
             </dependency>
