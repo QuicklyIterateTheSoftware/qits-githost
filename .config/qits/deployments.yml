@@ -13,6 +13,10 @@
 # whichever tier listens to the built branch.
 deployment_target: environment
 
+# `/git` is the smart-HTTP protocol address clients require; `/githost` is the browser surface.
+routes: /githost,/git
+navigation: Githost:9
+
 # TWO DATABASES, because this application opens two datasources with two Flyway lineages.
 # qits-deployments creates a login role and a database for each on the postgres of this tier before
 # the container starts and injects QITS_RESOURCE_<NAME>_URL / _USERNAME / _PASSWORD — the generic
