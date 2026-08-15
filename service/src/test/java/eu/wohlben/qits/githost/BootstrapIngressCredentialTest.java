@@ -32,4 +32,18 @@ class BootstrapIngressCredentialTest {
     assertFalse(credential(Instant.parse("2030-01-01T00:00:00Z"))
         .permits("forged", "qits-bootstrap", Instant.parse("2029-01-01T00:00:00Z")));
   }
+
+  @Test
+  void disabledSentinelsNeverCreateAnAlternateCredential() {
+    BootstrapIngressCredential disabled =
+        new BootstrapIngressCredential(
+            new BootstrapIngressCredential.Config(
+                false,
+                "disabled",
+                "disabled",
+                "refs/heads/disabled",
+                Instant.parse("1970-01-01T00:00:00Z")));
+
+    assertFalse(disabled.permits(CAPABILITY, "qits-bootstrap", Instant.parse("2029-01-01T00:00:00Z")));
+  }
 }

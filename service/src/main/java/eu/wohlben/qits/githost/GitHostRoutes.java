@@ -250,13 +250,14 @@ public class GitHostRoutes {
   @ConfigProperty(name = "qits.bootstrap.ingress.git.enabled", defaultValue = "false")
   boolean bootstrapIngressEnabled;
 
-  @ConfigProperty(name = "qits.bootstrap.ingress.git.secret-hash", defaultValue = "")
+  @ConfigProperty(name = "qits.bootstrap.ingress.git.secret-hash", defaultValue = "disabled")
   String bootstrapIngressSecretHash;
 
-  @ConfigProperty(name = "qits.bootstrap.ingress.git.repository", defaultValue = "")
+  @ConfigProperty(name = "qits.bootstrap.ingress.git.repository", defaultValue = "disabled")
   String bootstrapIngressRepository;
 
-  @ConfigProperty(name = "qits.bootstrap.ingress.git.ref-pattern", defaultValue = "")
+  @ConfigProperty(
+      name = "qits.bootstrap.ingress.git.ref-pattern", defaultValue = "refs/heads/disabled")
   String bootstrapIngressRefPattern;
 
   @ConfigProperty(name = "qits.bootstrap.ingress.git.expires-at", defaultValue = "1970-01-01T00:00:00Z")
