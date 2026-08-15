@@ -20,6 +20,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.Collection;
 import java.util.List;
 import java.util.UUID;
@@ -157,6 +158,7 @@ public class GitHostRoutes {
    * workspace daemon's provisioner both clone from it — so moving it is a cutover, not an edit.
    */
   private static final String BASE = "/git";
+  private static final String BOOTSTRAP_BASE = "/bootstrap-git";
 
   private static final String UPLOAD = "git-upload-pack";
   private static final String RECEIVE = "git-receive-pack";
@@ -244,6 +246,21 @@ public class GitHostRoutes {
    */
   @ConfigProperty(name = "qits.repositories.git.max-pack-size", defaultValue = "64M")
   MemorySize maxPackSize;
+
+  @ConfigProperty(name = "qits.bootstrap.ingress.git.enabled", defaultValue = "false")
+  boolean bootstrapIngressEnabled;
+
+  @ConfigProperty(name = "qits.bootstrap.ingress.git.secret-hash", defaultValue = "")
+  String bootstrapIngressSecretHash;
+
+  @ConfigProperty(name = "qits.bootstrap.ingress.git.repository", defaultValue = "")
+  String bootstrapIngressRepository;
+
+  @ConfigProperty(name = "qits.bootstrap.ingress.git.ref-pattern", defaultValue = "")
+  String bootstrapIngressRefPattern;
+
+  @ConfigProperty(name = "qits.bootstrap.ingress.git.expires-at", defaultValue = "1970-01-01T00:00:00Z")
+  Instant bootstrapIngressExpiresAt;
 
   @Inject Instance<RepositoryNameResolver> repositoryNames;
 
@@ -353,6 +370,41 @@ public class GitHostRoutes {
         .handler(packBodyHandler())
         .handler(this::snapshotPushAccess)
         .blockingHandler(rc -> service(rc, RECEIVE, openByName(rc)));
+
+    // No normal deployment enables these routes.  The short-lived bootstrap ingress rewrites only
+    // the three smart-HTTP shapes here and carries an opaque capability whose hash, repository,
+    // ref namespace and deadline exist solely in the seed compose environment.
+    if (bootstrapIngressEnabled) {
+      BootstrapIngressCredential credential = new BootstrapIngressCredential(
+          new BootstrapIngressCredential.Config(true, bootstrapIngressSecretHash,
+              bootstrapIngressRepository, bootstrapIngressRefPattern, bootstrapIngressExpiresAt));
+      router.get(BOOTSTRAP_BASE + "/:repoId/info/refs")
+          .handler(rc -> bootstrapPermit(rc, credential))
+          .blockingHandler(rc -> infoRefs(rc, open(rc, "repoId")));
+      router.post(BOOTSTRAP_BASE + "/:repoId/git-upload-pack")
+          .handler(rc -> bootstrapPermit(rc, credential))
+          .handler(packBodyHandler())
+          .blockingHandler(rc -> service(rc, UPLOAD, open(rc, "repoId")));
+      router.post(BOOTSTRAP_BASE + "/:repoId/git-receive-pack")
+          .handler(rc -> bootstrapPermit(rc, credential))
+          .handler(packBodyHandler())
+          .handler(rc -> snapshotBootstrapPushAccess(rc, credential))
+          .blockingHandler(rc -> service(rc, RECEIVE, open(rc, "repoId")));
+    }
+  }
+
+  private void bootstrapPermit(RoutingContext rc, BootstrapIngressCredential credential) {
+    if (!credential.permits(rc.request().getHeader(BootstrapIngressCredential.HEADER),
+        rc.pathParam("repoId"), Instant.now())) {
+      rc.response().setStatusCode(401).end();
+      return;
+    }
+    rc.next();
+  }
+
+  private void snapshotBootstrapPushAccess(RoutingContext rc, BootstrapIngressCredential credential) {
+    rc.put(PUSH_ACCESS_KEY, new PushAccess(true, credential.refPattern()));
+    rc.next();
   }
 
   /**
