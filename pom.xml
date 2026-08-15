@@ -56,7 +56,7 @@
              exists: none of the three is on Maven Central or built in this reactor. -->
         <qits.eventstream.version>2026.811.155429</qits.eventstream.version>
         <!-- Shared OIDC and forwarded-header authentication. -->
-        <qits.integrations-quarkus.version>2026.815.140812</qits.integrations-quarkus.version>
+        <qits.integrations-quarkus.version>2026.815.141521</qits.integrations-quarkus.version>
         <!-- The platform's datasource resilience, released together out of
              libs/qits-integrations-quarkus, which is why the two versions are the same string:
              qits-db-core carries PatientPgDriver (the pool's connections are opened through it and
