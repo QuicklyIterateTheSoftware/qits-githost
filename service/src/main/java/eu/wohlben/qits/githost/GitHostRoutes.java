@@ -382,12 +382,12 @@ public class GitHostRoutes {
           .handler(rc -> bootstrapPermit(rc, credential))
           .blockingHandler(rc -> infoRefs(rc, open(rc, "repoId")));
       router.post(BOOTSTRAP_BASE + "/:repoId/git-upload-pack")
-          .handler(rc -> bootstrapPermit(rc, credential))
           .handler(packBodyHandler())
+          .handler(rc -> bootstrapPermit(rc, credential))
           .blockingHandler(rc -> service(rc, UPLOAD, open(rc, "repoId")));
       router.post(BOOTSTRAP_BASE + "/:repoId/git-receive-pack")
-          .handler(rc -> bootstrapPermit(rc, credential))
           .handler(packBodyHandler())
+          .handler(rc -> bootstrapPermit(rc, credential))
           .handler(rc -> snapshotBootstrapPushAccess(rc, credential))
           .blockingHandler(rc -> service(rc, RECEIVE, open(rc, "repoId")));
     }
