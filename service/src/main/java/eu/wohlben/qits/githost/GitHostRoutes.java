@@ -1077,7 +1077,18 @@ public class GitHostRoutes {
    * repository" is a 404.
    */
   private OpenedRepo open(String repoId) {
-    if (repoId == null || !repoId.matches(REPO_ID_PATTERN)) {
+    if (repoId == null) {
+      return null;
+    }
+    // Git's conventional spelling of a repository url carries a `.git` suffix, and every submodule
+    // url a wrapper's `.gitmodules` states does (`../<name>.git` resolves against the wrapper's
+    // origin) — so a workspace container's submodule remotes address exactly this route with the
+    // suffix. An id can never legitimately end in `.git` (the slug pattern refuses dots), so
+    // stripping it is a pure alias, the same one the name-addressed route already grants.
+    if (repoId.endsWith(".git")) {
+      repoId = repoId.substring(0, repoId.length() - 4);
+    }
+    if (!repoId.matches(REPO_ID_PATTERN)) {
       return null;
     }
     Repository repo = provider.open(repoId);
