@@ -139,6 +139,20 @@ public class GitHostTest {
   }
 
   @Test
+  public void gitSuffixedIdAddressesTheSameRepository() throws Exception {
+    // The conventional url spelling: every submodule remote a wrapper's `.gitmodules` produces ends
+    // in `.git`, and it must reach the same repository the bare id does — a workspace container's
+    // submodule fetch/push depends on it.
+    String repoId = seedOrigin();
+    given()
+        .when()
+        .get("/git/" + repoId + ".git/info/refs?service=git-upload-pack")
+        .then()
+        .statusCode(Response.Status.OK.getStatusCode())
+        .contentType(containsString("git-upload-pack-advertisement"));
+  }
+
+  @Test
   public void missingServiceParamIs403ForAKnownRepo() throws Exception {
     // A known repo id with no ?service= (dumb-HTTP) is 403. The handler opens the repo eagerly, so
     // this path must still close it — regression guard for the try(repo)-wraps-the-403 fix.
