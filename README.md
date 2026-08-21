@@ -39,19 +39,35 @@ health gate in `.config/qits/deployments.yml` moved with it.
 
 | Route | What it does |
 |---|---|
-| `GET /git` | `{"repositories": ["<repoId>", …]}` — every repository this host serves, sorted. |
+**The name-addressed scheme is the public one.** `/git/<projectId>/<repoName>` is the clone url every
+consumer holds — CI, the daemons, deploy pushes, humans. `/git/<repoId>` is **internal storage
+plumbing**, spoken by qits-projects and nothing else: it is what mints and mirrors, and a UUID clone
+url is never published. With `qits.githost.storage-client` configured, the id-addressed scheme is
+served only to that client's self-role (see Configuration).
+
+| Route | What it does |
+|---|---|
+| `GET /git/:projectId/:repoName/info/refs?service=…` | The ref advertisement, name-addressed. |
+| `POST /git/:projectId/:repoName/git-upload-pack` | Fetch / clone. |
+| `POST /git/:projectId/:repoName/git-receive-pack` | Push. |
+| `GET /git/:projectId/:repoName/blob/:rev/<path>` | The raw bytes at that path in that revision. `Git-Commit-Sha` names the resolved commit. |
+| `GET /git/:projectId/:repoName/tree/:rev[/<path>]` | `{"entries":[{"name","type"}]}` for the directory there. |
+| `GET /git` | `{"repositories": ["<repoId>", …]}` — every repository this host serves, sorted. Storage ids. |
 | `PUT /git/:repoId` | Create, idempotently. Body `{"defaultBranch": "main"}`. 201 created, 200 already there. |
 | `GET /git/:repoId` | `{"repoId", "defaultBranch"}`, or 404. |
 | `HEAD /git/:repoId` | The same existence question, no body. |
-| `GET /git/:repoId/info/refs?service=git-(upload\|receive)-pack` | The ref advertisement. |
-| `POST /git/:repoId/git-upload-pack` | Fetch / clone. |
-| `POST /git/:repoId/git-receive-pack` | Push. |
-| `GET /git/:repoId/blob/:rev/<path>` | The raw bytes at that path in that revision. `Git-Commit-Sha` names the resolved commit. |
-| `GET /git/:repoId/tree/:rev[/<path>]` | `{"entries":[{"name","type"}]}` for the directory there. |
-| `GET /git/:projectId/:repoName/info/refs?service=…` | The name-addressed scheme. |
-| `POST /git/:projectId/:repoName/git-upload-pack` | Fetch, name-addressed. |
-| `POST /git/:projectId/:repoName/git-receive-pack` | Push, name-addressed. |
+| `GET /git/:repoId/info/refs?service=git-(upload\|receive)-pack` | The ref advertisement, id-addressed. |
+| `POST /git/:repoId/git-upload-pack` | Fetch, id-addressed. |
+| `POST /git/:repoId/git-receive-pack` | Push, id-addressed. |
+| `GET /git/:repoId/blob/:rev/<path>` | The same blob read, id-addressed. |
+| `GET /git/:repoId/tree/:rev[/<path>]` | The same tree read, id-addressed. |
 | `GET /githost/q/health/ready` | Readiness, for qits-cd's health gate. |
+
+The content reads carry a literal segment (`blob`, `tree`) and a tail that may hold slashes, so path
+length does not separate the two schemes there. The name-addressed pair is registered first and hands
+a request down when the name does not resolve; the id-addressed pair hands a
+`/git/<project>/<blob|tree>/info/refs` clone back to the name-addressed route. So a repository is
+never unreachable because of what it is called, and no shape is answered twice.
 
 **The prefix changed.** It was `/artifacts/git` while the host lived inside qits-artifacts; standing
 alone it drops the borrowed segment. qits-gateway routes verbatim by prefix, so `/git` is carried as
@@ -62,6 +78,12 @@ The name-addressed scheme resolves `(projectId, repoName)` through qits-projects
 (`qits.projects.name-resolver-url`) and is what makes a committed relative submodule url
 (`../<name>.git`) work. Unset, that scheme answers 404 and the id-addressed one keeps serving.
 
+**A resolver miss and a resolver outage are different answers.** qits-projects' 404 means "no such
+name" and reaches the client as a 404; anything that stopped the question being answered — a timeout,
+a refused connection, a non-200, an unreadable body — is a **503**. A git client records a 404 as
+"this repository is gone", so an outage answered that way would tell the platform every repository
+had been deleted (the `fe26a6c` lesson).
+
 ### The API
 
 | Route | What it does |
@@ -70,7 +92,8 @@ The name-addressed scheme resolves `(projectId, repoName)` through qits-projects
 
 It answers the same question as `GET /git` and is not a duplicate of it: that one is a wire the
 platform's machines read and its shape is fixed by them, this one is the browser's and may grow a
-field. **`id` is the whole contract**; the client renders anything else that arrives and assumes
+field. Both are **storage views** — the ids are opaque storage keys, not clone urls, and a repository's
+public identity (`projectId`, `repoName`) lives in qits-projects. **`id` is the whole contract**; the client renders anything else that arrives and assumes
 nothing about it, so a field is added here when it is honest and cheap and never as a placeholder.
 `protectDefaultBranch` is the effective answer — the platform switch with the repository's override
 applied — which is why it is not simply "there is a row".
@@ -98,10 +121,17 @@ Depend on `eu.wohlben.qits:qits-githost-events` for the vocabulary. Wire name = 
 
 | Event | When | Payload |
 |---|---|---|
-| `SCMPublishCommit` | per successfully updated branch ref | `repoId`, `branch`, `oldSha`, `sha`, `parents[]`, `authorName`, `authorEmail`, `authoredAt`, `committedAt`, `message`, `suppressCi`, `receivedAt` |
-| `SCMPublishTag` | per created or updated tag ref | `repoId`, `tagName`, `sha`, `targetSha`, `taggerName`, `taggerEmail`, `message`, `annotated`, `receivedAt` |
-| `SCMDeleteBranch` | per deleted branch ref | `repoId`, `branch`, `sha` (the old tip), `receivedAt` |
-| `SCMDeleteTag` | per deleted tag ref | `repoId`, `tagName`, `sha` (the old tip), `receivedAt` |
+| `SCMPublishCommit` | per successfully updated branch ref | `repoId`, `projectId`, `repoName`, `branch`, `oldSha`, `sha`, `parents[]`, `authorName`, `authorEmail`, `authoredAt`, `committedAt`, `message`, `suppressCi`, `receivedAt` |
+| `SCMPublishTag` | per created or updated tag ref | `repoId`, `projectId`, `repoName`, `tagName`, `sha`, `targetSha`, `taggerName`, `taggerEmail`, `message`, `annotated`, `receivedAt` |
+| `SCMDeleteBranch` | per deleted branch ref | `repoId`, `projectId`, `repoName`, `branch`, `sha` (the old tip), `receivedAt` |
+| `SCMDeleteTag` | per deleted tag ref | `repoId`, `projectId`, `repoName`, `tagName`, `sha` (the old tip), `receivedAt` |
+
+**`projectId` and `repoName` are the address the push arrived on**, echoed and not resolved: the
+public clone url carries both, so the route already holds them when it announces and this host still
+looks nothing up and stores no name. They are **null — omitted from the payload — for a push on the
+id-addressed scheme**, which is qits-projects mirroring history the platform already announced. A
+consumer that needs a name ignores those events. Both keys are additive: an older payload simply has
+neither.
 
 `occurredAt` is `receivedAt` on all four: when this host finished taking the push. A commit's own
 two clocks (`authoredAt`, `committedAt`) are the pusher's and stay in the payload.
@@ -164,7 +194,8 @@ lineage, the retry budget). What this service owns is in
 | `QITS_RESOURCE_DB_URL` / `_USERNAME` / `_PASSWORD` | This service's PostgreSQL database (pack catalog, protection overrides). No defaults — an unset variable fails the boot. |
 | `QITS_RESOURCE_EVENTSTREAM_URL` / `_USERNAME` / `_PASSWORD` | The outbox's own database, from the qits-eventstream jar. |
 | `QITS_EVENTS_URL` | Where qits-events answers. Scheme, host and port, no path. |
-| `QITS_PROJECTS_NAME_RESOLVER_URL` | Where qits-projects resolves a repository name. No default; unset means the name-addressed scheme 404s. |
+| `QITS_PROJECTS_NAME_RESOLVER_URL` | Where qits-projects resolves a repository name. No default; unset means the name-addressed scheme 404s — which is every public clone url, so a real deployment sets it. |
+| `QITS_GITHOST_STORAGE_CLIENT` | The client id whose self-role (`clients/<value>`) opens the id-addressed scheme. Set it to qits-projects' service client and nothing else opens those routes — not `qits:admin`, not `qits:system`. Unset (shipped) leaves the scheme exactly as it was. |
 | `QITS_REPOSITORIES_GIT_PROTECT_DEFAULT_BRANCH` | The default branch's seatbelt. Ships `false`. |
 | `QITS_REPOSITORIES_GIT_PUSH_TOKEN` | What `-o qits.token=<value>` must match. No default: unset means no token matches. |
 | `QITS_REPOSITORIES_GIT_MAX_PACK_SIZE` | The largest push this host accepts. Ships `64M`. |

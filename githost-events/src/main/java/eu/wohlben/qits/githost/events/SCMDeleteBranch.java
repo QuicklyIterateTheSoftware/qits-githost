@@ -18,9 +18,19 @@ import java.util.UUID;
  *
  * <p>There is no {@code suppressCi} here and that is deliberate: {@code -o qits.no-ci} is about not
  * starting a build for pushed work, and a deletion starts none.
+ *
+ * <p>{@code projectId} and {@code repoName} are the address the push arrived on, echoed and not
+ * resolved, and null for a push on the internal {@code /git/<storageId>} scheme — see {@link
+ * SCMPublishCommit} for the whole of that rule.
  */
 public record SCMDeleteBranch(
-    UUID eventId, String repoId, String branch, String sha, Instant receivedAt)
+    UUID eventId,
+    String repoId,
+    String projectId,
+    String repoName,
+    String branch,
+    String sha,
+    Instant receivedAt)
     implements QitsEvent {
 
   public SCMDeleteBranch {
@@ -30,8 +40,14 @@ public record SCMDeleteBranch(
   }
 
   /** The constructor a publisher uses: the facts, with the identity taken care of. */
-  public SCMDeleteBranch(String repoId, String branch, String sha, Instant receivedAt) {
-    this(null, repoId, branch, sha, receivedAt);
+  public SCMDeleteBranch(
+      String repoId,
+      String projectId,
+      String repoName,
+      String branch,
+      String sha,
+      Instant receivedAt) {
+    this(null, repoId, projectId, repoName, branch, sha, receivedAt);
   }
 
   @Override

@@ -2,6 +2,7 @@ package eu.wohlben.qits.githost;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -26,9 +27,11 @@ import org.junit.jupiter.api.Test;
  * HttpServer}, the {@code StubIntake} / {@code StubNpmRegistry} idiom — there is no network here, and
  * a test that reached a real qits-projects would pass or fail for reasons unrelated to this code.
  *
- * <p>Every failure case asserts {@code Optional.empty()} rather than an exception, because that is
- * the port's whole contract: {@code GitHostRoutes} has no exception clause, so a throw here would be
- * a 500 where a 404 is owed.
+ * <p><b>The two answers this adapter must never blur.</b> A 404 from qits-projects is empty — the
+ * question was answered and the answer is "no such name", which the routes report as a 404. Anything
+ * else that stops the question being answered throws {@link RepositoryNameResolver.Unavailable}, and
+ * the routes report 503. An outage answered empty is {@code fe26a6c} again: a git client caches a
+ * 404 as "this repository is gone".
  */
 class HttpRepositoryNameResolverTest {
 
@@ -99,32 +102,43 @@ class HttpRepositoryNameResolverTest {
 
   @Test
   void anUnknownNameIsEmpty() {
+    // The one negative answer that is an ANSWER: qits-projects looked and there is no such name.
     status = 404;
     body = "";
     assertEquals(Optional.empty(), resolver(base).resolveRepositoryId("p-7", "nope"));
   }
 
   @Test
-  void aBrokenAnswerIsEmptyRatherThanAThrow() {
+  void aBrokenAnswerThrowsRatherThanReadingAsAMiss() {
+    // None of these three is qits-projects saying "no such name": a 500 is a fault, and a 200 whose
+    // body carries no id is an answer this adapter cannot read. Reported as an outage, they become a
+    // 503 the caller retries; reported as empty, they become a 404 the caller believes.
     status = 500;
     body = "not json at all";
-    assertEquals(Optional.empty(), resolver(base).resolveRepositoryId("p-7", "testing-repo"));
+    assertThrows(
+        RepositoryNameResolver.Unavailable.class,
+        () -> resolver(base).resolveRepositoryId("p-7", "testing-repo"));
 
     status = 200;
     body = "{\"unexpected\":true}";
-    assertEquals(Optional.empty(), resolver(base).resolveRepositoryId("p-7", "testing-repo"));
+    assertThrows(
+        RepositoryNameResolver.Unavailable.class,
+        () -> resolver(base).resolveRepositoryId("p-7", "testing-repo"));
 
     body = "}{ garbage";
-    assertEquals(Optional.empty(), resolver(base).resolveRepositoryId("p-7", "testing-repo"));
+    assertThrows(
+        RepositoryNameResolver.Unavailable.class,
+        () -> resolver(base).resolveRepositoryId("p-7", "testing-repo"));
   }
 
   @Test
-  void anUnreachableUpstreamIsEmptyAndBounded() {
+  void anUnreachableUpstreamThrowsAndIsBounded() {
     long startedAt = System.nanoTime();
-    assertEquals(
-        Optional.empty(),
-        resolver("http://localhost:1/projects/api/projects")
-            .resolveRepositoryId("p-7", "testing-repo"));
+    assertThrows(
+        RepositoryNameResolver.Unavailable.class,
+        () ->
+            resolver("http://localhost:1/projects/api/projects")
+                .resolveRepositoryId("p-7", "testing-repo"));
     Duration took = Duration.ofNanos(System.nanoTime() - startedAt);
     assertTrue(
         took.compareTo(HttpRepositoryNameResolver.REQUEST_TIMEOUT) <= 0,

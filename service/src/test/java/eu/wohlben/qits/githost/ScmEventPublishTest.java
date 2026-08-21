@@ -1,6 +1,7 @@
 package eu.wohlben.qits.githost;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -62,6 +63,9 @@ public class ScmEventPublishTest {
 
   @Inject GitRepositoryProvider repositories;
 
+  /** The alias table, so a push can arrive on the public {@code /git/<project>/<name>} url. */
+  @Inject FakeRepositoryNameResolver repositoryNames;
+
   /**
    * The outbox is read through its OWN persistence unit's EntityManager rather than through
    * Panache's static methods: {@code OutboxEvent} arrives from the qits-eventstream jar, and a
@@ -101,6 +105,57 @@ public class ScmEventPublishTest {
     assertTrue(published.payload.contains("\"authorEmail\":\"qits@local\""), published.payload);
     assertTrue(published.payload.contains("\"parents\":["), published.payload);
     assertNotNull(published.occurredAt);
+  }
+
+  @Test
+  public void aNameAddressedPushEchoesTheAddressOntoItsEvents() throws Exception {
+    // The trick this whole campaign rests on: the public clone url IS (projectId, repoName), so the
+    // route holds both coordinates when the push lands and the event carries them without this host
+    // resolving, storing or knowing anything about names.
+    String projectId = UUID.randomUUID().toString();
+    String repoId = GitHostFixture.seedOrigin(repositories, gitBase);
+    repositoryNames.register(projectId, "testing-repo", repoId);
+    String address = projectId + "/testing-repo";
+    Path clone = GitHostFixture.clone(gitBase, address);
+    forgetPreviousPublishes();
+
+    GitHostFixture.commitFile(clone, "named.txt", "pushed by name\n", "named");
+    String tagObject = GitHostFixture.tagObject(clone, "v2026.821.1", "release");
+    GitHostFixture.git(
+        clone,
+        "git",
+        "push",
+        "--atomic",
+        "origin",
+        "HEAD:refs/heads/main",
+        tagObject + ":refs/tags/v2026.821.1");
+
+    OutboxEvent commit = only("SCMPublishCommit");
+    assertTrue(commit.payload.contains("\"projectId\":\"" + projectId + "\""), commit.payload);
+    assertTrue(commit.payload.contains("\"repoName\":\"testing-repo\""), commit.payload);
+    assertTrue(commit.payload.contains("\"repoId\":\"" + repoId + "\""), commit.payload);
+
+    OutboxEvent tag = only("SCMPublishTag");
+    assertTrue(tag.payload.contains("\"projectId\":\"" + projectId + "\""), tag.payload);
+    assertTrue(tag.payload.contains("\"repoName\":\"testing-repo\""), tag.payload);
+  }
+
+  @Test
+  public void anIdAddressedPushAnnouncesWithNoNameFieldsAtAll() throws Exception {
+    // The internal scheme is qits-projects' mirror syncing history the platform already announced
+    // under its public name. The push is real, the event is owed, and inventing a name for it would
+    // be worse than leaving the two keys out.
+    String repoId = GitHostFixture.seedOrigin(repositories, gitBase);
+    Path clone = GitHostFixture.clone(gitBase, repoId);
+    forgetPreviousPublishes();
+
+    GitHostFixture.commitFile(clone, "mirrored.txt", "pushed by id\n", "mirrored");
+    GitHostFixture.git(clone, "git", "push", "origin", "main");
+
+    OutboxEvent published = only("SCMPublishCommit");
+    assertFalse(published.payload.contains("projectId"), published.payload);
+    assertFalse(published.payload.contains("repoName"), published.payload);
+    assertTrue(published.payload.contains("\"repoId\":\"" + repoId + "\""), published.payload);
   }
 
   @Test

@@ -3,6 +3,7 @@ package eu.wohlben.qits.githost.events;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -33,6 +34,8 @@ class ScmEventsTest {
   private static SCMPublishCommit aCommit() {
     return new SCMPublishCommit(
         "qits-githost",
+        "qits",
+        "qits-githost-repo",
         "main",
         "1111111111111111111111111111111111111111",
         "2222222222222222222222222222222222222222",
@@ -49,6 +52,8 @@ class ScmEventsTest {
   private static SCMPublishTag anAnnotatedTag() {
     return new SCMPublishTag(
         "qits-githost",
+        "qits",
+        "qits-githost-repo",
         "v2026.810.1",
         "3333333333333333333333333333333333333333",
         "2222222222222222222222222222222222222222",
@@ -65,8 +70,8 @@ class ScmEventsTest {
         List.of(
             aCommit(),
             anAnnotatedTag(),
-            new SCMDeleteBranch("r", "feature/x", "44", RECEIVED),
-            new SCMDeleteTag("r", "v1", "55", RECEIVED))) {
+            new SCMDeleteBranch("r", "p", "n", "feature/x", "44", RECEIVED),
+            new SCMDeleteTag("r", "p", "n", "v1", "55", RECEIVED))) {
       assertEquals(event.getClass().getSimpleName(), event.signature());
       assertEquals(event.signature(), event.name());
     }
@@ -108,9 +113,67 @@ class ScmEventsTest {
             + "\"message\":\"Serve one file without cloning\","
             + "\"oldSha\":\"1111111111111111111111111111111111111111\","
             + "\"parents\":[\"1111111111111111111111111111111111111111\"],"
+            + "\"projectId\":\"qits\","
             + "\"receivedAt\":\"2026-08-10T09:02:03Z\",\"repoId\":\"qits-githost\","
+            + "\"repoName\":\"qits-githost-repo\","
             + "\"sha\":\"2222222222222222222222222222222222222222\",\"suppressCi\":false}",
         json.get("payload").asText());
+  }
+
+  @Test
+  void thePushAddressRidesEveryEventAndIsAbsentWhenTheIdSchemeWasUsed() {
+    // The trick that keeps this host domain-free: the public clone url is /git/<projectId>/<repoName>
+    // and the route echoes both onto the event, resolving nothing. A push on the internal
+    // /git/<storageId> scheme legitimately has neither — qits-projects mirroring history the
+    // platform already announced — and the payload then simply omits the two keys, which is the
+    // shape an older consumer already reads.
+    assertEquals("qits", aCommit().projectId());
+    assertEquals("qits-githost-repo", aCommit().repoName());
+    assertEquals("qits", anAnnotatedTag().projectId());
+
+    for (QitsEvent addressed :
+        List.of(
+            aCommit(),
+            anAnnotatedTag(),
+            new SCMDeleteBranch("r", "qits", "n", "feature/x", "44", RECEIVED),
+            new SCMDeleteTag("r", "qits", "n", "v1", "55", RECEIVED))) {
+      String payload = CanonicalJson.payload(addressed);
+      assertTrue(payload.contains("\"projectId\":\"qits\""), payload);
+      assertTrue(payload.contains("\"repoName\":\"n\"") || payload.contains("\"repoName\":\"qits-githost-repo\""), payload);
+    }
+
+    for (QitsEvent unaddressed :
+        List.of(
+            new SCMPublishCommit(
+                "r", null, null, "main", "old", "new", List.of("old"), "q", "q@l", AUTHORED,
+                COMMITTED, "mirror", false, RECEIVED),
+            new SCMPublishTag(
+                "r", null, null, "v1", "abc", "abc", null, null, null, false, RECEIVED),
+            new SCMDeleteBranch("r", null, null, "feature/x", "44", RECEIVED),
+            new SCMDeleteTag("r", null, null, "v1", "55", RECEIVED))) {
+      String payload = CanonicalJson.payload(unaddressed);
+      assertFalse(payload.contains("projectId"), payload);
+      assertFalse(payload.contains("repoName"), payload);
+    }
+  }
+
+  @Test
+  void aConsumerReadsThePushAddressBackOutOfThePayload() {
+    SCMPublishCommit commit =
+        CanonicalJson.payloadTo(CanonicalJson.payload(aCommit()), SCMPublishCommit.class);
+    assertEquals("qits", commit.projectId());
+    assertEquals("qits-githost-repo", commit.repoName());
+
+    // The older shape, which carried neither key: it must still bind, with both fields null. That is
+    // what makes this addition additive for a consumer replaying its history.
+    SCMDeleteBranch old =
+        CanonicalJson.payloadTo(
+            "{\"branch\":\"feature/x\",\"receivedAt\":\"2026-08-10T09:02:03Z\",\"repoId\":\"r\","
+                + "\"sha\":\"44\"}",
+            SCMDeleteBranch.class);
+    assertEquals("feature/x", old.branch());
+    assertNull(old.projectId());
+    assertNull(old.repoName());
   }
 
   @Test
@@ -129,8 +192,8 @@ class ScmEventsTest {
   void aRootCommitSaysItHasNoParentsRatherThanOmittingTheKey() {
     SCMPublishCommit root =
         new SCMPublishCommit(
-            "r", "main", "0".repeat(40), "abc", null, "q", "q@l", AUTHORED, COMMITTED, "seed",
-            false, RECEIVED);
+            "r", "qits", "n", "main", "0".repeat(40), "abc", null, "q", "q@l", AUTHORED,
+            COMMITTED, "seed", false, RECEIVED);
 
     assertEquals(List.of(), root.parents());
     assertTrue(CanonicalJson.payload(root).contains("\"parents\":[]"));
@@ -139,7 +202,8 @@ class ScmEventsTest {
   @Test
   void aLightweightTagOmitsTheTaggerRatherThanNullingIt() {
     SCMPublishTag lightweight =
-        new SCMPublishTag("r", "v1", "abc", "abc", null, null, null, false, RECEIVED);
+        new SCMPublishTag(
+            "r", "qits", "n", "v1", "abc", "abc", null, null, null, false, RECEIVED);
 
     String payload = CanonicalJson.payload(lightweight);
 
@@ -168,14 +232,16 @@ class ScmEventsTest {
 
     SCMDeleteBranch deletedBranch =
         CanonicalJson.payloadTo(
-            CanonicalJson.payload(new SCMDeleteBranch("r", "feature/x", "44", RECEIVED)),
+            CanonicalJson.payload(
+                new SCMDeleteBranch("r", "qits", "n", "feature/x", "44", RECEIVED)),
             SCMDeleteBranch.class);
     assertEquals("feature/x", deletedBranch.branch());
     assertEquals("44", deletedBranch.sha());
 
     SCMDeleteTag deletedTag =
         CanonicalJson.payloadTo(
-            CanonicalJson.payload(new SCMDeleteTag("r", "v1", "55", RECEIVED)), SCMDeleteTag.class);
+            CanonicalJson.payload(new SCMDeleteTag("r", "qits", "n", "v1", "55", RECEIVED)),
+            SCMDeleteTag.class);
     assertEquals("v1", deletedTag.tagName());
     assertEquals("55", deletedTag.sha());
   }
@@ -186,8 +252,8 @@ class ScmEventsTest {
     // projects one. The option is data now, so a third consumer can have its own opinion.
     SCMPublishCommit suppressed =
         new SCMPublishCommit(
-            "r", "main", "old", "new", List.of("old"), "q", "q@l", AUTHORED, COMMITTED, "import",
-            true, RECEIVED);
+            "r", "qits", "n", "main", "old", "new", List.of("old"), "q", "q@l", AUTHORED,
+            COMMITTED, "import", true, RECEIVED);
 
     assertTrue(suppressed.suppressCi());
     assertTrue(CanonicalJson.payload(suppressed).contains("\"suppressCi\":true"));

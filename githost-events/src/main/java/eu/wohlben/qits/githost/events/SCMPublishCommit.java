@@ -36,6 +36,15 @@ import java.util.UUID;
  * when the commit was authored or made. Those two are the pusher's clock and are in the payload
  * where a consumer can read them; the event log is ordered by when the platform learned.
  *
+ * <p><b>{@code projectId} and {@code repoName} are the address the push arrived on</b>, echoed
+ * rather than resolved. The public clone url is {@code /git/<projectId>/<repoName>}, so the route
+ * already holds both coordinates when it announces — the git host looks nothing up, stores no name
+ * and learns no domain. Both are <b>null</b> for a push on the internal {@code /git/<storageId>}
+ * scheme (qits-projects' own mirror syncs): a consumer that needs a name ignores those events, and
+ * one written against the older shape reads the payload as JSON and sees two keys it does not know.
+ *
+ * <p>{@code repoId} stays what it always was — the opaque storage id — and is never displayed.
+ *
  * <p>{@code eventId} is a component and is generated when absent, which gives the idempotent {@code
  * PUT} the stable key a retry rests on. It never reaches the payload: {@code CanonicalJson}
  * excludes everything {@link QitsEvent} declares.
@@ -43,6 +52,8 @@ import java.util.UUID;
 public record SCMPublishCommit(
     UUID eventId,
     String repoId,
+    String projectId,
+    String repoName,
     String branch,
     String oldSha,
     String sha,
@@ -68,6 +79,8 @@ public record SCMPublishCommit(
   /** The constructor a publisher uses: the facts, with the identity taken care of. */
   public SCMPublishCommit(
       String repoId,
+      String projectId,
+      String repoName,
       String branch,
       String oldSha,
       String sha,
@@ -82,6 +95,8 @@ public record SCMPublishCommit(
     this(
         null,
         repoId,
+        projectId,
+        repoName,
         branch,
         oldSha,
         sha,

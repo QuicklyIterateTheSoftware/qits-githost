@@ -461,6 +461,175 @@ public class GitHostTest {
         .statusCode(Response.Status.OK.getStatusCode());
   }
 
+  // --- content reads, name-addressed -------------------------------------------------------------
+  // The public spelling of the same two routes: qits-ci reads a pipeline config and qits-deployments
+  // a deploy spec, and neither of them holds a storage id any more.
+
+  @Test
+  public void aBlobAndATreeAreServedByProjectAndName() throws Exception {
+    String projectId = UUID.randomUUID().toString();
+    String repoId = contentOrigin();
+    String head = refSha(repoId, "refs/heads/main");
+    repositoryNames.register(projectId, "testing-repo", repoId);
+
+    byte[] blob =
+        given()
+            .when()
+            .get("/git/" + projectId + "/testing-repo/blob/main/pipeline.yml")
+            .then()
+            .statusCode(Response.Status.OK.getStatusCode())
+            .contentType(containsString("application/octet-stream"))
+            .header("Git-Commit-Sha", equalTo(head))
+            .extract()
+            .asByteArray();
+    assertEquals("steps: []\n", new String(blob, StandardCharsets.UTF_8));
+
+    // A .git suffix on the name segment resolves here exactly as it does on a clone.
+    given()
+        .when()
+        .get("/git/" + projectId + "/testing-repo.git/blob/" + head + "/docs/guide.md")
+        .then()
+        .statusCode(Response.Status.OK.getStatusCode())
+        .header("Git-Commit-Sha", equalTo(head));
+
+    given()
+        .when()
+        .get("/git/" + projectId + "/testing-repo/tree/main")
+        .then()
+        .statusCode(Response.Status.OK.getStatusCode())
+        .contentType(containsString("application/json"))
+        .header("Git-Commit-Sha", equalTo(head))
+        .body("entries.name", hasItems("README.md", "docs", "pipeline.yml"));
+
+    given()
+        .when()
+        .get("/git/" + projectId + "/testing-repo/tree/" + head + "/docs/")
+        .then()
+        .statusCode(Response.Status.OK.getStatusCode())
+        .body("entries[0].name", equalTo("guide.md"));
+  }
+
+  @Test
+  public void aNameAddressedContentReadOfAnUnknownNameIs404() throws Exception {
+    String projectId = UUID.randomUUID().toString();
+    given()
+        .when()
+        .get("/git/" + projectId + "/no-such-name/blob/main/pipeline.yml")
+        .then()
+        .statusCode(Response.Status.NOT_FOUND.getStatusCode());
+    given()
+        .when()
+        .get("/git/" + projectId + "/no-such-name/tree/main")
+        .then()
+        .statusCode(Response.Status.NOT_FOUND.getStatusCode());
+  }
+
+  @Test
+  public void bothReadingsOfTheOverlappingShapeAreServed() throws Exception {
+    // /git/A/blob/blob/<rev>/<path> is the one shape both content schemes match: a NAME-addressed
+    // read of a repository called `blob`, and an id-addressed read at a revision called `blob`. The
+    // name routes are registered first and hand the request down when the name does not resolve, so
+    // neither reading is unreachable. The same argument for tree, one segment shorter.
+    String projectId = UUID.randomUUID().toString();
+    String named = seedOrigin();
+    Path clone = GitHostFixture.clone(gitBase, named);
+    GitHostFixture.commitFile(clone, "in-blob.txt", "inside the repo called blob\n", "blob repo");
+    GitHostFixture.git(clone, "git", "push", "origin", "main");
+    repositoryNames.register(projectId, "blob", named);
+    repositoryNames.register(projectId, "tree", named);
+
+    byte[] byName =
+        given()
+            .when()
+            .get("/git/" + projectId + "/blob/blob/main/in-blob.txt")
+            .then()
+            .statusCode(Response.Status.OK.getStatusCode())
+            .extract()
+            .asByteArray();
+    assertEquals("inside the repo called blob\n", new String(byName, StandardCharsets.UTF_8));
+
+    given()
+        .when()
+        .get("/git/" + projectId + "/tree/tree/main")
+        .then()
+        .statusCode(Response.Status.OK.getStatusCode())
+        .body("entries.name", hasItems("in-blob.txt"));
+
+    // The id reading of the very same shape — five segments, `blob` twice: a repository whose
+    // BRANCH is called blob, read at a two-segment path. The name routes match it first, find no
+    // such name and hand it down, which is the whole of the mechanism.
+    String byId = contentOrigin();
+    Path other = GitHostFixture.clone(gitBase, byId);
+    GitHostFixture.git(other, "git", "switch", "-q", "-c", "blob");
+    GitHostFixture.commitFile(other, "on-blob.txt", "on a branch called blob\n", "blob branch");
+    GitHostFixture.git(other, "git", "push", "origin", "blob");
+
+    byte[] atRevBlob =
+        given()
+            .when()
+            .get("/git/" + byId + "/blob/blob/docs/guide.md")
+            .then()
+            .statusCode(Response.Status.OK.getStatusCode())
+            .extract()
+            .asByteArray();
+    assertEquals("guide\n", new String(atRevBlob, StandardCharsets.UTF_8));
+
+    // And its tree counterpart, four segments with `tree` twice: a directory listed at a branch
+    // called tree.
+    GitHostFixture.git(other, "git", "switch", "-q", "-c", "tree");
+    GitHostFixture.git(other, "git", "push", "origin", "tree");
+    given()
+        .when()
+        .get("/git/" + byId + "/tree/tree/docs")
+        .then()
+        .statusCode(Response.Status.OK.getStatusCode())
+        .body("entries[0].name", equalTo("guide.md"));
+  }
+
+  @Test
+  public void aResolverOutageIs503AndAMissIsStill404() throws Exception {
+    // fe26a6c on this seam: a git client records a 404 as "this repository is gone" and stops, so a
+    // qits-projects that could not be asked must never produce one. Every name-addressed route
+    // answers 503 instead — and the miss, which IS an answer, stays a 404.
+    String projectId = UUID.randomUUID().toString();
+    String repoId = contentOrigin();
+    repositoryNames.register(projectId, "testing-repo", repoId);
+    repositoryNames.beUnavailable(true);
+
+    for (String path :
+        new String[] {
+          "/git/" + projectId + "/testing-repo/info/refs?service=git-upload-pack",
+          "/git/" + projectId + "/testing-repo/blob/main/pipeline.yml",
+          "/git/" + projectId + "/testing-repo/tree/main",
+          "/git/" + projectId + "/testing-repo/tree/main/docs"
+        }) {
+      given()
+          .when()
+          .get(path)
+          .then()
+          .statusCode(Response.Status.SERVICE_UNAVAILABLE.getStatusCode());
+    }
+    given()
+        .when()
+        .post("/git/" + projectId + "/testing-repo/git-upload-pack")
+        .then()
+        .statusCode(Response.Status.SERVICE_UNAVAILABLE.getStatusCode());
+
+    // The id-addressed scheme reads no name, so it is untouched by the outage.
+    given()
+        .when()
+        .get("/git/" + repoId + "/blob/main/pipeline.yml")
+        .then()
+        .statusCode(Response.Status.OK.getStatusCode());
+
+    repositoryNames.beUnavailable(false);
+    given()
+        .when()
+        .get("/git/" + projectId + "/nothing-here/info/refs?service=git-upload-pack")
+        .then()
+        .statusCode(Response.Status.NOT_FOUND.getStatusCode());
+  }
+
   @Test
   public void aRepositoryCalledBlobIsStillClonableByName() throws Exception {
     // The one request shape the content routes and the name-addressed scheme both match:

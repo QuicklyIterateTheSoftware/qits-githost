@@ -22,12 +22,18 @@ import java.util.UUID;
  * therefore <b>null for a lightweight tag</b>, which has none. A null field is omitted from the
  * canonical payload rather than written as an explicit null.
  *
+ * <p>{@code projectId} and {@code repoName} are the address the push arrived on, echoed and not
+ * resolved, and null for a push on the internal {@code /git/<storageId>} scheme — see {@link
+ * SCMPublishCommit} for the whole of that rule.
+ *
  * <p>{@code occurredAt} is {@code receivedAt}, the moment this host finished taking the push — see
  * {@link SCMPublishCommit} for why the log is ordered by the platform's clock and not the pusher's.
  */
 public record SCMPublishTag(
     UUID eventId,
     String repoId,
+    String projectId,
+    String repoName,
     String tagName,
     String sha,
     String targetSha,
@@ -47,6 +53,8 @@ public record SCMPublishTag(
   /** The constructor a publisher uses: the facts, with the identity taken care of. */
   public SCMPublishTag(
       String repoId,
+      String projectId,
+      String repoName,
       String tagName,
       String sha,
       String targetSha,
@@ -58,6 +66,8 @@ public record SCMPublishTag(
     this(
         null,
         repoId,
+        projectId,
+        repoName,
         tagName,
         sha,
         targetSha,

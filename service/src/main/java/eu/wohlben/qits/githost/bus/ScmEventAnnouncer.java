@@ -55,10 +55,15 @@ public class ScmEventAnnouncer implements ScmAnnouncer {
   @Override
   @ActivateRequestContext
   public void onPostReceive(
-      String repoId, Repository repo, Collection<ReceiveCommand> commands, boolean suppressCi) {
+      String repoId,
+      String projectId,
+      String repoName,
+      Repository repo,
+      Collection<ReceiveCommand> commands,
+      boolean suppressCi) {
     Instant receivedAt = Instant.now();
     List<QitsEvent> events =
-        PostReceiveEvents.of(repoId, repo, commands, suppressCi, receivedAt);
+        PostReceiveEvents.of(repoId, projectId, repoName, repo, commands, suppressCi, receivedAt);
     for (QitsEvent event : events) {
       bus.publish(event);
     }

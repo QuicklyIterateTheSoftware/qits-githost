@@ -45,6 +45,11 @@ class PostReceiveEventsTest {
   private static final Instant COMMITTED = Instant.parse("2026-08-10T09:01:00Z");
   private static final Instant RECEIVED = Instant.parse("2026-08-10T09:02:03Z");
 
+  /** The address the push arrived on, which every event of it echoes. */
+  private static final String PROJECT = "qits";
+
+  private static final String REPO_NAME = "testing-repo";
+
   private Repository repo;
   private ObjectInserter inserter;
 
@@ -181,7 +186,47 @@ class PostReceiveEventsTest {
     // announcing it would have every consumer act on a push this host rejected.
     refused.setResult(ReceiveCommand.Result.REJECTED_OTHER_REASON, "protected ref");
 
-    assertEquals(List.of(), PostReceiveEvents.of("r", repo, List.of(refused), false, RECEIVED));
+    assertEquals(
+        List.of(),
+        PostReceiveEvents.of("r", "qits", "n", repo, List.of(refused), false, RECEIVED));
+  }
+
+  @Test
+  void everyEventEchoesThePushAddressAndAnIdAddressedPushHasNone() throws Exception {
+    ObjectId head = commit("addressed\n");
+    ObjectId tag = annotatedTag("v1", head, "released");
+    ObjectId gone = commit("gone\n");
+
+    List<QitsEvent> addressed =
+        map(
+            List.of(
+                create("refs/heads/main", head),
+                create("refs/tags/v1", tag),
+                delete("refs/heads/old", gone),
+                delete("refs/tags/v0", gone)),
+            false);
+
+    assertEquals(PROJECT, assertInstanceOf(SCMPublishCommit.class, addressed.get(0)).projectId());
+    assertEquals(REPO_NAME, assertInstanceOf(SCMPublishCommit.class, addressed.get(0)).repoName());
+    assertEquals(PROJECT, assertInstanceOf(SCMPublishTag.class, addressed.get(1)).projectId());
+    assertEquals(REPO_NAME, assertInstanceOf(SCMPublishTag.class, addressed.get(1)).repoName());
+    assertEquals(PROJECT, assertInstanceOf(SCMDeleteBranch.class, addressed.get(2)).projectId());
+    assertEquals(REPO_NAME, assertInstanceOf(SCMDeleteBranch.class, addressed.get(2)).repoName());
+    assertEquals(PROJECT, assertInstanceOf(SCMDeleteTag.class, addressed.get(3)).projectId());
+    assertEquals(REPO_NAME, assertInstanceOf(SCMDeleteTag.class, addressed.get(3)).repoName());
+
+    // The internal scheme: qits-projects mirroring history the platform already announced. The
+    // storage id is still there — it is what was written — and the two name fields are simply
+    // absent rather than guessed at.
+    ReceiveCommand mirrored = create("refs/heads/main", head);
+    mirrored.setResult(ReceiveCommand.Result.OK);
+    SCMPublishCommit event =
+        assertInstanceOf(
+            SCMPublishCommit.class,
+            only(PostReceiveEvents.of("r", null, null, repo, List.of(mirrored), false, RECEIVED)));
+    assertEquals("r", event.repoId());
+    assertNull(event.projectId());
+    assertNull(event.repoName());
   }
 
   @Test
@@ -202,7 +247,7 @@ class PostReceiveEventsTest {
     for (ReceiveCommand command : commands) {
       command.setResult(ReceiveCommand.Result.OK);
     }
-    return PostReceiveEvents.of("r", repo, commands, suppressCi, RECEIVED);
+    return PostReceiveEvents.of("r", PROJECT, REPO_NAME, repo, commands, suppressCi, RECEIVED);
   }
 
   private static QitsEvent only(List<QitsEvent> events) {

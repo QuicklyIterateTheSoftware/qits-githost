@@ -4,6 +4,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Test double for the {@link RepositoryNameResolver} port. In the monorepo the name-addressed
@@ -22,17 +23,32 @@ public class FakeRepositoryNameResolver implements RepositoryNameResolver {
 
   private final Map<String, String> aliases = new ConcurrentHashMap<>();
 
+  private final AtomicBoolean unavailable = new AtomicBoolean();
+
   /** Registers {@code (projectId, name) -> repoId}, the way a repository import would. */
   public void register(String projectId, String name, String repoId) {
     aliases.put(key(projectId, name), repoId);
   }
 
+  /**
+   * Makes every lookup throw, the way an unreachable qits-projects does. The port's two answers are
+   * "no such name" and "could not ask", and only a test that can produce the second proves the
+   * routes tell them apart.
+   */
+  public void beUnavailable(boolean unavailable) {
+    this.unavailable.set(unavailable);
+  }
+
   public void clear() {
     aliases.clear();
+    unavailable.set(false);
   }
 
   @Override
   public Optional<String> resolveRepositoryId(String projectId, String name) {
+    if (unavailable.get()) {
+      throw new Unavailable("the fake resolver is standing in for an unreachable qits-projects");
+    }
     return Optional.ofNullable(aliases.get(key(projectId, name)));
   }
 

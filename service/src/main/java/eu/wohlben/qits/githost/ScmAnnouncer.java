@@ -37,6 +37,11 @@ public interface ScmAnnouncer {
   /**
    * A push landed on {@code repoId}.
    *
+   * @param repoId the opaque storage id the push landed in
+   * @param projectId the project segment of the address the push arrived on, or {@code null} when it
+   *     arrived on the internal id-addressed scheme. <b>Echoed, never resolved</b>: this host looks
+   *     no name up and holds none, it repeats what the pusher addressed.
+   * @param repoName the repository segment of that same address, or {@code null} for the same reason
    * @param repo the repository, open and readable, including the objects this push delivered
    * @param commands every command of the push, <b>including the ones that failed</b> — an
    *     implementation filters on {@link ReceiveCommand#getResult()} itself, because a refused ref
@@ -45,5 +50,10 @@ public interface ScmAnnouncer {
    *     an instruction to act on: what a consumer does about it is the consumer's decision.
    */
   void onPostReceive(
-      String repoId, Repository repo, Collection<ReceiveCommand> commands, boolean suppressCi);
+      String repoId,
+      String projectId,
+      String repoName,
+      Repository repo,
+      Collection<ReceiveCommand> commands,
+      boolean suppressCi);
 }

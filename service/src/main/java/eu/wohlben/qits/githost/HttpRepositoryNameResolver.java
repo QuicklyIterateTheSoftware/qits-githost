@@ -31,11 +31,14 @@ import org.jboss.logging.Logger;
  * name-addressed scheme 404s exactly as it did before this class existed — the same 404 {@link
  * GitHostRoutes#openByName} produces when no resolver bean is present at all.
  *
- * <p><b>It never throws.</b> {@code GitHostRoutes} has no exception clause on this port, so anything
- * escaping here becomes a 500 where the contract promises a 404. A timeout, a refused connection, a
- * non-200 or a body this cannot read are all logged at WARN with the url and answered empty. That is
- * the opposite of the GC pin ports ({@code CdHttpDeploymentPins}, {@code CiHttpDaemonPins}), which
- * throw on purpose because a run that cannot read a pin must delete nothing.
+ * <p><b>A 404 is empty; everything else throws {@link RepositoryNameResolver.Unavailable}.</b> The
+ * two are not the same answer and this adapter must not blur them: qits-projects' 404 means "no
+ * repository under that name", which the routes turn into a 404 a git client caches as fact, while a
+ * timeout, a refused connection, a non-200 or a body this cannot read mean the question was never
+ * answered — a 503. Answering those empty is exactly the shape of {@code fe26a6c}, where an
+ * unreachable database read as "no such repository" and every caller downstream believed it. Same
+ * stance as the GC pin ports ({@code CdHttpDeploymentPins}, {@code CiHttpDaemonPins}), which throw
+ * because a run that cannot read a pin must delete nothing.
  *
  * <p><b>Nothing is cached</b>, for the reason the pin ports state: a rename must not serve a stale
  * id. A cached alias would keep clones flowing to the repository a name used to mean, and this repo
@@ -101,26 +104,30 @@ public class HttpRepositoryNameResolver implements RepositoryNameResolver {
         return Optional.empty();
       }
       if (response.statusCode() != 200) {
-        LOG.warnf("name lookup %s answered %d", url, response.statusCode());
-        return Optional.empty();
+        throw unavailable(url + " answered " + response.statusCode(), null);
       }
       // A JsonNode, never a bound DTO — the wire rule this repo keeps so nothing needs
       // @RegisterForReflection.
       JsonNode body = objectMapper.readTree(response.body());
       JsonNode id = body == null ? null : body.get("repositoryId");
       if (id == null || !id.isTextual() || id.asText().isBlank()) {
-        LOG.warnf("name lookup %s answered a body with no repositoryId", url);
-        return Optional.empty();
+        throw unavailable(url + " answered a body with no repositoryId", null);
       }
       return Optional.of(id.asText());
     } catch (InterruptedException interrupted) {
       Thread.currentThread().interrupt();
-      LOG.warnf("name lookup %s interrupted", url);
-      return Optional.empty();
+      throw unavailable(url + " interrupted", interrupted);
+    } catch (RepositoryNameResolver.Unavailable alreadyReported) {
+      throw alreadyReported;
     } catch (Exception e) {
-      LOG.warnf("name lookup %s failed: %s", url, e.toString());
-      return Optional.empty();
+      throw unavailable(url + " failed: " + e, e);
     }
+  }
+
+  /** One place to log the fault and one shape to report it in. */
+  private static RepositoryNameResolver.Unavailable unavailable(String what, Throwable cause) {
+    LOG.warnf("name lookup %s", what);
+    return new RepositoryNameResolver.Unavailable("name lookup " + what, cause);
   }
 
   /** One path segment. {@code URLEncoder} is form encoding, so its {@code +} needs undoing. */

@@ -45,12 +45,25 @@ import org.jboss.logging.Logger;
  * <p>A ref whose metadata cannot be read produces <b>no event</b> and one warning. That is the
  * conservative direction: an event with invented fields is worse than a missing one, and the miss
  * is visible in a log while a wrong author is not.
+ *
+ * <p>Every event carries the {@link Address} the push arrived on — the storage id it landed in plus,
+ * when the pusher used the public scheme, the {@code (projectId, repoName)} it was addressed by.
+ * Echoed and never resolved: this class asks nobody what a repository is called.
  */
 final class PostReceiveEvents {
 
   private static final Logger LOG = Logger.getLogger(PostReceiveEvents.class);
 
   private PostReceiveEvents() {}
+
+  /**
+   * Where the push landed and how it was addressed.
+   *
+   * @param repoId the opaque storage id — always known, because it is what was written
+   * @param projectId the project segment of the push url, {@code null} on the id-addressed scheme
+   * @param repoName the repository segment of the push url, {@code null} for the same reason
+   */
+  record Address(String repoId, String projectId, String repoName) {}
 
   /**
    * The events for one push, in command order.
@@ -60,14 +73,17 @@ final class PostReceiveEvents {
    */
   static List<QitsEvent> of(
       String repoId,
+      String projectId,
+      String repoName,
       Repository repo,
       Collection<ReceiveCommand> commands,
       boolean suppressCi,
       Instant receivedAt) {
+    Address address = new Address(repoId, projectId, repoName);
     List<QitsEvent> events = new ArrayList<>();
     try (RevWalk walk = new RevWalk(repo)) {
       for (ReceiveCommand command : commands) {
-        QitsEvent event = eventFor(repoId, walk, command, suppressCi, receivedAt);
+        QitsEvent event = eventFor(address, walk, command, suppressCi, receivedAt);
         if (event != null) {
           events.add(event);
         }
@@ -77,7 +93,7 @@ final class PostReceiveEvents {
   }
 
   private static QitsEvent eventFor(
-      String repoId,
+      Address address,
       RevWalk walk,
       ReceiveCommand command,
       boolean suppressCi,
@@ -91,25 +107,37 @@ final class PostReceiveEvents {
       if (ref.startsWith(Constants.R_HEADS)) {
         String branch = ref.substring(Constants.R_HEADS.length());
         return deleted
-            ? new SCMDeleteBranch(repoId, branch, command.getOldId().name(), receivedAt)
-            : publishedCommit(repoId, walk, branch, command, suppressCi, receivedAt);
+            ? new SCMDeleteBranch(
+                address.repoId(),
+                address.projectId(),
+                address.repoName(),
+                branch,
+                command.getOldId().name(),
+                receivedAt)
+            : publishedCommit(address, walk, branch, command, suppressCi, receivedAt);
       }
       if (ref.startsWith(Constants.R_TAGS)) {
         String tagName = ref.substring(Constants.R_TAGS.length());
         return deleted
-            ? new SCMDeleteTag(repoId, tagName, command.getOldId().name(), receivedAt)
-            : publishedTag(repoId, walk, tagName, command, receivedAt);
+            ? new SCMDeleteTag(
+                address.repoId(),
+                address.projectId(),
+                address.repoName(),
+                tagName,
+                command.getOldId().name(),
+                receivedAt)
+            : publishedTag(address, walk, tagName, command, receivedAt);
       }
       return null;
     } catch (Exception e) {
-      LOG.warnf("no event for %s in %s: %s", ref, repoId, e.toString());
+      LOG.warnf("no event for %s in %s: %s", ref, address.repoId(), e.toString());
       return null;
     }
   }
 
   /** The head commit's own facts, read out of the pack that just arrived. */
   private static SCMPublishCommit publishedCommit(
-      String repoId,
+      Address address,
       RevWalk walk,
       String branch,
       ReceiveCommand command,
@@ -124,7 +152,9 @@ final class PostReceiveEvents {
     PersonIdent author = head.getAuthorIdent();
     PersonIdent committer = head.getCommitterIdent();
     return new SCMPublishCommit(
-        repoId,
+        address.repoId(),
+        address.projectId(),
+        address.repoName(),
         branch,
         command.getOldId().name(),
         command.getNewId().name(),
@@ -144,14 +174,16 @@ final class PostReceiveEvents {
    * so rather than leaving a consumer to compare them.
    */
   private static SCMPublishTag publishedTag(
-      String repoId, RevWalk walk, String tagName, ReceiveCommand command, Instant receivedAt)
+      Address address, RevWalk walk, String tagName, ReceiveCommand command, Instant receivedAt)
       throws Exception {
     ObjectId id = command.getNewId();
     RevObject object = walk.parseAny(id);
     if (object instanceof RevTag tag) {
       PersonIdent tagger = tag.getTaggerIdent();
       return new SCMPublishTag(
-          repoId,
+          address.repoId(),
+          address.projectId(),
+          address.repoName(),
           tagName,
           id.name(),
           walk.peel(tag).getId().name(),
@@ -162,6 +194,16 @@ final class PostReceiveEvents {
           receivedAt);
     }
     return new SCMPublishTag(
-        repoId, tagName, id.name(), id.name(), null, null, null, false, receivedAt);
+        address.repoId(),
+        address.projectId(),
+        address.repoName(),
+        tagName,
+        id.name(),
+        id.name(),
+        null,
+        null,
+        null,
+        false,
+        receivedAt);
   }
 }

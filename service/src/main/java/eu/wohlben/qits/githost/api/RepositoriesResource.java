@@ -18,11 +18,17 @@ import org.jboss.logging.Logger;
 /**
  * {@code GET /githost/api/repositories} — the catalogue the git host's own client reads.
  *
- * <p><b>Why this exists beside {@code GET /git}.</b> The git routes are a wire protocol: their
- * prefix is a literal because git owns the spelling, and their listing answers bare ids because
- * qits-ci's trigger engine wants exactly that. This is the browser's surface, under the service's
- * gateway segment with the SPA, and it answers <b>records</b> — so a field can be added here without
- * touching a contract every clone url on the platform depends on.
+ * <p><b>It is a STORAGE view, and the ids it answers are opaque storage keys.</b> This host keys
+ * repositories by the UUID qits-projects mints and holds no name for any of them; the public
+ * identity of a repository is {@code (projectId, repoName)} and lives in qits-projects. So a row
+ * here says what bytes this host holds, and it is <b>not</b> a clone url: {@code
+ * /git/<repoId>} is the internal storage scheme, served to qits-projects' own client. Anything that
+ * wants to name, link to or clone a repository asks qits-projects.
+ *
+ * <p><b>Why this exists beside {@code GET /git}.</b> Both are storage views; that one is a wire the
+ * platform's machines read, with its prefix a literal because git owns the spelling, and this is the
+ * browser's surface, under the service's gateway segment with the SPA. It answers <b>records</b> —
+ * so a field can be added here without touching a contract every machine caller depends on.
  *
  * <p><b>The contract with qits-spa-githost is one field.</b> {@code id} is guaranteed; the client
  * renders whatever else arrives as a label and a value and assumes nothing about it. So a field is

@@ -23,7 +23,9 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
+import java.util.function.Consumer;
 import java.util.zip.GZIPInputStream;
 import org.eclipse.jgit.errors.IncorrectObjectTypeException;
 import org.eclipse.jgit.errors.MissingObjectException;
@@ -69,17 +71,23 @@ import org.jboss.logging.Logger;
  * class for the mechanism, the two push-option bypasses and why they are options rather than
  * headers.
  *
- * <p>Two addressing schemes, both served:
+ * <p>Two addressing schemes, and they are not two ways of saying the same thing:
  *
  * <ul>
- *   <li><b>id-addressed</b> {@code /git/:repoId} — the opaque UUID, handed straight to the
- *       storage (back-compat: already-provisioned containers, metadata, discovery).
- *   <li><b>name-addressed</b> {@code /git/:projectId/:repoName} — a project's
- *       repositories served as siblings, {@code repoName} resolved through the {@link
- *       RepositoryNameResolver} port to a repo id. This is what lets committed relative submodule
- *       urls ({@code ../<name>.git}) resolve natively against a sibling — no {@code
- *       submodule.<name>.url} override. With no resolver on the classpath the scheme answers 404
- *       and only the id-addressed one is served.
+ *   <li><b>name-addressed</b> {@code /git/:projectId/:repoName} — <b>the public clone url</b>, and
+ *       the only address anything above the projects↔githost seam ever holds: CI, the daemons, a
+ *       deploy push, a human. {@code repoName} is resolved through the {@link
+ *       RepositoryNameResolver} port to a storage id, and {@code (projectId, repoName)} is what a
+ *       push then ECHOES onto its events — this host resolves a name per request and remembers
+ *       none. It is also what lets committed relative submodule urls ({@code ../<name>.git}) resolve
+ *       natively against a sibling, with no {@code submodule.<name>.url} override. With no resolver
+ *       on the classpath, or none configured, the scheme answers 404.
+ *   <li><b>id-addressed</b> {@code /git/:repoId} — the opaque storage id, handed straight to the
+ *       store. <b>Internal plumbing for qits-projects</b>, which mints that id and is the one
+ *       service that may speak it; a UUID clone url is never published and never leaks upward. When
+ *       {@code qits.githost.storage-client} names the projects service's client, every route of this
+ *       scheme demands the role {@code clients/<that client>} and nothing else opens it — see
+ *       {@link #storageSchemeRefused}.
  * </ul>
  *
  * <p>The three smart-HTTP endpoints hang off each scheme:
@@ -113,17 +121,20 @@ import org.jboss.logging.Logger;
  * </ul>
  *
  * <p>That listing was withheld on purpose while nothing needed it (the same plan's §2.1, "no
- * enumerate verb"); the decision is reversed rather than left standing, because qits-ci's trigger
- * engine has to enumerate candidates before it can fire an event-triggered pipeline, and a caller
- * that cannot ask has to be told out of band by whoever creates a repository. It is one segment
- * shorter than every route above it, so it shadows none of them.
+ * enumerate verb"); the decision is reversed rather than left standing, because a caller that cannot
+ * ask has to be told out of band by whoever creates a repository. It answers STORAGE ids, so it is
+ * part of the id-addressed scheme and guarded with it — a caller enumerating repositories to act on
+ * them wants qits-projects' listing, which answers names. It is one segment shorter than every route
+ * above it, so it shadows none of them.
  *
- * <p>And two <b>content reads</b>, on the id-addressed base:
+ * <p>And two <b>content reads</b>, served on <b>both</b> schemes:
  *
  * <ul>
- *   <li>{@code GET …/:repoId/blob/:rev/<path>} — the raw bytes at that path in that revision.
- *   <li>{@code GET …/:repoId/tree/:rev[/<path>]} — {@code {"entries":[{"name","type"}]}} for the
- *       directory there; no path is the root tree.
+ *   <li>{@code GET …/:repoId/blob/:rev/<path>} and {@code GET …/:projectId/:repoName/blob/:rev/
+ *       <path>} — the raw bytes at that path in that revision.
+ *   <li>{@code GET …/:repoId/tree/:rev[/<path>]} and {@code GET …/:projectId/:repoName/tree/:rev[/
+ *       <path>]} — {@code {"entries":[{"name","type"}]}} for the directory there; no path is the
+ *       root tree.
  * </ul>
  *
  * <p>The wire protocol has no blob-at-path verb, so a consumer that wanted one file had to keep a
@@ -131,7 +142,8 @@ import org.jboss.logging.Logger;
  * as readily as a branch name — which is what lets a post-receive consumer read the exact pushed
  * commit instead of racing the branch, and both carry the resolved commit in {@value
  * #COMMIT_SHA_HEADER}. They are reads, but follow the same Git HTTP authentication policy as every
- * other route here.
+ * other route here. The name-addressed pair is what lets qits-ci read a pipeline config and
+ * qits-deployments read a deploy spec without ever holding a storage id.
  */
 @ApplicationScoped
 public class GitHostRoutes {
@@ -167,6 +179,14 @@ public class GitHostRoutes {
   private static final String SYSTEM_ROLE = "qits:system";
   private static final String EXTERNAL_GIT_ROLE = "qits:git:external";
   private static final String PUSH_ACCESS_KEY = GitHostRoutes.class.getName() + ".pushAccess";
+
+  /**
+   * The namespace qits-idp mints a client's SELF-ROLE into: every bearer it issues carries {@code
+   * clients/<its own client id>} beside whatever roles that client is configured with. Nobody grants
+   * it, nobody can ask for someone else's, and it names exactly one client — which is what makes it
+   * usable as "this caller IS qits-projects" rather than as another privilege to hand out.
+   */
+  private static final String CLIENT_ROLE_PREFIX = "clients/";
 
   /**
    * The resolved commit, on every content response. <b>Not</b> an {@code X-Qits-} name: qits-gateway
@@ -247,6 +267,27 @@ public class GitHostRoutes {
   @ConfigProperty(name = "qits.repositories.git.max-pack-size", defaultValue = "64M")
   MemorySize maxPackSize;
 
+  /**
+   * The client id whose SELF-ROLE opens the id-addressed scheme — qits-projects' service client, the
+   * one caller with a legitimate reason to speak storage ids. Set it and every id-addressed route
+   * demands {@code clients/<value>} EXCLUSIVELY: {@code qits:admin} and {@code qits:system} do not
+   * open them, so a caller that "just uses the storage url" meets a 403 naming the design instead of
+   * quietly building on an internal address.
+   *
+   * <p><b>Unset is the compat arm and the shipped default</b>: the routes then behave exactly as
+   * they always did, under the class-wide role policy alone. That is what lets the guard land before
+   * qits-idp mints the claim (WP-J) and before a bootstrap wires the key, and it is the kill switch
+   * if the claim ever stops arriving — a live platform is one env removal away from serving again.
+   *
+   * <p>An {@code Optional}, never a {@code String} with an empty default: SmallRye reads a
+   * configured-empty value as <em>absent</em>, so a {@code String} injection of an unset key kills
+   * the packaged binary at boot with "Failed to load config value of type java.lang.String" — the
+   * trap {@code MirrorUpstream.endpointOverride} documents, {@code PackagedProcessIT} caught, and
+   * {@link HttpRepositoryNameResolver#resolverUrl} avoids the same way.
+   */
+  @ConfigProperty(name = "qits.githost.storage-client")
+  Optional<String> storageClient;
+
   @ConfigProperty(name = "qits.bootstrap.ingress.git.enabled", defaultValue = "false")
   boolean bootstrapIngressEnabled;
 
@@ -280,8 +321,16 @@ public class GitHostRoutes {
    */
   @Inject GitRepositoryProvider provider;
 
-  /** A resolved repository plus the id it resolved to (the post-receive hook needs the id). */
-  private record OpenedRepo(String repoId, Repository repo) {}
+  /**
+   * A resolved repository plus <b>the address it was reached by</b>: the storage id the post-receive
+   * hook needs, and the {@code (projectId, repoName)} the request carried when it used the public
+   * scheme.
+   *
+   * <p>The two name fields are {@code null} on the id-addressed scheme, and a push there therefore
+   * announces without them. That is correct rather than a gap: the id scheme is qits-projects'
+   * mirror syncing history the platform has already announced under its public name.
+   */
+  private record OpenedRepo(String repoId, String projectId, String repoName, Repository repo) {}
 
   /**
    * A snapshot of the verified HTTP identity made before Vert.x moves receive-pack work to a worker
@@ -321,56 +370,88 @@ public class GitHostRoutes {
    * same fixed segment preserves that — four path segments against five — and every handler reads
    * its parameters {@link RoutingContext#pathParam(String) by name}, never by position, so nothing
    * here depends on where in the path a parameter happens to sit.
+   *
+   * <p><b>The content reads are the exception, and their order here is load-bearing.</b> They carry
+   * a literal segment ({@code blob}, {@code tree}) and a tail that may hold slashes, so path length
+   * decides nothing: {@code /git/A/blob/B/C…} and {@code /git/P/N/blob/R/C…} are the same shape
+   * whenever the segment that has to be the literal happens to hold it. Exactly two families
+   * overlap, both requiring the literal TWICE — {@code /git/A/blob/blob/…} and {@code
+   * /git/A/tree/tree/…} — plus the clone shape {@code /git/P/<blob|tree>/info/refs}, which is a
+   * repository CALLED blob or tree. So the name-addressed pair is registered FIRST, the public
+   * reading is tried first, and each handler hands the request back to the router when its own
+   * reading finds nothing: the name routes on a resolver MISS (never on an outage), the id routes on
+   * the clone shape ({@link #contentReadIsNotAClone}). Nothing is unreachable because of what it is
+   * called, and no shape is answered by two routes.
    */
   void init(@Observes Router router) {
     // The collection, on the base itself: one segment shorter than every route below, so Vert.x can
     // never dispatch a per-repo request here or a collection request there — the same path-length
     // argument the two addressing schemes rest on. Blocking like the rest, because enumerating is
     // a query against the pack catalog.
-    router.get(BASE).blockingHandler(this::listRepositories);
+    router.get(BASE).handler(this::requireStorageClient).blockingHandler(this::listRepositories);
 
-    router.get(BASE + "/:repoId/info/refs").blockingHandler(rc -> infoRefs(rc, open(rc, "repoId")));
+    router
+        .get(BASE + "/:repoId/info/refs")
+        .handler(this::requireStorageClient)
+        .blockingHandler(rc -> infoRefs(rc, open(rc, "repoId")));
     router
         .post(BASE + "/:repoId/git-upload-pack")
         .handler(packBodyHandler())
+        .handler(this::requireStorageClient)
         .blockingHandler(rc -> service(rc, UPLOAD, open(rc, "repoId")));
     router
         .post(BASE + "/:repoId/git-receive-pack")
         .handler(packBodyHandler())
+        .handler(this::requireStorageClient)
         .handler(this::snapshotPushAccess)
         .blockingHandler(rc -> service(rc, RECEIVE, open(rc, "repoId")));
 
     router
         .put(BASE + "/:repoId")
         .handler(lifecycleBodyHandler())
+        .handler(this::requireStorageClient)
         .blockingHandler(this::createRepository);
-    router.get(BASE + "/:repoId").blockingHandler(this::describeRepository);
-    router.head(BASE + "/:repoId").blockingHandler(this::headRepository);
+    router
+        .get(BASE + "/:repoId")
+        .handler(this::requireStorageClient)
+        .blockingHandler(this::describeRepository);
+    router
+        .head(BASE + "/:repoId")
+        .handler(this::requireStorageClient)
+        .blockingHandler(this::headRepository);
 
-    // The content reads, BEFORE the name-addressed scheme: they carry a literal second segment
-    // (`blob`, `tree`) where that scheme carries a repository NAME, so a project holding a
-    // repository called `blob` is the one place the two overlap — see contentReadIsNotAClone, which
-    // hands that request back to the router rather than answering it. Registered with regexes so
-    // the tail can hold slashes, the MavenPaths/NpmPaths shape: every group is (?<named>…) or
-    // (?:…), because vertx-web silently falls back to positional param0…N when the count disagrees.
-    // The rev group is deliberately LOOSE here and validated in the handler — a malformed rev is a
-    // 400 that says so, not a 404 that sends the caller looking for a repository.
+    // The content reads. Registered with regexes so the tail can hold slashes, the
+    // MavenPaths/NpmPaths shape: every group is (?<named>…) or (?:…), because vertx-web silently
+    // falls back to positional param0…N when the count disagrees. The rev group is deliberately
+    // LOOSE here and validated in the handler — a malformed rev is a 400 that says so, not a 404
+    // that sends the caller looking for a repository.
+    //
+    // NAME-ADDRESSED FIRST: it is the public scheme, and a miss hands the request on rather than
+    // answering it (see the init javadoc for the two shapes that overlap and why length settles
+    // nothing here). The storage-client guard is deliberately NOT a route handler on the two
+    // id-addressed content routes: they carry the clone hand-off, and a guard in front of it would
+    // 403 a name-addressed clone of a repository called `blob` before the hand-off ever ran. It is
+    // checked inside those handlers instead, after the hand-off.
+    router.getWithRegex(namedBlobRoute()).blockingHandler(this::serveBlobByName);
+    router.getWithRegex(namedTreeRoute("")).blockingHandler(this::serveTreeByName);
+    router.getWithRegex(namedTreeRoute("/(?<path>.*)")).blockingHandler(this::serveTreeByName);
+
     router.getWithRegex(blobRoute()).blockingHandler(this::serveBlob);
     router.getWithRegex(treeRoute("")).blockingHandler(this::serveTree);
     router.getWithRegex(treeRoute("/(?<path>.*)")).blockingHandler(this::serveTree);
 
     router
         .get(BASE + "/:projectId/:repoName/info/refs")
-        .blockingHandler(rc -> infoRefs(rc, openByName(rc)));
+        .blockingHandler(rc -> byName(rc, opened -> infoRefs(rc, opened)));
     router
         .post(BASE + "/:projectId/:repoName/git-upload-pack")
         .handler(packBodyHandler())
-        .blockingHandler(rc -> service(rc, UPLOAD, openByName(rc)));
+        .blockingHandler(rc -> byName(rc, opened -> service(rc, UPLOAD, opened)));
     router
         .post(BASE + "/:projectId/:repoName/git-receive-pack")
         .handler(packBodyHandler())
         .handler(this::snapshotPushAccess)
-        .blockingHandler(rc -> service(rc, RECEIVE, openByName(rc)));
+        .blockingHandler(rc -> byName(rc, opened -> service(rc, RECEIVE, opened)));
 
     // No normal deployment enables these routes.  The short-lived bootstrap ingress rewrites only
     // the three smart-HTTP shapes here and carries an opaque capability whose hash, repository,
@@ -392,6 +473,54 @@ public class GitHostRoutes {
           .handler(rc -> snapshotBootstrapPushAccess(rc, credential))
           .blockingHandler(rc -> service(rc, RECEIVE, open(rc, "repoId")));
     }
+  }
+
+  /**
+   * The id-addressed scheme's guard, as a route handler: it either passes the request on or ends it
+   * with a 403 that names the design. Used on every id-addressed route except the two content ones,
+   * which check the same thing inside their handler so the clone hand-off keeps its precedence.
+   */
+  private void requireStorageClient(RoutingContext rc) {
+    if (!storageSchemeRefused(rc)) {
+      rc.next();
+    }
+  }
+
+  /**
+   * Whether this request must be refused because the id-addressed scheme is closed to it, ending the
+   * response with a 403 when it is.
+   *
+   * <p><b>Unset {@code qits.githost.storage-client} means no</b>, always: the scheme then behaves
+   * exactly as it did before this guard existed, which is the arm a live platform runs on until the
+   * cutover.
+   *
+   * <p>Set, it demands the configured client's SELF-ROLE — {@code clients/<value>}, which qits-idp
+   * mints into that client's bearers and nobody else's — and <b>nothing else opens the scheme</b>.
+   * {@code qits:admin} and {@code qits:system} are deliberately not enough: the point is not that
+   * the caller is privileged, it is that the caller IS qits-projects. A storage id is not an address
+   * anything else may hold, and a 403 here is how that stops being advice.
+   *
+   * <p>The role arrives through the ordinary quarkus-oidc groups plumbing, so there is nothing to
+   * parse: the identity either carries it or it does not.
+   */
+  private boolean storageSchemeRefused(RoutingContext rc) {
+    String client = storageClient.map(String::trim).filter(value -> !value.isEmpty()).orElse(null);
+    if (client == null) {
+      return false;
+    }
+    SecurityIdentity identity =
+        rc.user() instanceof QuarkusHttpUser user ? user.getSecurityIdentity() : null;
+    if (identity != null && identity.hasRole(CLIENT_ROLE_PREFIX + client)) {
+      return false;
+    }
+    rc.response()
+        .setStatusCode(403)
+        .end(
+            "/git/<repoId> is qits-githost's internal storage scheme and is served only to "
+                + CLIENT_ROLE_PREFIX
+                + client
+                + ". Clone from /git/<projectId>/<repoName>.");
+    return true;
   }
 
   private void bootstrapPermit(RoutingContext rc, BootstrapIngressCredential credential) {
@@ -514,8 +643,7 @@ public class GitHostRoutes {
         rp.setPostReceiveHook(
             (pack, commands) ->
                 CausationScope.with(
-                    cause,
-                    () -> announce(opened.repoId(), repo, commands, hasNoCiOption(pack))));
+                    cause, () -> announce(opened, repo, commands, hasNoCiOption(pack))));
         rp.receive(in, out, null);
       }
       rc.response()
@@ -597,14 +725,23 @@ public class GitHostRoutes {
    * ReceivePack.receive}, before the response is written, and the refs are already updated by the
    * time it is reached. A push that succeeded must be reported as a success even if nobody could be
    * told about it.
+   *
+   * <p><b>The address travels with the push.</b> {@code opened} carries the {@code (projectId,
+   * repoName)} the pusher used, so an announcer echoes the public identity without asking anyone
+   * what this repository is called — the whole reason the git host can serve names and still hold
+   * no domain. A push on the id-addressed scheme announces both as null.
    */
   private void announce(
-      String repoId, Repository repo, Collection<ReceiveCommand> commands, boolean suppressCi) {
+      OpenedRepo opened,
+      Repository repo,
+      Collection<ReceiveCommand> commands,
+      boolean suppressCi) {
     for (ScmAnnouncer announcer : announcers) {
       try {
-        announcer.onPostReceive(repoId, repo, commands, suppressCi);
+        announcer.onPostReceive(
+            opened.repoId(), opened.projectId(), opened.repoName(), repo, commands, suppressCi);
       } catch (Exception e) {
-        LOG.warnf(e, "post-receive announcement for %s failed", repoId);
+        LOG.warnf(e, "post-receive announcement for %s failed", opened.repoId());
       }
     }
   }
@@ -635,6 +772,25 @@ public class GitHostRoutes {
   }
 
   /**
+   * {@code …/:projectId/:repoName/blob/:rev/<path>} — the public spelling of the blob read, and the
+   * one CI and the deployer use: a pipeline config and a deploy spec are read by name, because
+   * nothing above the projects↔githost seam holds a storage id.
+   *
+   * <p>The two name segments are as loose as the id one is strict, and deliberately: they are lookup
+   * keys handed to the resolver, never paths, and the id the resolver answers with is re-validated
+   * by {@link #open(String)} before it reaches the store. {@code [^/]+} is what keeps them one
+   * segment each.
+   */
+  private static String namedBlobRoute() {
+    return BASE + "/(?<projectId>[^/]+)/(?<repoName>[^/]+)/blob/(?<rev>[^/]+)/(?<path>.+)";
+  }
+
+  /** {@code …/:projectId/:repoName/tree/:rev} plus {@code suffix} — see {@link #treeRoute}. */
+  private static String namedTreeRoute(String suffix) {
+    return BASE + "/(?<projectId>[^/]+)/(?<repoName>[^/]+)/tree/(?<rev>[^/]+)" + suffix;
+  }
+
+  /**
    * {@code GET …/:repoId/blob/:rev/<path>} — the raw bytes at that path in that revision, {@code
    * application/octet-stream}, with the resolved commit in {@value #COMMIT_SHA_HEADER}.
    *
@@ -651,15 +807,9 @@ public class GitHostRoutes {
   private void serveBlob(RoutingContext rc) {
     String rev = decodePercent(rc.pathParam("rev"));
     String path = normalizePath(rc.pathParam("path"));
-    if (contentReadIsNotAClone(rc, rev, path)) {
-      return;
-    }
-    if (!isValidRev(rev)) {
-      rc.response().setStatusCode(400).end("rev must match " + REV_PATTERN);
-      return;
-    }
-    if (!isValidPath(path) || path.isEmpty()) {
-      rc.response().setStatusCode(400).end("path must be a repository-relative file path");
+    if (contentReadIsNotAClone(rc, rev, path)
+        || storageSchemeRefused(rc)
+        || !blobRequestIsWellFormed(rc, rev, path)) {
       return;
     }
     OpenedRepo opened = open(rc.pathParam("repoId"));
@@ -667,6 +817,46 @@ public class GitHostRoutes {
       rc.response().setStatusCode(404).end();
       return;
     }
+    serveBlob(rc, opened, rev, path);
+  }
+
+  /**
+   * {@code GET …/:projectId/:repoName/blob/:rev/<path>} — the same read, addressed the public way.
+   *
+   * <p>Resolution comes BEFORE validation here, unlike the id-addressed handler: a request this
+   * route matched may still be an id-addressed read (the {@code /git/A/blob/blob/…} overlap), and it
+   * only stays this route's once a repository of that name exists. Validating first would answer a
+   * 400 for a rev the other reading never had.
+   */
+  private void serveBlobByName(RoutingContext rc) {
+    OpenedRepo opened = openByNameOrHandOff(rc);
+    if (opened == null) {
+      return;
+    }
+    String rev = decodePercent(rc.pathParam("rev"));
+    String path = normalizePath(rc.pathParam("path"));
+    if (!blobRequestIsWellFormed(rc, rev, path)) {
+      opened.repo().close(); // opened eagerly; nothing below will close it
+      return;
+    }
+    serveBlob(rc, opened, rev, path);
+  }
+
+  /** Whether a blob request is one this route will look up at all; answers the 400 if it is not. */
+  private boolean blobRequestIsWellFormed(RoutingContext rc, String rev, String path) {
+    if (!isValidRev(rev)) {
+      rc.response().setStatusCode(400).end("rev must match " + REV_PATTERN);
+      return false;
+    }
+    if (!isValidPath(path) || path.isEmpty()) {
+      rc.response().setStatusCode(400).end("path must be a repository-relative file path");
+      return false;
+    }
+    return true;
+  }
+
+  /** The blob read itself, once a scheme has resolved the repository. Closes {@code opened}. */
+  private void serveBlob(RoutingContext rc, OpenedRepo opened, String rev, String path) {
     try (Repository repo = opened.repo();
         RevWalk walk = new RevWalk(repo)) {
       RevCommit commit = resolveCommit(repo, walk, rev);
@@ -713,15 +903,9 @@ public class GitHostRoutes {
   private void serveTree(RoutingContext rc) {
     String rev = decodePercent(rc.pathParam("rev"));
     String path = normalizePath(rc.pathParam("path"));
-    if (contentReadIsNotAClone(rc, rev, path)) {
-      return;
-    }
-    if (!isValidRev(rev)) {
-      rc.response().setStatusCode(400).end("rev must match " + REV_PATTERN);
-      return;
-    }
-    if (!isValidPath(path)) {
-      rc.response().setStatusCode(400).end("path must be a repository-relative directory path");
+    if (contentReadIsNotAClone(rc, rev, path)
+        || storageSchemeRefused(rc)
+        || !treeRequestIsWellFormed(rc, rev, path)) {
       return;
     }
     OpenedRepo opened = open(rc.pathParam("repoId"));
@@ -729,6 +913,42 @@ public class GitHostRoutes {
       rc.response().setStatusCode(404).end();
       return;
     }
+    serveTree(rc, opened, rev, path);
+  }
+
+  /**
+   * {@code GET …/:projectId/:repoName/tree/:rev[/<path>]} — the same listing, addressed the public
+   * way. Resolution before validation, for the reason {@link #serveBlobByName} states.
+   */
+  private void serveTreeByName(RoutingContext rc) {
+    OpenedRepo opened = openByNameOrHandOff(rc);
+    if (opened == null) {
+      return;
+    }
+    String rev = decodePercent(rc.pathParam("rev"));
+    String path = normalizePath(rc.pathParam("path"));
+    if (!treeRequestIsWellFormed(rc, rev, path)) {
+      opened.repo().close(); // opened eagerly; nothing below will close it
+      return;
+    }
+    serveTree(rc, opened, rev, path);
+  }
+
+  /** Whether a tree request is one this route will look up at all; answers the 400 if it is not. */
+  private boolean treeRequestIsWellFormed(RoutingContext rc, String rev, String path) {
+    if (!isValidRev(rev)) {
+      rc.response().setStatusCode(400).end("rev must match " + REV_PATTERN);
+      return false;
+    }
+    if (!isValidPath(path)) {
+      rc.response().setStatusCode(400).end("path must be a repository-relative directory path");
+      return false;
+    }
+    return true;
+  }
+
+  /** The tree listing itself, once a scheme has resolved the repository. Closes {@code opened}. */
+  private void serveTree(RoutingContext rc, OpenedRepo opened, String rev, String path) {
     try (Repository repo = opened.repo();
         RevWalk walk = new RevWalk(repo)) {
       RevCommit commit = resolveCommit(repo, walk, rev);
@@ -802,12 +1022,16 @@ public class GitHostRoutes {
    * Hands the request back to the router when it is a name-addressed clone rather than a content
    * read, and reports whether it did.
    *
-   * <p>{@code /git/<projectId>/<repoName>/info/refs} is the one request shape that
-   * matches these routes too — with {@code repoName} spelled {@code blob} or {@code tree}, so
-   * {@code rev} comes out {@code info} and {@code path} {@code refs}. Answering it would make a
-   * repository unclonable because of what it is called, so {@link RoutingContext#next} lets the
-   * name-addressed route have it. Nothing else overlaps: every other route of that scheme is a
-   * POST, and the id-addressed ones differ in segment count.
+   * <p>{@code /git/<projectId>/<repoName>/info/refs} is the one CLONE shape that matches these
+   * routes too — with {@code repoName} spelled {@code blob} or {@code tree}, so {@code rev} comes
+   * out {@code info} and {@code path} {@code refs}. Answering it would make a repository unclonable
+   * because of what it is called, so {@link RoutingContext#next} lets the name-addressed route have
+   * it. Every other route of that scheme is a POST.
+   *
+   * <p>The name-addressed CONTENT reads overlap these routes too, in the {@code /git/A/blob/blob/…}
+   * and {@code /git/A/tree/tree/…} shapes — and they are dealt with at the other end: those routes
+   * are registered first and hand the request down here when the name does not resolve, so there is
+   * nothing left for this check to catch.
    */
   private boolean contentReadIsNotAClone(RoutingContext rc, String rev, String path) {
     if ("info".equals(rev) && "refs".equals(path)) {
@@ -900,9 +1124,10 @@ public class GitHostRoutes {
    * #open(String)} is: an id that is not a valid slug cannot be served by any route on this host, so
    * listing one would advertise a repository no caller could clone.
    *
-   * <p>The class-wide Git HTTP policy applies here too — repo ids are identifiers rather than
-   * UUIDs and the callers are machines on qits-net. A read surface gated on its own would be the
-   * piecemeal machine auth this platform has decided against; qits-platform-idp gates these together.
+   * <p>The class-wide Git HTTP policy applies here, and so does the id-addressed scheme's guard: the
+   * ids this answers are storage keys, so with {@code qits.githost.storage-client} configured the
+   * listing is qits-projects' alone. A caller enumerating repositories to act on them wants
+   * qits-projects' listing, which answers names.
    *
    * <p>An enumeration failure is a 500 by way of {@link #fail}, never an empty list: a trigger
    * engine told "no repositories" stops triggering and reports nothing wrong.
@@ -1092,7 +1317,7 @@ public class GitHostRoutes {
       return null;
     }
     Repository repo = provider.open(repoId);
-    return repo == null ? null : new OpenedRepo(repoId, repo);
+    return repo == null ? null : new OpenedRepo(repoId, null, null, repo);
   }
 
   /**
@@ -1102,6 +1327,12 @@ public class GitHostRoutes {
    * a repo id, then opens that repo through the provider. The path segments are only lookup
    * keys (never filesystem paths), and the resolved id is re-validated by {@link
    * #open(String)}, so traversal is impossible. With no resolver configured this is a 404.
+   *
+   * <p>The address is kept on the result: a push here announces {@code (projectId, repoName)} as the
+   * pusher spelled them, with the {@code .git} suffix stripped — the name a consumer can act on.
+   *
+   * @throws RepositoryNameResolver.Unavailable if the resolver could not answer at all, which the
+   *     callers turn into a 503. A miss is {@code null} and a 404; the two must not be confused.
    */
   private OpenedRepo openByName(RoutingContext rc) {
     String projectId = rc.pathParam("projectId");
@@ -1112,7 +1343,61 @@ public class GitHostRoutes {
     String name =
         repoName.endsWith(".git") ? repoName.substring(0, repoName.length() - 4) : repoName;
     String repoId = repositoryNames.get().resolveRepositoryId(projectId, name).orElse(null);
-    return open(repoId);
+    OpenedRepo opened = open(repoId);
+    return opened == null
+        ? null
+        : new OpenedRepo(opened.repoId(), projectId, name, opened.repo());
+  }
+
+  /**
+   * Runs {@code served} with the name-addressed repository ({@code null} when there is no such
+   * name), or answers 503 when the resolver could not be asked.
+   *
+   * <p>503 rather than 404 is the whole of {@code fe26a6c} restated on this seam: a git client
+   * records a 404 as "this repository does not exist" and stops, while a 503 is a condition it
+   * retries. An outage of qits-projects must not read as every repository on the platform having
+   * been deleted.
+   */
+  private void byName(RoutingContext rc, Consumer<OpenedRepo> served) {
+    OpenedRepo opened;
+    try {
+      opened = openByName(rc);
+    } catch (RepositoryNameResolver.Unavailable e) {
+      resolverUnavailable(rc, e);
+      return;
+    }
+    served.accept(opened);
+  }
+
+  /**
+   * The name-addressed content routes' resolution: the repository, or {@code null} with the request
+   * already dealt with — 503 when the resolver could not answer, and handed back to the router when
+   * it answered "no such name", because an id-addressed content route registered below may still
+   * match this shape (see {@link #init}). A shape neither reading serves ends as the router's own
+   * 404.
+   */
+  private OpenedRepo openByNameOrHandOff(RoutingContext rc) {
+    OpenedRepo opened;
+    try {
+      opened = openByName(rc);
+    } catch (RepositoryNameResolver.Unavailable e) {
+      resolverUnavailable(rc, e);
+      return null;
+    }
+    if (opened == null) {
+      rc.next();
+    }
+    return opened;
+  }
+
+  /** 503, and the reason in the log rather than on the wire. */
+  private void resolverUnavailable(RoutingContext rc, RepositoryNameResolver.Unavailable e) {
+    LOG.warnf(
+        "name-addressed request %s refused: the repository name lookup is unavailable (%s)",
+        rc.request().path(), e.getMessage());
+    rc.response()
+        .setStatusCode(503)
+        .end("the repository name lookup is unavailable; this is not an answer about the name");
   }
 
   private void fail(RoutingContext rc, String service, Exception e) {

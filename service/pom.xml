@@ -156,6 +156,15 @@
             <scope>test</scope>
         </dependency>
         <dependency>
+            <!-- @TestSecurity, which is the only way to put a ROLE on a request in this suite: the
+                 git routes are raw Vert.x and read the identity off the RoutingContext, and the
+                 test profile replaces the path policy with `permit` so every other case can stay
+                 about git semantics. GitHostStorageClientTest is what needs it. -->
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-test-security</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
             <groupId>io.rest-assured</groupId>
             <artifactId>rest-assured</artifactId>
             <scope>test</scope>
