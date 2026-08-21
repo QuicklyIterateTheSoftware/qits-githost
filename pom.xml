@@ -49,12 +49,12 @@
              indexes and reftables in it and uses nothing else it offers.
              PG-ONLY: the store moved its bytes out of the filesystem and into three PostgreSQL
              tables. The campaign has released, so the pin is that calver. -->
-        <qits.blobstore.version>2026.814.71936</qits.blobstore.version>
+        <qits.blobstore.version>2026.818.45340</qits.blobstore.version>
         <!-- The event bus: the outbox, the idempotent PUT, the durable listener. Published by
              libs/qits-eventstream into the platform Maven repository — the same place the blob
              store above and qits-db-core below come from, and why the <repositories> block below
              exists: none of the three is on Maven Central or built in this reactor. -->
-        <qits.eventstream.version>2026.817.202549</qits.eventstream.version>
+        <qits.eventstream.version>2026.818.45652</qits.eventstream.version>
         <!-- Shared OIDC and forwarded-header authentication. -->
         <qits.integrations-quarkus.version>2026.817.175344</qits.integrations-quarkus.version>
         <!-- The platform's datasource resilience, released together out of
