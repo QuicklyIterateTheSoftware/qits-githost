@@ -97,7 +97,17 @@ public class HttpRepositoryNameResolver implements RepositoryNameResolver {
     try {
       HttpResponse<String> response =
           client.send(
-              HttpRequest.newBuilder(URI.create(url)).timeout(REQUEST_TIMEOUT).GET().build(),
+              HttpRequest.newBuilder(URI.create(url))
+                  .timeout(REQUEST_TIMEOUT)
+                  // The by-name endpoint is qits:system. This call stays on qits-net, never
+                  // through the edge, so it presents the forward-auth headers the platform trusts
+                  // in-network — the same pair qits-ci's listing clients send. Without them the
+                  // lookup answers 401, which this resolver reads as an outage (503 to the git
+                  // client), so every name-addressed clone or push is refused.
+                  .header("X-Qits-User", "qits-githost")
+                  .header("X-Qits-Roles", "qits:system")
+                  .GET()
+                  .build(),
               HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
       if (response.statusCode() == 404) {
         // The documented "no such name" answer, not a fault: nothing to log.
