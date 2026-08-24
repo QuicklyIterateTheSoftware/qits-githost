@@ -5,8 +5,10 @@ clone and push over HTTP, qits-ci reads a pipeline config out of one file, qits-
 through it, and a push announces itself to the platform as a durable domain event.
 
 It also serves a page. Since the client landed, this is not a wire-protocol-only service: it carries
-its own Angular SPA at `/githost/` and the REST API that SPA reads at `/githost/api`, in the same
-process and on the same port as the git protocol at `/git`.
+its own Angular SPA — served at `/` on this service's own host, `githost.<env>.<domain>` — and the
+REST API that SPA reads at `/githost/api`, in the same process and on the same port as the git
+protocol at `/git`. Both planes land on the authority every clone url already spells; the edge picks
+the gate per request.
 
 It moved out of `qits-platform-artifacts` with its history (byte-plane-split-plan.md phase 3). A git
 repository is not an artifact — it only shared the blob store's storage layout — and every consumer
@@ -22,15 +24,21 @@ is an env service, so an env-scoped git host is the consistent shape.
 
 ## Addresses
 
-Four surfaces, one port, two prefixes. **`/githost` is this service's gateway segment**; `/git` is an
-extra prefix on the same gateway entry, carried because git itself owns that spelling.
+Four surfaces, one port, one host. **`githost.<env>.<domain>` is this service's own host**, and it
+serves the client at its root. `/githost` stays this service's machine segment and `/git` the wire
+protocol's; the edge path-routes both on every host, so nothing that names them has to move.
 
 | Address | What it is |
 |---|---|
 | `/git/**` | The git wire protocol. Plain Vert.x routes, the prefix a literal in `GitHostRoutes` — git treats the base as opaque, so no config key can move it. |
 | `/githost/api/**` | The REST API (`quarkus.rest.path`), read by the client and by nothing that speaks git. |
-| `/githost/` | The Angular client, built and served by Quinoa out of `service/src/main/webui` (the `qits-spa-githost` submodule). Bare `/githost` with no trailing slash is a 404 — upstream quinoa #960, identical for every client on the platform. |
+| `/` | The Angular client, built and served by Quinoa out of `service/src/main/webui` (the `qits-spa-githost` submodule). The old bare-`/githost` trailing-slash wart (upstream quinoa #960) went with the move to the root. |
 | `/githost/q/**` | Quarkus' non-application root: health, and nothing else here. |
+
+Because the client sits at the root, `/git` and `/bootstrap-git` are inside the SPA fallback's reach
+for the first time. `quarkus.quinoa.ignored-path-prefixes` therefore lists all three absolutely —
+`/githost,/git,/bootstrap-git` — so a mistyped machine path is a 404 rather than a web page a git
+client would read as a ref advertisement.
 
 It **was** `/git/q` for the non-application root, when `/git` was read as the whole segment. The
 health gate in `.config/qits/deployments.yml` moved with it.
@@ -106,9 +114,9 @@ ask.
 ### The client
 
 `service/src/main/webui` is the `qits-spa-githost` submodule, an Angular 21 SPA that Quinoa builds
-during `mvn package` and serves at `/githost/`. Its `baseHref` is `"/githost/"` and it is spelled in
-two repositories — here as `quarkus.quinoa.ui-root-path`, there in `angular.json` — so a mismatch
-serves a page whose every asset 404s. `docs/project-setup-quinoa-angular.md` in the superproject is
+during `mvn package` and serves at `/`. Its `baseHref` is `"/"` and the pairing is spelled in two
+repositories — here as `quarkus.quinoa.ui-root-path`, there in `angular.json` — so a mismatch serves
+a page whose every asset 404s. `docs/project-setup-quinoa-angular.md` in the superproject is
 the doctrine; `application.properties` carries the per-key reasoning.
 
 ## Events
@@ -225,7 +233,7 @@ it.
 reach that registry by no address at all. So the step container builds the bundle first, and the
 image build packages one that already exists — its Quinoa install/ci/build commands are neutered to
 `--version`, and a missing bundle is a red build at a `test -f` guard rather than an image that
-boots and serves `/githost/` as a 404.
+boots and serves `/` as a 404.
 
 `.config/qits/deployments.yml` is the deploy answer: **an environment service** — every tier
 runs its own git host, and a green build deploys into whichever tier listens to the built branch —
@@ -280,9 +288,12 @@ git submodule update --init service/src/main/webui
 ```
 
 `mvn test` alone needs neither node nor the submodule: Quinoa is disabled by default in test mode.
-That is also why no `@QuarkusTest` can prove anything about what `/githost/` serves — only the
-packaged artifact can, and this service needs both its databases to boot, so those probes ride a
-platform bootstrap.
+That is also why no `@QuarkusTest` can prove anything about what `/` serves — only the packaged
+artifact can, and this service needs both its databases to boot, so those probes ride a platform
+bootstrap. After the root-path flip the list to run is: `/` → 200 HTML with `<base href="/">`, a
+deep link → `index.html`, `/githost/api/nope` and `/githost/q/nope` → 404 never HTML, and a mistyped
+`/git/…` or `/bootstrap-git/…` → 404, which is the half the absolute `ignored-path-prefixes` list
+now carries. `/githost/q/health/ready` → UP.
 
 `npm ci` needs the platform's npm registries (localhost:8081 for the `@qits` scope, localhost:8082
 for the npmjs cache — the client's committed `.npmrc`); Quinoa itself reuses the `node_modules` it
