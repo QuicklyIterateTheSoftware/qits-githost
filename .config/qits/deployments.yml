@@ -13,9 +13,20 @@
 # whichever tier listens to the built branch.
 deployment_target: environment
 
-# `/git` is the smart-HTTP protocol address clients require; `/githost` is the browser surface.
+# `/git` is the smart-HTTP protocol address clients require; `/githost` is this service's machine
+# segment — its API at /githost/api and its health at /githost/q. The edge path-routes every
+# application's route prefixes on EVERY host, so both stay reachable wherever a reader is. The
+# browser surface is no longer under either: the client is served at / on this application's own
+# host.
 routes: /githost,/git
-navigation: Githost:9
+
+# WHERE THIS APPLICATION HANGS IN THE SIDEBAR. `system` is the global group — the git host serves
+# every project rather than belonging to one — and 5 is the position inside it, after System:4.
+#
+# The host is not spelled because the derived one is already right: the application name minus its
+# `qits-` prefix is `githost`, which is the label every clone url already carries. The browser plane
+# and the git plane land on the same authority by design, not by accident.
+navigation-entries: system.Githost:5
 
 # TWO DATABASES, because this application opens two datasources with two Flyway lineages.
 # qits-deployments creates a login role and a database for each on the postgres of this tier before
