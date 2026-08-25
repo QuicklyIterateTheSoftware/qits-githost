@@ -2,6 +2,7 @@ package eu.wohlben.qits.githost.api;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import eu.wohlben.qits.githost.GitRepositoryProvider;
+import io.quarkus.runtime.annotations.RegisterForReflection;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.GET;
 import jakarta.ws.rs.Path;
@@ -85,7 +86,14 @@ public class RepositoryBrowseResource {
    * The repository as the browser plane spells it. {@code branches} empty means an empty repository
    * — a freshly provisioned origin has a HEAD naming an unborn branch and nothing else, and the
    * page reads the empty list as "nothing to browse yet" without ever asking for a tree.
+   *
+   * <p><b>Every record below carries {@code @RegisterForReflection}, and it is load-bearing.</b>
+   * These entities travel inside an untyped {@link Response}, so the build-time analysis that
+   * registers a typed signature's return ({@code RepositoriesResource}'s, for instance) never sees
+   * them — and this service ships as a native image, where an unregistered entity is a 500 on
+   * every answer, measured on the 2026.825.141202 deploy while the whole JVM-mode suite was green.
    */
+  @RegisterForReflection
   public record DescribeResponse(String id, String defaultBranch, List<String> branches) {}
 
   /**
@@ -95,6 +103,7 @@ public class RepositoryBrowseResource {
    * show and no tree to descend into on this host. {@code commitSha} is the resolved commit, the
    * natural generation token for anything the client caches.
    */
+  @RegisterForReflection
   public record TreeResponse(String rev, String commitSha, List<String> paths) {}
 
   /**
@@ -102,10 +111,12 @@ public class RepositoryBrowseResource {
    * #MAX_CONTENT_BYTES}; {@code size} is always the blob's real size, so the page can say which. A
    * symlink answers its target string as content — that is what its blob holds.
    */
+  @RegisterForReflection
   @JsonInclude(JsonInclude.Include.NON_NULL)
   public record FileResponse(String path, boolean binary, long size, String content) {}
 
-  record ErrorBody(String error) {}
+  @RegisterForReflection
+  public record ErrorBody(String error) {}
 
   @GET
   public Response describe(@PathParam("repoId") String repoId) {
