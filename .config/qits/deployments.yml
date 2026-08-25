@@ -20,13 +20,17 @@ deployment_target: environment
 # host.
 routes: /githost,/git
 
-# WHERE THIS APPLICATION HANGS IN THE SIDEBAR. `system` is the global group — the git host serves
-# every project rather than belonging to one — and 5 is the position inside it, after System:4.
+# WHERE THIS APPLICATION HANGS IN THE SIDEBAR. `system.Githost` is the global entry — the storage
+# audit at the root serves every project rather than belonging to one — at position 5, after
+# System:4. The six `Code` entries are the per-repository links: one in every category's details
+# slot, so each service, daemon, lib, frontend, cli tool and image offers its committed contents at
+# `/<slug>/<category>/<repo>/` on this host. Position 7 follows the taken 1–6 (Docs, CI, Artifacts,
+# Configuration, Workspaces, Api Docs); no subpath, because the Code page IS the repository root.
 #
 # The host is not spelled because the derived one is already right: the application name minus its
 # `qits-` prefix is `githost`, which is the label every clone url already carries. The browser plane
 # and the git plane land on the same authority by design, not by accident.
-navigation-entries: system.Githost:5
+navigation-entries: system.Githost:5, services.details.Code:7, daemons.details.Code:7, libs.details.Code:7, frontends.details.Code:7, cli.details.Code:7, images.details.Code:7
 
 # TWO DATABASES, because this application opens two datasources with two Flyway lineages.
 # qits-deployments creates a login role and a database for each on the postgres of this tier before
