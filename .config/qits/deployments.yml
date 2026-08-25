@@ -24,13 +24,14 @@ routes: /githost,/git
 # audit at the root serves every project rather than belonging to one — at position 5, after
 # System:4. The six `Code` entries are the per-repository links: one in every category's details
 # slot, so each service, daemon, lib, frontend, cli tool and image offers its committed contents at
-# `/<slug>/<category>/<repo>/` on this host. Position 7 follows the taken 1–6 (Docs, CI, Artifacts,
-# Configuration, Workspaces, Api Docs); no subpath, because the Code page IS the repository root.
+# `/<slug>/<category>/<repo>/` on this host. Position 3 is Code's place in the platform's fixed
+# order of the per-repository applications (Api Docs 1, Docs 2, Code 3, CI 4, Artifacts 5, Configuration 6, Workspaces 7);
+# no subpath, because the Code page IS the repository root.
 #
 # The host is not spelled because the derived one is already right: the application name minus its
 # `qits-` prefix is `githost`, which is the label every clone url already carries. The browser plane
 # and the git plane land on the same authority by design, not by accident.
-navigation-entries: system.Githost:5, services.details.Code:7, daemons.details.Code:7, libs.details.Code:7, frontends.details.Code:7, cli.details.Code:7, images.details.Code:7
+navigation-entries: system.Githost:5, services.details.Code:3, daemons.details.Code:3, libs.details.Code:3, frontends.details.Code:3, cli.details.Code:3, images.details.Code:3
 
 # TWO DATABASES, because this application opens two datasources with two Flyway lineages.
 # qits-deployments creates a login role and a database for each on the postgres of this tier before
