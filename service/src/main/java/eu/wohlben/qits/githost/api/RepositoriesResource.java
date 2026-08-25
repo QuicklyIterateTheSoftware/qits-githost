@@ -121,7 +121,8 @@ public class RepositoriesResource {
 
   /**
    * Logs the cause and answers 500. The cause is logged rather than sent: it names a datasource and
-   * a driver, and this surface is unauthenticated like every other route on this host.
+   * a driver, and this listing is served unauthenticated (the per-repository browse paths beside it
+   * are role-gated — see the {@code githost-browse} policy).
    */
   private ServerErrorException unavailable(String what, Exception cause) {
     LOG.error(what, cause);
