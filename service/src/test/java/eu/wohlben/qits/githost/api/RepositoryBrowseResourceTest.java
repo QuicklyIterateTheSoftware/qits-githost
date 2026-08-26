@@ -9,6 +9,7 @@ import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.nullValue;
 
 import eu.wohlben.qits.githost.GitRepositoryProvider;
+import eu.wohlben.qits.githost.persistence.RepositoryLocStore;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.path.json.JsonPath;
@@ -40,6 +41,7 @@ public class RepositoryBrowseResourceTest {
   static final String API = "/githost/api/repositories/";
 
   @Inject GitRepositoryProvider repositories;
+  @Inject RepositoryLocStore locStore;
 
   @TestHTTPResource("/git")
   URL gitBase;
@@ -79,6 +81,23 @@ public class RepositoryBrowseResourceTest {
         work.resolve("large.txt"),
         "x".repeat(80).concat("\n").repeat((RepositoryBrowseResource.MAX_CONTENT_BYTES / 81) + 42));
     Files.createSymbolicLink(work.resolve("link.txt"), Path.of("README.md"));
+    // The loc summary's fixture: a main/test pair per classification rule, and one file per skip.
+    Files.createDirectories(work.resolve("src/main/java"));
+    Files.createDirectories(work.resolve("src/test/java"));
+    Files.writeString(work.resolve("src/main/java/App.java"), "line\n".repeat(5)); // main by default
+    Files.writeString(
+        work.resolve("src/test/java/AppTest.java"), "line\n".repeat(9)); // test by segment
+    Files.createDirectories(work.resolve("web"));
+    Files.writeString(work.resolve("web/thing.ts"), "line\n".repeat(3)); // main by default
+    Files.writeString(work.resolve("web/thing.spec.ts"), "line\n".repeat(4)); // test by suffix
+    // A mapped extension past the cap: SQL must stay out of the summary entirely.
+    Files.writeString(
+        work.resolve("big.sql"),
+        "x".repeat(80).concat("\n").repeat((RepositoryBrowseResource.MAX_CONTENT_BYTES / 81) + 42));
+    // A mapped extension holding binary bytes: CSS must stay out too.
+    Files.write(work.resolve("art.css"), new byte[] {0x00, 0x01, 0x02, (byte) 0xff, 0x00});
+    // A symlink spelled like Markdown: its blob is a target string and counts nothing.
+    Files.createSymbolicLink(work.resolve("link.md"), Path.of("README.md"));
     git(work, "add", ".");
     commit(work, "seed");
     // A gitlink at `vendored`, pointing at this repository's own tip — receive-pack does not chase
@@ -222,6 +241,62 @@ public class RepositoryBrowseResourceTest {
   public void aDirectoryIsNotAFile() throws Exception {
     given().queryParam("path", "src/app").when().get(API + seededRepo() + "/file")
         .then().statusCode(404).body("error", is("no-such-path"));
+  }
+
+  @Test
+  public void theLocSummaryCountsLinesPerLanguageAndSplitsTestFromMain() throws Exception {
+    JsonPath body =
+        given()
+            .when()
+            .get(API + seededRepo() + "/loc")
+            .then()
+            .statusCode(Response.Status.OK.getStatusCode())
+            .extract()
+            .jsonPath();
+    assertThat(body.getString("commitSha"), matchesPattern("[0-9a-f]{40}"));
+    // Sorted largest total first: Java 14, TypeScript 7, Markdown 1 — and nothing else.
+    assertThat(body.getList("languages.language", String.class),
+        is(List.of("Java", "TypeScript", "Markdown")));
+    assertThat(body.getLong("languages[0].mainLines"), is(5L));
+    assertThat(body.getLong("languages[0].testLines"), is(9L));
+    assertThat(body.getLong("languages[1].mainLines"), is(3L));
+    assertThat(body.getLong("languages[1].testLines"), is(4L));
+    // README.md only: the link.md symlink at the same target counted nothing.
+    assertThat(body.getLong("languages[2].mainLines"), is(1L));
+    assertThat(body.getLong("languages[2].testLines"), is(0L));
+  }
+
+  @Test
+  public void whatTheMapDoesNotNameOrTheScanSkipsAppearsInNoBucket() throws Exception {
+    List<String> languages =
+        given().when().get(API + seededRepo() + "/loc").then().statusCode(200)
+            .extract().jsonPath().getList("languages.language", String.class);
+    assertThat(languages, not(hasItem("Other"))); // unknown extensions are omitted, not bucketed
+    assertThat(languages, not(hasItem("SQL"))); // big.sql is past the cap
+    assertThat(languages, not(hasItem("CSS"))); // art.css is binary
+  }
+
+  @Test
+  public void aSecondLocReadAnswersTheStoredSummary() throws Exception {
+    String first =
+        given().when().get(API + seededRepo() + "/loc").then().statusCode(200)
+            .extract().asString();
+    String sha = JsonPath.from(first).getString("commitSha");
+    assertThat(locStore.find(seededRepo(), sha).isPresent(), is(true));
+    String second =
+        given().when().get(API + seededRepo() + "/loc").then().statusCode(200)
+            .extract().asString();
+    assertThat(second, is(first));
+  }
+
+  @Test
+  public void locMirrorsTheTreeEndpointsAbsenceAnswers() throws Exception {
+    given().when().get(API + UUID.randomUUID() + "/loc").then().statusCode(404)
+        .body("error", is("no-such-repository"));
+    given().queryParam("rev", "no-such-branch").when().get(API + seededRepo() + "/loc")
+        .then().statusCode(404).body("error", is("no-such-rev"));
+    given().queryParam("rev", "-not-a-rev").when().get(API + seededRepo() + "/loc")
+        .then().statusCode(400);
   }
 
   private static void commit(Path work, String message) throws Exception {
