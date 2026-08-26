@@ -1,7 +1,13 @@
 package eu.wohlben.qits.githost.api;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import eu.wohlben.qits.githost.GitRepositoryProvider;
+import eu.wohlben.qits.githost.loc.LanguageLoc;
+import eu.wohlben.qits.githost.loc.LocResponse;
+import eu.wohlben.qits.githost.loc.RepositoryLocScanner;
+import eu.wohlben.qits.githost.persistence.RepositoryLocStore;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.GET;
@@ -31,8 +37,8 @@ import org.eclipse.jgit.treewalk.TreeWalk;
 import org.jboss.logging.Logger;
 
 /**
- * {@code GET /githost/api/repositories/{repoId}[/tree|/file]} — the browser plane's content reads,
- * for qits-spa-githost's per-repository Code pages.
+ * {@code GET /githost/api/repositories/{repoId}[/tree|/file|/loc]} — the browser plane's content
+ * reads, for qits-spa-githost's per-repository Code pages.
  *
  * <p><b>Why this exists beside {@code /git/…/tree|blob}.</b> Those live on the git wire's storage
  * scheme, which {@code qits.githost.storage-client} is slated to close to qits-projects' own client
@@ -81,6 +87,8 @@ public class RepositoryBrowseResource {
   static final int MAX_CONTENT_BYTES = 2 * 1024 * 1024;
 
   @Inject GitRepositoryProvider repositories;
+  @Inject RepositoryLocStore locStore;
+  @Inject ObjectMapper mapper;
 
   /**
    * The repository as the browser plane spells it. {@code branches} empty means an empty repository
@@ -225,6 +233,52 @@ public class RepositoryBrowseResource {
     } catch (Exception e) {
       throw unavailable("could not read a file of repository " + repoId, e);
     }
+  }
+
+  /**
+   * The lines-of-code summary at one commit, memoized. The memo is consulted first and written
+   * after a scan, both fail-soft — a database that cannot answer costs a rescan, never a 5xx of its
+   * own. The scan failing is this endpoint failing, and that follows the house rule: a failed read
+   * is a 5xx, never an empty answer. Answered from the memo, the stored JSON goes out verbatim.
+   */
+  @GET
+  @Path("/loc")
+  public Response loc(@PathParam("repoId") String repoId, @QueryParam("rev") String rev) {
+    if (!isValidRepoId(repoId)) {
+      return badRequest("repoId must match " + REPO_ID_PATTERN);
+    }
+    if (rev != null && !rev.isEmpty() && !isValidRev(rev)) {
+      return badRequest("rev must match " + REV_PATTERN);
+    }
+    try (Repository repo = openOrNull(repoId)) {
+      if (repo == null) {
+        return notFound("no-such-repository");
+      }
+      String effectiveRev = rev == null || rev.isEmpty() ? defaultBranchOf(repo) : rev;
+      try (RevWalk walk = new RevWalk(repo)) {
+        RevCommit commit = resolveCommit(repo, walk, effectiveRev);
+        if (commit == null) {
+          return notFound("no-such-rev");
+        }
+        String stored = locStore.find(repoId, commit.name()).orElse(null);
+        if (stored != null) {
+          return Response.ok(stored).build();
+        }
+        List<LanguageLoc> languages = RepositoryLocScanner.scan(repo, commit);
+        String payload = serialize(new LocResponse(commit.name(), languages));
+        locStore.saveQuietly(repoId, commit.name(), payload);
+        return Response.ok(payload).build();
+      }
+    } catch (MissingObjectException | IncorrectObjectTypeException e) {
+      return notFound("no-such-rev");
+    } catch (Exception e) {
+      throw unavailable("could not count the lines of repository " + repoId, e);
+    }
+  }
+
+  /** One serialization per scan, stored and answered as the same bytes. */
+  private String serialize(LocResponse response) throws JsonProcessingException {
+    return mapper.writeValueAsString(response);
   }
 
   /** Null is absence and only absence; a store that cannot answer throws out of here unchanged. */
