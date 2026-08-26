@@ -38,6 +38,8 @@ public class DfsGitRepositoryProvider implements GitRepositoryProvider {
 
   @Inject CatalogRepository catalog;
 
+  @Inject RepositoryPurge purge;
+
   /**
    * How long an existence check holds while the datasource is gone. The shipped 15s covers a
    * postgres cutover; the suite shortens it, so a test proving the give-up does not pay for it.
@@ -114,6 +116,17 @@ public class DfsGitRepositoryProvider implements GitRepositoryProvider {
     try (QitsDfsRepository repo = build(repoId)) {
       repo.create(defaultBranch);
     }
+  }
+
+  /**
+   * Deletion is rows, so nothing is opened: a {@link QitsDfsRepository} held open across the delete
+   * would keep a reftable stack pointing at packs that no longer exist, and the next reader on that
+   * instance would be reading a repository that is gone. {@link RepositoryPurge} does the whole of
+   * it in one transaction, existence included.
+   */
+  @Override
+  public boolean delete(String repoId) {
+    return purge.purge(repoId);
   }
 
   /**

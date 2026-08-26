@@ -19,6 +19,11 @@ import jakarta.persistence.Table;
  * MB. The accepted cost instead is roughly three blobs and three rows per push, about 75 blobs per
  * active repository per year. Deleting a row here frees nothing.
  *
+ * <p>That holds for a whole repository too. {@code DELETE /git/:repoId} removes every row keyed by
+ * the id — see {@link RepositoryPurge} — and leaves the blobs behind, orphaned rather than
+ * reclaimed. It is the same residue as a repack's, arriving at a far smaller rate, and the same
+ * census sweep will be what collects both.
+ *
  * <p>{@link #packName} is a UUID and is never reused. {@code (repositoryId, packName)} identifies a
  * pack for all time, a row is never updated in place, and a name collision would not raise an error
  * — JGit compares descriptions by name, so it would serve the wrong bytes.

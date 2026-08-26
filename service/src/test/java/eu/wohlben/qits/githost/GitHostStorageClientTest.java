@@ -79,7 +79,13 @@ public class GitHostStorageClientTest {
         "main");
   }
 
-  /** Every id-addressed route, as one list, so a route added without a guard fails here. */
+  /**
+   * Every id-addressed route, as one list, so a route added without a guard fails here.
+   *
+   * <p>DELETE is last, and it is the one entry whose served answer is not 200: it takes the seeded
+   * repository away, so every other route has to have been asked before it. The guard is what this
+   * list checks, so the served status is mapped rather than the case being left out.
+   */
   private void assertIdAddressedRoutesAnswer(int status) {
     given().when().get("/git").then().statusCode(status);
     given()
@@ -92,6 +98,14 @@ public class GitHostStorageClientTest {
     given().when().get("/git/" + repoId + "/blob/main/README.md").then().statusCode(status);
     given().when().get("/git/" + repoId + "/tree/main").then().statusCode(status);
     given().when().get("/git/" + repoId + "/tree/main/").then().statusCode(status);
+    given()
+        .when()
+        .delete("/git/" + repoId)
+        .then()
+        .statusCode(
+            status == Response.Status.OK.getStatusCode()
+                ? Response.Status.NO_CONTENT.getStatusCode()
+                : status);
   }
 
   @Test
