@@ -10,7 +10,13 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import eu.wohlben.qits.githost.persistence.GitPack;
+import eu.wohlben.qits.githost.persistence.GitPackFile;
+import eu.wohlben.qits.githost.persistence.GitRepositoryLoc;
+import eu.wohlben.qits.githost.persistence.GitRepositoryProtection;
+import eu.wohlben.qits.githost.persistence.RepositoryLocStore;
 import eu.wohlben.qits.githost.persistence.RepositoryProtectionStore;
+import io.quarkus.narayana.jta.QuarkusTransaction;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.http.ContentType;
@@ -57,6 +63,11 @@ public class GitHostTest {
   @Inject GitRepositoryProvider repositories;
 
   @Inject RepositoryProtectionStore protections;
+
+  @Inject RepositoryLocStore locs;
+
+  /** A well-formed commit sha, for a loc memo whose only job is to be a row the delete must take. */
+  private static final String LOC_SHA = String.format("%040x", 1);
 
   @TestHTTPResource("/git")
   URL gitBase;
@@ -1109,6 +1120,11 @@ public class GitHostTest {
         .put("/git/foo.bar")
         .then()
         .statusCode(Response.Status.BAD_REQUEST.getStatusCode());
+    given()
+        .when()
+        .delete("/git/foo.bar")
+        .then()
+        .statusCode(Response.Status.BAD_REQUEST.getStatusCode());
   }
 
   @Test
@@ -1127,6 +1143,102 @@ public class GitHostTest {
 
     given().when().head("/git/" + repoId).then().statusCode(
         Response.Status.OK.getStatusCode());
+  }
+
+  @Test
+  public void deleteTakesTheRepositoryAndEveryRowKeyedByItsId() {
+    // The whole point of the verb: qits-projects deleting a repository row must leave nothing here.
+    // So the repository is given all four kinds of row first — a create writes a reftable, which is
+    // a pack and its files — and the delete is judged on all four.
+    //
+    // Created rather than pushed to on purpose. A push wakes the loc indexer on its own thread, and
+    // a memo landing after the delete would make this assertion a coin toss rather than a fact.
+    String repoId = UUID.randomUUID().toString();
+    given()
+        .contentType(ContentType.JSON)
+        .body("{\"defaultBranch\":\"main\"}")
+        .when()
+        .put("/git/" + repoId)
+        .then()
+        .statusCode(Response.Status.CREATED.getStatusCode());
+    protect(repoId);
+    locs.saveQuietly(repoId, LOC_SHA, "{\"total\":1}");
+    assertTrue(rowsOf(repoId) > 0, "the fixture must leave rows to delete");
+
+    given()
+        .when()
+        .delete("/git/" + repoId)
+        .then()
+        .statusCode(Response.Status.NO_CONTENT.getStatusCode());
+
+    assertEquals(0, rowsOf(repoId), "every table keyed by the id is empty");
+    given().when().get("/git/" + repoId).then().statusCode(
+        Response.Status.NOT_FOUND.getStatusCode());
+    given().when().head("/git/" + repoId).then().statusCode(
+        Response.Status.NOT_FOUND.getStatusCode());
+    assertFalse(
+        listRepositories().contains(repoId), "a repository that is gone is not one the host lists");
+
+    // Idempotent only in effect, not in answer: the second call has nothing to delete, and saying
+    // 204 to it would tell a caller it removed something.
+    given()
+        .when()
+        .delete("/git/" + repoId)
+        .then()
+        .statusCode(Response.Status.NOT_FOUND.getStatusCode());
+  }
+
+  @Test
+  public void deleteOnAnUnknownIdIs404() {
+    given()
+        .when()
+        .delete("/git/" + UUID.randomUUID())
+        .then()
+        .statusCode(Response.Status.NOT_FOUND.getStatusCode());
+  }
+
+  @Test
+  public void anIdIsReusableAfterItIsDeleted() throws Exception {
+    // Nothing tombstones the id — the rows are gone, so a PUT on it creates rather than finding
+    // something already there. That is what makes the delete a real one from a caller's side.
+    //
+    // Pushed to first, so this is also where a repository with real packs is proven deletable: the
+    // case above creates rather than pushes, to keep the loc indexer out of its assertion.
+    String repoId = seedOrigin();
+    given()
+        .when()
+        .delete("/git/" + repoId)
+        .then()
+        .statusCode(Response.Status.NO_CONTENT.getStatusCode());
+    assertEquals(0, packRowsOf(repoId), "a pushed repository's packs go with it");
+
+    given()
+        .contentType(ContentType.JSON)
+        .body("{\"defaultBranch\":\"main\"}")
+        .when()
+        .put("/git/" + repoId)
+        .then()
+        .statusCode(Response.Status.CREATED.getStatusCode())
+        .body("defaultBranch", equalTo("main"));
+  }
+
+  /** Every row this host keys by a repository id, counted as one number so a leftover cannot hide. */
+  private static long rowsOf(String repoId) {
+    return QuarkusTransaction.requiringNew()
+        .call(
+            () ->
+                GitPack.count("repositoryId", repoId)
+                    + GitPackFile.count("repositoryId", repoId)
+                    + GitRepositoryProtection.count("repositoryId", repoId)
+                    + GitRepositoryLoc.count("repositoryId", repoId));
+  }
+
+  /** The pack rows alone — the half of {@link #rowsOf} no background worker can write. */
+  private static long packRowsOf(String repoId) {
+    return QuarkusTransaction.requiringNew()
+        .call(
+            () ->
+                GitPack.count("repositoryId", repoId) + GitPackFile.count("repositoryId", repoId));
   }
 
   // --- the collection listing: GET /git ------------------------------------------------

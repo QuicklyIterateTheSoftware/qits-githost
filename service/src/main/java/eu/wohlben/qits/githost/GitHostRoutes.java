@@ -98,7 +98,7 @@ import org.jboss.logging.Logger;
  *   <li>{@code POST …/git-receive-pack} — push.
  * </ul>
  *
- * <p>Beside those, three lifecycle routes on the id-addressed base only — not served
+ * <p>Beside those, four lifecycle routes on the id-addressed base only — not served
  * name-addressed, since a name is an alias for an id that has to already exist:
  *
  * <ul>
@@ -107,11 +107,15 @@ import org.jboss.logging.Logger;
  *   <li>{@code GET …/:repoId} — {@code {"repoId", "defaultBranch"}} for a repository that exists,
  *       404 otherwise.
  *   <li>{@code HEAD …/:repoId} — the same existence question with no body.
+ *   <li>{@code DELETE …/:repoId} — delete the repository: 204 when it existed and its rows are
+ *       gone, 404 when this host holds no such repository. No body either way.
  * </ul>
  *
  * <p>These give a caller (qits-projects) a way to provision a repository over the wire instead of
  * {@code git init --bare} on the shared volume — see {@code projects-volume-decoupling-plan.md}
- * §2. There is deliberately no delete verb.
+ * §2. The delete verb, withheld while the plan was written, is the same argument run the other way:
+ * qits-projects deletes repository rows, and without a verb here every one of them left a bare
+ * behind at an id nobody holds any more.
  *
  * <p>And one route on the bare collection:
  *
@@ -419,6 +423,10 @@ public class GitHostRoutes {
         .head(BASE + "/:repoId")
         .handler(this::requireStorageClient)
         .blockingHandler(this::headRepository);
+    router
+        .delete(BASE + "/:repoId")
+        .handler(this::requireStorageClient)
+        .blockingHandler(this::deleteRepository);
 
     // The content reads. Registered with regexes so the tail can hold slashes, the
     // MavenPaths/NpmPaths shape: every group is (?<named>…) or (?:…), because vertx-web silently
@@ -1207,6 +1215,33 @@ public class GitHostRoutes {
       rc.response().setStatusCode(repo == null ? 404 : 200).end();
     } catch (Exception e) {
       fail(rc, "git-head", e);
+    }
+  }
+
+  /**
+   * {@code DELETE …/:repoId} — delete the repository: 204 when it existed and its rows are gone, 404
+   * when this host holds no such repository. Nothing is announced; there is no repository-level
+   * event, and create announces nothing either.
+   *
+   * <p><b>Rows go, bytes stay.</b> The packs, the pack files, the protection override and the
+   * lines-of-code memos are deleted in one transaction. Their blobs are not: the store is
+   * content-addressed and shared, nothing counts references to a blob, and its one delete is
+   * reachable only from the sweep that does not run. So a deleted repository leaves its pack blobs
+   * orphaned until a census exists to collect them — the same residue every repack already leaves.
+   *
+   * <p>Nothing is opened here. See {@code DfsGitRepositoryProvider.delete} for why a {@link
+   * Repository} must not be held across the delete.
+   */
+  private void deleteRepository(RoutingContext rc) {
+    String repoId = rc.pathParam("repoId");
+    if (repoId == null || !repoId.matches(REPO_ID_PATTERN)) {
+      rc.response().setStatusCode(400).end("repo id must match " + REPO_ID_PATTERN);
+      return;
+    }
+    try {
+      rc.response().setStatusCode(provider.delete(repoId) ? 204 : 404).end();
+    } catch (Exception e) {
+      fail(rc, "git-delete", e);
     }
   }
 

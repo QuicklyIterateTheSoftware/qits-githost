@@ -64,6 +64,7 @@ served only to that client's self-role (see Configuration).
 | `PUT /git/:repoId` | Create, idempotently. Body `{"defaultBranch": "main"}`. 201 created, 200 already there. |
 | `GET /git/:repoId` | `{"repoId", "defaultBranch"}`, or 404. |
 | `HEAD /git/:repoId` | The same existence question, no body. |
+| `DELETE /git/:repoId` | Delete the repository. 204 gone, 404 no such repository. No body. |
 | `GET /git/:repoId/info/refs?service=git-(upload\|receive)-pack` | The ref advertisement, id-addressed. |
 | `POST /git/:repoId/git-upload-pack` | Fetch, id-addressed. |
 | `POST /git/:repoId/git-receive-pack` | Push, id-addressed. |
@@ -274,6 +275,13 @@ round.
 path, so `DfsGarbageCollector` does not reclaim, it duplicates — measured once on the platform's
 largest repository, 22 packs and 7.8 MB became 2 packs and 15 MB. The accepted cost instead is about
 three blobs and three rows per push.
+
+**A repository can be deleted, and that frees rows rather than bytes.** `DELETE /git/:repoId` removes
+every row keyed by the id — packs, pack files, the protection override, the lines-of-code memos — in
+one transaction, so qits-projects deleting a repository no longer leaves a bare behind at an id
+nobody holds. The pack blobs stay: the store is content-addressed and shared, nothing counts
+references to a blob, so they are orphaned exactly as a repack's are. A census sweep is what will
+collect both, and there is not one yet.
 
 ## Building
 

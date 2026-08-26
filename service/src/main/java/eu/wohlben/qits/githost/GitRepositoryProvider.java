@@ -46,6 +46,24 @@ public interface GitRepositoryProvider {
   void create(String repoId, String defaultBranch) throws IOException;
 
   /**
+   * Deletes the repository — every row this host keys by {@code repoId}, in one transaction.
+   *
+   * <p>{@code DELETE /git/:repoId} ({@link GitHostRoutes}) is the route that calls this, and
+   * qits-projects calls that route when a repository row is deleted there. The verb exists because
+   * the alternative was a bare left behind for every repository the platform ever removed, with
+   * nothing able to reach it: an id nobody holds is an address nobody can clean up.
+   *
+   * <p><b>Rows go, bytes stay.</b> The pack blobs live in the shared content-addressed store, which
+   * counts no references and has no delete on this path, so they are orphaned rather than reclaimed
+   * — the same thing a repack leaves behind today, and the same census sweep will be what collects
+   * both.
+   *
+   * @return {@code true} if the repository existed and is now gone, {@code false} if the store held
+   *     no such repository — which the route answers as a 404
+   */
+  boolean delete(String repoId);
+
+  /**
    * Every repository this host currently holds, by id — the enumeration {@code GET
    * /git} answers, and what qits-ci's trigger engine reads to know which repositories an
    * event-triggered pipeline could fire for.
