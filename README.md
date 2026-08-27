@@ -224,7 +224,12 @@ whole `X-Qits-` prefix, so a header would behave differently through the front d
 A push builds `docker/Dockerfile` — a Mandrel builder stage that native-compiles `service`, a
 `ubi-minimal` runtime stage that carries only the binary — and pushes it as
 `qits/qits-githost:<sha>`; a release rebuilds the same content under the released version
-(`.config/qits/ci-post-receive.yml` and `.config/qits/ci-event-release.yml`). Both builds run
+(`.config/qits/ci-event-build.yml` and `.config/qits/ci-event-release.yml` — this repository
+carries **no `ci-post-receive.yml`**: every pipeline is a domain-event trigger, the push build
+riding `SCMPublishCommit` with `checkout:` so it still builds the pushed branch at the pushed sha.
+A third file, `ci-event-userflows.yml`, runs `mvn verify` per commit and publishes the userflow
+reports as the `@userflows/qits-githost` docs site, version = the commit sha, non-gating for the
+image). Both image builds run
 `--network host` with `--build-arg QITS_MAVEN_REPOSITORY_URL=…`, because `qits-eventstream`
 exists only in the platform's own Maven repository and a docker build reaches no other address for
 it.

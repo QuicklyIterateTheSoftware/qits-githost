@@ -7,7 +7,7 @@
 # - `artifacts:` is a declaration, not a report — qits-ci announces on the strength of it. Keep it
 #   true.
 # - The name is unqualified on purpose; the reader supplies its own registry host.
-# - The build below is ci-post-receive.yml's, and the two must stay matched: one image content, two
+# - The build below is ci-event-build.yml's, and the two must stay matched: one image content, two
 #   coordinates. That includes --network and --build-arg, which this repository needs because
 #   qits-eventstream lives only in the platform's own Maven repository, AND the whole first half —
 #   the webui submodule fetch, the lockfile origin swap and the `npm_config_*` environment. That
@@ -58,7 +58,7 @@ steps:
       # --- half one: the bundle -----------------------------------------------------------------
       # The daemon's clone is shallow and does not recurse, so qits-spa-githost arrives as an empty
       # directory and Quinoa's client never gets built — the Dockerfile's `test -f` guard is what
-      # turns that into a red build instead of an image with no page. See ci-post-receive.yml for
+      # turns that into a red build instead of an image with no page. See ci-event-build.yml for
       # why the lockfile origins are rewritten and why the registry is passed as environment rather
       # than as a file: that repo's committed .npmrc outranks any ~/.npmrc this step could write.
       frontend_url="${QITS_CI_REPOSITORY_URL%/*}/qits-spa-githost"
@@ -90,7 +90,7 @@ steps:
       # pair to the mounts on the Dockerfile's mvnw RUN. Unconditional on purpose: a missing env
       # source is NOT an error — measured on buildx v0.36.1, `--secret id=x,env=DOES_NOT_EXIST`
       # builds green and the mounted variable is simply unset — so this is inert until a run carries
-      # the pair. ci-post-receive.yml carries the same two flags, and the two must stay matched.
+      # the pair. ci-event-build.yml carries the same two flags, and the two must stay matched.
       ref="$QITS_REGISTRY/$QITS_IMAGE_REPOSITORY/qits-githost:$version"
       docker build --network host \
         --build-arg QITS_MAVEN_REPOSITORY_URL="http://$QITS_REGISTRY/artifacts/maven/maven" \
