@@ -68,6 +68,15 @@
              the rule would pass a build it should fail. -->
         <qits.db-core.version>2026.817.175344</qits.db-core.version>
         <qits.arch-rules.version>2026.817.175344</qits.arch-rules.version>
+        <!-- The user-story framework (test scope): TokenValidationBootstrapIT is a userflow, so a
+             `mvn verify` also regenerates service/target/userstories/ — the story's documentation,
+             sequence diagram included. -->
+        <qits.userflows.version>2026.827.71231</qits.userflows.version>
+        <!-- The recording service mocks the same IT boots against (the generic MockService plus
+             idp.MockIdp), released out of libs/qits-integrations-quarkus like
+             qits-db-core/qits-arch-rules above (the same-string policy applies the day this repo
+             consumes a newer reactor). -->
+        <qits.service-mock.version>2026.827.71232</qits.service-mock.version>
         <qits.maven.repository.url>http://registry.dev.localhost:8080/artifacts/maven/maven</qits.maven.repository.url>
 
         <maven.compiler.release>25</maven.compiler.release>
@@ -102,7 +111,10 @@
         <zonky.embedded-postgres.version>2.2.2</zonky.embedded-postgres.version>
         <zonky.postgres-binaries.version>18.4.0</zonky.postgres-binaries.version>
 
-        <!-- Integration tests run against a PACKAGED artifact, so a plain `mvn verify` skips them. -->
+        <!-- Integration tests run against a PACKAGED artifact. The library modules keep this
+             default; the `service` module opts back IN (skipITs=false there), so a plain
+             `mvn verify` boots the packaged app for TokenValidationBootstrapIT — deliberately,
+             because that IT is also the generator of the userstories documentation. -->
         <skipITs>true</skipITs>
     </properties>
 
@@ -165,6 +177,18 @@
                 <groupId>${project.groupId}</groupId>
                 <artifactId>qits-auth-core</artifactId>
                 <version>${qits.integrations-quarkus.version}</version>
+            </dependency>
+            <dependency>
+                <!-- Test scope at every declaration site, like qits-arch-rules. -->
+                <groupId>${project.groupId}</groupId>
+                <artifactId>qits-userflows</artifactId>
+                <version>${qits.userflows.version}</version>
+            </dependency>
+            <dependency>
+                <!-- Test scope at every declaration site, like qits-arch-rules. -->
+                <groupId>${project.groupId}</groupId>
+                <artifactId>qits-service-mock</artifactId>
+                <version>${qits.service-mock.version}</version>
             </dependency>
             <!-- The reactor's own modules, so `service` depends on them version-less. -->
             <dependency>

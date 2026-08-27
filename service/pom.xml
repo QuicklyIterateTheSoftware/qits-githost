@@ -30,6 +30,14 @@
     <name>qits-githost :: service</name>
     <packaging>quarkus</packaging>
 
+    <properties>
+        <!-- Opt back IN to the parent's skipITs=true: this module's IT is a userflow, so every
+             `mvn verify` boots the packaged fast-jar AND regenerates target/userstories/ — the
+             story documentation is a build product, not a CI-only artifact. `-Dnative` runs the
+             same IT against the binary. -->
+        <skipITs>false</skipITs>
+    </properties>
+
     <dependencies>
         <dependency>
             <groupId>${project.groupId}</groupId>
@@ -178,6 +186,23 @@
             <scope>test</scope>
         </dependency>
         <dependency>
+            <!-- The user-story framework: TokenValidationBootstrapIT is written as a @UserStory,
+                 so the packaged-boot proof doubles as documentation — steps, interactions and a
+                 sequence diagram emitted under target/userstories/. The story is browserless
+                 (no Flow parameter), so the transitive Playwright never launches anything. -->
+            <groupId>${project.groupId}</groupId>
+            <artifactId>qits-userflows</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <!-- The recording service mocks. The IT points quarkus.oidc at idp.MockIdp — a
+                 MockService plus key material: it serves the JWKS for a generated keypair, mints
+                 tokens, records what it answered — the far end of the story's interactions. -->
+            <groupId>${project.groupId}</groupId>
+            <artifactId>qits-service-mock</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
             <groupId>io.zonky.test</groupId>
             <artifactId>embedded-postgres</artifactId>
             <scope>test</scope>
@@ -193,6 +218,14 @@
         <dependency>
             <groupId>io.zonky.test.postgres</groupId>
             <artifactId>embedded-postgres-binaries-linux-arm64v8</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <!-- The CI step containers are Alpine (musl): ci-event-userflows.yml runs `mvn verify`
+                 in maven-base as `user: build`, and zonky picks the -alpine binaries there at run
+                 time — qits-db-core's pom carries the same fourth arch for the same pipeline. -->
+            <groupId>io.zonky.test.postgres</groupId>
+            <artifactId>embedded-postgres-binaries-linux-amd64-alpine</artifactId>
             <scope>test</scope>
         </dependency>
         <dependency>
@@ -219,6 +252,36 @@
                 <artifactId>maven-surefire-plugin</artifactId>
                 <configuration>
                     <systemPropertyVariables>
+                        <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
+            <plugin>
+                <!-- TokenValidationBootstrapIT binds here. Unlike the siblings, skipITs is flipped
+                     to false in THIS module's properties, so the IT runs on every `mvn verify`
+                     against the fast-jar; the `native` profile runs the same IT against the
+                     binary. -->
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <systemPropertyVariables>
+                        <!-- How @QuarkusIntegrationTest finds the compiled binary in a `-Dnative`
+                             build; without it the native run has nothing to launch. The name is
+                             `quarkus.package.output-name` from application.properties, NOT maven's
+                             finalName. The two spellings move together. -->
+                        <native.image.path>${project.build.directory}/qits-githost</native.image.path>
+                        <!-- Launch the packaged app on a free port instead of the default 8081 —
+                             the @QuarkusTest port, which surefire's last Quarkus instance can still
+                             hold when failsafe starts, and which on the deployment host is the
+                             platform's own npm registry. -->
+                        <quarkus.http.test-port>0</quarkus.http.test-port>
                         <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
                     </systemPropertyVariables>
                 </configuration>

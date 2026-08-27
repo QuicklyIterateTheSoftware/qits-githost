@@ -1,4 +1,26 @@
-# The pipeline qits-ci runs on every push to a tracked branch of this repository.
+# The image build, per push — this repository's ci-post-receive.yml MOVED HERE whole when the
+# repo went domain-event-only. `checkout:` is what makes that a move rather than a rewrite: the run
+# builds the pushed branch at the pushed sha (QITS_CI_BRANCH/QITS_CI_SHA are the payload's), so the
+# script below is the old file's, byte-identical, and BuildSuccessful still announces the branch
+# the deployer keys on. The one semantic the push path had that when: has to restate is
+# suppressCi — the listener honoured `-o qits.no-ci` before any pipeline was read; here it is a
+# selection like any other.
+#
+# DELIBERATELY A SEPARATE FILE from ci-event-userflows.yml: that run is the per-commit verify +
+# docs publish and is non-gating by design — a red verify must not cost a branch its image, until
+# the quality gate becomes a decision someone takes. Two files, two runs per push, collapsed per
+# branch under burst by the accept-time supersede.
+#
+# Loop review (the README's checkout box): this pipeline pushes an image and never a commit, and
+# selects no event its own green run publishes — no cycle.
+event: SCMPublishCommit
+when:
+  - repoId: { exact: qits-githost }
+    suppressCi: { exact: "false" }
+checkout:
+  branch: branch
+  sha: sha
+# The step below is ci-post-receive.yml's one step, unchanged. Its own header rules, still binding:
 #
 # ONE STEP, TWO HALVES, and the split between them is the whole point:
 #
@@ -79,7 +101,7 @@ steps:
       #
       # npm's own knob for this, `--replace-registry-host=always`, cannot do it against a registry
       # mounted under a path prefix: @npmcli/arborist glues rather than resolves, so every tarball
-      # 404s. qits-artifacts' ci-post-receive.yml carries the measurement.
+      # 404s. qits-artifacts' pipeline file carries the measurement.
       npm_hosted_origin=$(node -p 'new URL(process.env.QITS_NPM_REGISTRY_URL).origin')
       npm_proxy_origin=$(node -p 'new URL(process.env.QITS_NPM_PROXY_URL).origin')
       npm_hosted_path=$(node -p 'new URL(process.env.QITS_NPM_REGISTRY_URL).pathname')
