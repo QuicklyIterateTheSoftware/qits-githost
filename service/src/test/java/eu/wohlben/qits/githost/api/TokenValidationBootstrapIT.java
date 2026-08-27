@@ -33,7 +33,9 @@ import org.junit.jupiter.api.AfterAll;
 @TestProfile(TokenValidationBootstrapIT.PackagedWithMockIdp.class)
 public class TokenValidationBootstrapIT {
 
-  static final String SLUG = "on-start-the-git-host-fetches-the-platform-s-signing-keys";
+  static final String CATEGORY = "authentication";
+  static final String ACCEPTED_SLUG = "on-start-the-git-host-fetches-the-platform-s-signing-keys";
+  static final String DENIED_SLUG = "a-stranger-s-token-never-opens-the-git-host";
 
   /**
    * Hands the launched artifact its config the way a deployment does — the generic resource
@@ -71,15 +73,17 @@ public class TokenValidationBootstrapIT {
     }
   }
 
-  @UserStory("On start, the git host fetches the platform's signing keys")
+  @UserStory(
+      value = "On start, the git host fetches the platform's signing keys",
+      category = "authentication")
   @UserStoryDescription(
       """
       A freshly deployed qits-githost must validate service bearers before any caller arrives:
       at startup it fetches the signing keys (JWKS) from qits-platform-idp — discovery stays
       off, the path is configured — so the very first `git` request carrying a platform token
-      is accepted, and a token signed by anyone else never is.
+      is accepted.
       """)
-  void serviceBootFetchesJwksAndValidatesTokens(Interactions story) {
+  void serviceBootFetchesJwksAndAcceptsPlatformTokens(Interactions story) {
     MockIdp idp = MockIdp.attach();
 
     story.note("qits-githost starts with the OIDC tenant on, beside a reachable qits-platform-idp");
@@ -94,7 +98,7 @@ public class TokenValidationBootstrapIT {
         .as("jwks-fetched");
 
     // End (b), the githost side: those keys are what token validation now runs on. A platform
-    // service's bearer (aud = this service, roles in `groups`) opens the guarded git surface…
+    // service's bearer (aud = this service, roles in `groups`) opens the guarded git surface.
     String platformToken =
         idp.token()
             .subject("qits-ci")
@@ -109,9 +113,20 @@ public class TokenValidationBootstrapIT {
         .body("repositories", notNullValue());
     story.happened("a platform service", "qits-githost", "GET /git (Bearer, groups=[qits:system])")
         .as("git-served");
+  }
 
-    // …while a token signed by a key the JWKS never published, or minted for another audience,
-    // stays outside.
+  @UserStory(
+      value = "A stranger's token never opens the git host",
+      category = "authentication")
+  @UserStoryDescription(
+      """
+      The flip side of trusting the platform's keys: a token signed by a key the published JWKS
+      never carried, or minted for another service's audience, is refused at the door — however
+      well-formed it looks.
+      """)
+  void aStrangersTokenIsRefused(Interactions story) {
+    MockIdp idp = MockIdp.attach();
+
     String strangersToken =
         idp.token()
             .audience(PackagedWithMockIdp.AUDIENCE)
@@ -119,6 +134,9 @@ public class TokenValidationBootstrapIT {
             .signedByUnknownKey()
             .mint();
     given().header("Authorization", "Bearer " + strangersToken).get("/git").then().statusCode(401);
+    story.happened("an impostor", "qits-githost", "GET /git (token signed by an unknown key) -> 401")
+        .as("unknown-key-refused");
+
     String wrongAudienceToken =
         idp.token().audience("some-other-service").groups("qits:system").mint();
     given()
@@ -126,16 +144,21 @@ public class TokenValidationBootstrapIT {
         .get("/git")
         .then()
         .statusCode(401);
-    story.happened("an impostor", "qits-githost", "GET /git (unknown key or wrong audience) -> 401")
-        .as("impostor-refused");
+    story
+        .happened("an impostor", "qits-githost", "GET /git (another service's audience) -> 401")
+        .as("wrong-audience-refused");
   }
 
   @AfterAll
-  static void theStoryReportIsComplete() {
-    // The extension emits the report in its afterEach, so it is on disk before @AfterAll runs.
-    ReportAssertions.assertComplete(SLUG, UserflowReport.PASSED);
+  static void bothStoryReportsAreComplete() {
+    // The extension emits each report in its afterEach, so both are on disk before @AfterAll runs.
+    ReportAssertions.assertComplete(CATEGORY, ACCEPTED_SLUG, UserflowReport.PASSED);
     ReportAssertions.assertInteraction(
-        SLUG, "qits-githost", "qits-platform-idp", "GET /idp/jwks (at startup)");
-    ReportAssertions.assertStepId(SLUG, "jwks-fetched");
+        CATEGORY, ACCEPTED_SLUG, "qits-githost", "qits-platform-idp", "GET /idp/jwks (at startup)");
+    ReportAssertions.assertStepId(CATEGORY, ACCEPTED_SLUG, "jwks-fetched");
+
+    ReportAssertions.assertComplete(CATEGORY, DENIED_SLUG, UserflowReport.PASSED);
+    ReportAssertions.assertStepId(CATEGORY, DENIED_SLUG, "unknown-key-refused");
+    ReportAssertions.assertStepId(CATEGORY, DENIED_SLUG, "wrong-audience-refused");
   }
 }
