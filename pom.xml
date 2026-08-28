@@ -33,7 +33,7 @@
          no monorepo and no parent to inherit from. -->
     <groupId>eu.wohlben.qits</groupId>
     <artifactId>qits-githost</artifactId>
-    <version>2026.827.83632</version>
+    <version>2026.828.153309</version>
     <packaging>pom</packaging>
     <name>qits-githost</name>
 
@@ -71,7 +71,7 @@
         <!-- The user-story framework (test scope): TokenValidationBootstrapIT is a userflow, so a
              `mvn verify` also regenerates service/target/userstories/ — the story's documentation,
              sequence diagram included. -->
-        <qits.userflows.version>2026.827.83520</qits.userflows.version>
+        <qits.userflows.version>2026.828.153026</qits.userflows.version>
         <!-- The recording service mocks the same IT boots against (the generic MockService plus
              idp.MockIdp), released out of libs/qits-integrations-quarkus like
              qits-db-core/qits-arch-rules above (the same-string policy applies the day this repo
