@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import eu.wohlben.qits.githost.persistence.CatalogRepository;
 import eu.wohlben.qits.githost.storage.PackDescription;
+import io.quarkus.arc.ClientProxy;
 import io.quarkus.test.junit.QuarkusMock;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
@@ -13,6 +14,7 @@ import java.sql.SQLTransientConnectionException;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -43,6 +45,21 @@ public class GitHostCatalogUnavailableTest {
 
   /** The real catalog, read through before any mock is installed over it. */
   @Inject CatalogRepository catalog;
+
+  /**
+   * PUT THE REAL CATALOG BACK, after every method. {@code QuarkusMock.installMockForType} inside a
+   * test method installs for the rest of the run, not the rest of the method — and a severed
+   * catalog that outlives this class turns some later class's requests into 403s/500s that read
+   * like that class's own bug. That was the {@code GitHostStorageClientTest} "flake": three
+   * consecutive CI runs red on its first {@code GET /git}, every request underneath throwing THIS
+   * class's {@code connectionLost()} (2026-08-28) — which order the suite ran in was the whole
+   * probability. {@code ClientProxy.unwrap}, because installing the injected proxy AS the mock
+   * would route the proxy to itself.
+   */
+  @AfterEach
+  void restoreTheRealCatalog() {
+    QuarkusMock.installMockForType(ClientProxy.unwrap(catalog), CatalogRepository.class);
+  }
 
   /**
    * What a severed pool throws: unchecked, like Hibernate's {@code JDBCConnectionException}, over a

@@ -7,7 +7,6 @@ import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
-import io.quarkus.test.security.TestSecurity;
 import io.restassured.http.ContentType;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
@@ -80,25 +79,39 @@ public class GitHostStorageClientTest {
   }
 
   /**
+   * The identity, asserted the way the deployment asserts it: {@code ForwardAuthMechanism} reads
+   * the {@code X-Qits-User}/{@code X-Qits-Roles} pair, and a present header outranks the
+   * {@code %test} dev-user. NOT {@code @TestSecurity}, and that is a measured decision
+   * (2026-08-28): the guard reads the identity off the raw {@code RoutingContext}
+   * ({@code rc.user()}), and whether the harness identity reaches that seam proved bimodal per
+   * application instance — a run either passed at once or answered 403 for a solid ten seconds of
+   * retries. The real mechanism is deterministic, and it is also simply the truer test: the role
+   * arrives the way qits-idp delivers it.
+   */
+  private static io.restassured.specification.RequestSpecification withRoles(String roles) {
+    return given().header("X-Qits-User", "storage-client-test").header("X-Qits-Roles", roles);
+  }
+
+  /**
    * Every id-addressed route, as one list, so a route added without a guard fails here.
    *
    * <p>DELETE is last, and it is the one entry whose served answer is not 200: it takes the seeded
    * repository away, so every other route has to have been asked before it. The guard is what this
    * list checks, so the served status is mapped rather than the case being left out.
    */
-  private void assertIdAddressedRoutesAnswer(int status) {
-    given().when().get("/git").then().statusCode(status);
-    given()
+  private void assertIdAddressedRoutesAnswer(String roles, int status) {
+    withRoles(roles).when().get("/git").then().statusCode(status);
+    withRoles(roles)
         .when()
         .get("/git/" + repoId + "/info/refs?service=git-upload-pack")
         .then()
         .statusCode(status);
-    given().when().get("/git/" + repoId).then().statusCode(status);
-    given().when().head("/git/" + repoId).then().statusCode(status);
-    given().when().get("/git/" + repoId + "/blob/main/README.md").then().statusCode(status);
-    given().when().get("/git/" + repoId + "/tree/main").then().statusCode(status);
-    given().when().get("/git/" + repoId + "/tree/main/").then().statusCode(status);
-    given()
+    withRoles(roles).when().get("/git/" + repoId).then().statusCode(status);
+    withRoles(roles).when().head("/git/" + repoId).then().statusCode(status);
+    withRoles(roles).when().get("/git/" + repoId + "/blob/main/README.md").then().statusCode(status);
+    withRoles(roles).when().get("/git/" + repoId + "/tree/main").then().statusCode(status);
+    withRoles(roles).when().get("/git/" + repoId + "/tree/main/").then().statusCode(status);
+    withRoles(roles)
         .when()
         .delete("/git/" + repoId)
         .then()
@@ -109,28 +122,13 @@ public class GitHostStorageClientTest {
   }
 
   @Test
-  @TestSecurity(user = "qits-projects", roles = STORAGE_ROLE)
   public void theStorageClientsSelfRoleOpensTheWholeIdAddressedScheme() {
-    // THE FIRST REQUEST AFTER THE PROFILE RESTART CAN MISS THE @TestSecurity ROLES — the identity
-    // association races the restarted application (~1 in 3 full-suite runs locally, near-certain
-    // on the CI runner: three consecutive userflows runs died here on 2026-08-28). The warm-up
-    // below retries ONLY the first probe until the harness identity carries, bounded, and then the
-    // real assertion list runs in full — it is harness eventual-consistency, not guard leniency:
-    // the guard's refusal arm is proven by adminDoesNotOpenTheStorageScheme below, which needs no
-    // warm-up because 403 is also what a raced identity answers.
-    long deadline = System.currentTimeMillis() + 10_000;
-    while (given().when().get("/git").statusCode() != Response.Status.OK.getStatusCode()
-        && System.currentTimeMillis() < deadline) {
-      try {
-        Thread.sleep(250);
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        break;
-      }
-    }
-    assertIdAddressedRoutesAnswer(Response.Status.OK.getStatusCode());
+    // A persistent 403 here that no request carries a cause for was, once, ANOTHER class's severed
+    // catalog outliving its run — check the captured log for "severed by a database cutover"
+    // before debugging this guard (GitHostCatalogUnavailableTest's @AfterEach is the fix's home).
+    assertIdAddressedRoutesAnswer(STORAGE_ROLE, Response.Status.OK.getStatusCode());
 
-    given()
+    withRoles(STORAGE_ROLE)
         .contentType(ContentType.JSON)
         .body("{\"defaultBranch\":\"main\"}")
         .when()
@@ -140,24 +138,22 @@ public class GitHostStorageClientTest {
   }
 
   @Test
-  @TestSecurity(user = "admin", roles = "qits:admin")
   public void adminDoesNotOpenTheStorageScheme() {
-    assertIdAddressedRoutesAnswer(Response.Status.FORBIDDEN.getStatusCode());
+    assertIdAddressedRoutesAnswer("qits:admin", Response.Status.FORBIDDEN.getStatusCode());
   }
 
   @Test
-  @TestSecurity(user = "a-service", roles = "qits:system")
   public void aSystemTokenDoesNotOpenItEither() {
-    assertIdAddressedRoutesAnswer(Response.Status.FORBIDDEN.getStatusCode());
+    assertIdAddressedRoutesAnswer("qits:system", Response.Status.FORBIDDEN.getStatusCode());
 
-    given()
+    withRoles("qits:system")
         .contentType(ContentType.JSON)
         .body("{\"defaultBranch\":\"main\"}")
         .when()
         .put("/git/" + UUID.randomUUID())
         .then()
         .statusCode(Response.Status.FORBIDDEN.getStatusCode());
-    given()
+    withRoles("qits:system")
         .when()
         .post("/git/" + repoId + "/git-receive-pack")
         .then()
@@ -165,11 +161,10 @@ public class GitHostStorageClientTest {
   }
 
   @Test
-  @TestSecurity(user = "a-service", roles = "qits:system")
   public void theRefusalNamesTheAddressToUseInstead() {
     // A 403 a caller cannot act on would send them looking for a missing grant. The one thing to do
     // about this refusal is to stop holding a storage id, so the message says so.
-    given()
+    withRoles("qits:system")
         .when()
         .get("/git/" + repoId + "/info/refs?service=git-upload-pack")
         .then()
@@ -179,22 +174,21 @@ public class GitHostStorageClientTest {
   }
 
   @Test
-  @TestSecurity(user = "a-service", roles = "qits:system")
   public void theNameAddressedSchemeIsUntouchedByTheGuard() {
     // The public scheme keeps the policy it always had — this guard closes one address, it does not
     // narrow who may clone.
-    given()
+    withRoles("qits:system")
         .when()
         .get("/git/" + projectId + "/testing-repo/info/refs?service=git-upload-pack")
         .then()
         .statusCode(Response.Status.OK.getStatusCode())
         .contentType(containsString("git-upload-pack-advertisement"));
-    given()
+    withRoles("qits:system")
         .when()
         .get("/git/" + projectId + "/testing-repo/blob/main/README.md")
         .then()
         .statusCode(Response.Status.OK.getStatusCode());
-    given()
+    withRoles("qits:system")
         .when()
         .get("/git/" + projectId + "/testing-repo/tree/main")
         .then()
@@ -202,13 +196,12 @@ public class GitHostStorageClientTest {
   }
 
   @Test
-  @TestSecurity(user = "a-service", roles = "qits:system")
   public void aNameAddressedCloneOfARepositoryCalledBlobStillReachesItsRoute() {
     // The hand-off the id-addressed content routes carry must survive the guard: that is why the
     // check lives inside those two handlers rather than in front of them. Guarded from the front,
     // this request would be a 403 before the router ever tried the clone route.
     repositoryNames.register(projectId, "blob", repoId);
-    given()
+    withRoles("qits:system")
         .when()
         .get("/git/" + projectId + "/blob/info/refs?service=git-upload-pack")
         .then()
