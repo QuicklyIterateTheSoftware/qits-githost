@@ -111,6 +111,23 @@ public class GitHostStorageClientTest {
   @Test
   @TestSecurity(user = "qits-projects", roles = STORAGE_ROLE)
   public void theStorageClientsSelfRoleOpensTheWholeIdAddressedScheme() {
+    // THE FIRST REQUEST AFTER THE PROFILE RESTART CAN MISS THE @TestSecurity ROLES — the identity
+    // association races the restarted application (~1 in 3 full-suite runs locally, near-certain
+    // on the CI runner: three consecutive userflows runs died here on 2026-08-28). The warm-up
+    // below retries ONLY the first probe until the harness identity carries, bounded, and then the
+    // real assertion list runs in full — it is harness eventual-consistency, not guard leniency:
+    // the guard's refusal arm is proven by adminDoesNotOpenTheStorageScheme below, which needs no
+    // warm-up because 403 is also what a raced identity answers.
+    long deadline = System.currentTimeMillis() + 10_000;
+    while (given().when().get("/git").statusCode() != Response.Status.OK.getStatusCode()
+        && System.currentTimeMillis() < deadline) {
+      try {
+        Thread.sleep(250);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        break;
+      }
+    }
     assertIdAddressedRoutesAnswer(Response.Status.OK.getStatusCode());
 
     given()
