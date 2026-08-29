@@ -251,6 +251,87 @@ volume any more**: the container is stateless except for its two databases, so a
 mounting one is carrying dead bytes. Deploy this service alone: replacing it blinks the host every
 other repository's build clones from.
 
+## User stories
+
+Every integration test in `service` is a **userflow**: a `@UserStory` that emits its own
+documentation under `service/target/userstories/<category>/<slug>/` — the steps, the command
+transcripts, the files a story wrote, and a **network diagram** — which `ci-event-userflows.yml`
+publishes as the `@userflows/qits-githost` docs site. The proof and the documentation are the same
+artifact, so neither can go stale without the build going red.
+
+**Three categories, seven stories.**
+
+| category | story | what it proves |
+| --- | --- | --- |
+| `authentication` | On start, the git host fetches the platform's signing keys | the shipped `quarkus.oidc.*` block against a real listener — the one thing no `@QuarkusTest` here can exercise, since `%test` disables the tenant outright |
+| `authentication` | A stranger's token never opens the git host | an unknown key and a wrong audience are both refused at the door |
+| `git` | A developer clones a repository | the PUBLIC clone url serves a real `git clone`, and the clone's HEAD is the commit the origin was given |
+| `git` | A push lands new history | receive-pack moved the ref, and the origin now advertises AND serves what the push carried |
+| `git` | A pull fetches what a teammate pushed | two working copies, two initiators, one repository |
+| `git` | A pipeline reads a file without cloning | the content routes answer a directory and a file in two plain GETs |
+| `browse` | A reader opens a file in the code browser | the SPA's four reads, and that this plane asks qits-projects nothing |
+
+`api/TokenValidationBootstrapIT` owns the first category; the rest live under
+`githost/stories/{git,browse}/` with their support in `githost/stories/support/`.
+
+**One profile, one launched process.** Every story class names
+`TokenValidationBootstrapIT.PackagedWithMockIdp`, so failsafe launches the packaged artifact once
+for the whole IT phase. That is not a speed optimisation: the git stories' only possible network tap
+is the server's own access log, and one process means one log to attribute.
+
+**Two mocks stand in for the platform.** `idp.MockIdp` serves the JWKS and mints every bearer a
+story presents — validation is real, and a token minted for another audience is refused by the same
+code path a deployment runs. A plain `MockService` plays **qits-projects' name resolver**, which is
+what makes `/git/:projectId/:repoName` serve at all; without `qits.projects.name-resolver-url` the
+public scheme 404s and not one git story could clone anything. Both mocks' recordings are registered
+as `NetworkCapture` sources, so the far half of every diagram is observed on the far side rather
+than claimed here.
+
+**The diagram is observed, never narrated.** Three taps feed it and no story method draws an edge:
+
+- the framework's `NetworkTaps.restAssured` for what `TokenValidationBootstrapIT` sends (this
+  repository's hand-copied `StoryNetworkFilter` was deleted when the tap shipped);
+- `stories/support/StoryAccessLog`, which parses `quarkus.http.access-log`'s `%m %U %s` — `%U`
+  carries the query, which is what distinguishes `?service=git-upload-pack` from
+  `?service=git-receive-pack`;
+- the two mock recordings above.
+
+`StoryAccessLog` does two things a copy of the sibling services' access-log tap does not. It decides
+the **kind per line**: the three smart-HTTP shapes are `git` (a negotiated protocol exchange, whose
+transport happening to be HTTP says nothing about what it means) and everything else — the content
+routes, the browser plane — is `http`. And it stamps the **actor per line as it harvests**, rather
+than reading one initiator at drain time, which is what lets the pull story draw the teammate's push
+and the developer's pull as two different people.
+
+**A story drives the public scheme; the fixture drives the storage one.** `stories/support/
+StoryOrigin` provisions and seeds through `/git/:repoId` — it is playing qits-projects' own client,
+which is the only caller with a legitimate reason to speak storage ids — and `StoryAccessLog` drops
+every request on that scheme, because provisioning a fixture is setup rather than a walk anybody
+takes. The two never collide, for the same reason the router can tell them apart: the public scheme
+carries one more path segment. The fixture also **deletes before it creates**, since the storage ids
+are fixed literals and the IT database is not wiped between builds — otherwise "a push lands NEW
+history" would be pushing history that was already there.
+
+**What is asserted, and what is deliberately not.** `assertEdge` pins every arrow;
+`assertOnlyEdgesFrom` pins the actor *set*, which is the honest claim for a git flow because the
+request COUNT of a clone or a push belongs to the client (protocol v2 splits a fetch into two POSTs
+that dedupe into one edge; v0 sends one). `assertEdgeCount` appears exactly twice — the file read
+and the code browser — where the number of requests is a property of the routes rather than of the
+tool. `assertNotLeaked` runs in every git story: the bearer rides on `git -c http.extraHeader` and
+is on four command lines per story, and `Commands.redact` is what keeps it out of the published
+bytes.
+
+Run them alone with:
+
+```
+./mvnw -B -pl service -am -DskipITs=false -Dtest=SKIPNONE \
+  -Dsurefire.failIfNoSpecifiedTests=false -Dit.test='*IT' verify
+```
+
+Both `git` and `curl` must be on `PATH`; a machine without either **skips** the affected classes
+(`@EnabledIf` on `StoryTools`) rather than failing, because a skipped story emits nothing at all,
+which is the honest answer for "this machine has no git".
+
 ## Storage
 
 A repository has no directory anywhere, and no file anywhere either. Its packs, pack indexes and
@@ -313,8 +394,10 @@ for the npmjs cache — the client's committed `.npmrc`); Quinoa itself reuses t
 finds and runs the host's node.
 
 Otherwise the build needs no docker: the suite drives the real `git` CLI against the in-process
-routes, and both databases are real PostgreSQL binaries resolved as Maven artifacts and spawned as a
-child process (zonky). `qits-eventstream` resolves from the platform Maven repository; everything
+routes and — in the userflow ITs — the real `git` and `curl` against the packaged artifact on a
+socket the test JVM is not on, and both databases are real PostgreSQL binaries resolved as Maven
+artifacts and spawned as a child process (zonky). A machine missing either tool skips the story
+classes that need it and stays green. `qits-eventstream` resolves from the platform Maven repository; everything
 else is Maven Central or this reactor. `qits-blobstore` is pinned to
 `1.0.0-pgblobs-SNAPSHOT` while the PostgreSQL blob store is on its branch, so a build here needs
 that branch installed (`./mvnw install` in `libs/qits-blobstore`) until it releases.
