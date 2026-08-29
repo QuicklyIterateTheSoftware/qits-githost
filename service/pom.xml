@@ -7,7 +7,7 @@
     <parent>
         <groupId>eu.wohlben.qits</groupId>
         <artifactId>qits-githost</artifactId>
-        <version>2026.828.201438</version>
+        <version>2026.829.204606</version>
         <relativePath>../pom.xml</relativePath>
     </parent>
 
@@ -186,18 +186,22 @@
             <scope>test</scope>
         </dependency>
         <dependency>
-            <!-- The user-story framework: TokenValidationBootstrapIT is written as a @UserStory,
-                 so the packaged-boot proof doubles as documentation — steps, interactions and a
-                 sequence diagram emitted under target/userstories/. The story is browserless
-                 (no Flow parameter), so the transitive Playwright never launches anything. -->
+            <!-- The user-story framework: every IT in this module is written as a @UserStory, so
+                 the packaged-boot proof and the git-wire proofs double as documentation — steps,
+                 notes, command transcripts and an observed network diagram emitted under
+                 target/userstories/. Every story here is browserless (Interactions + Commands, no
+                 Flow parameter), so the transitive Playwright never launches anything. -->
             <groupId>${project.groupId}</groupId>
             <artifactId>qits-userflows</artifactId>
             <scope>test</scope>
         </dependency>
         <dependency>
-            <!-- The recording service mocks. The IT points quarkus.oidc at idp.MockIdp — a
-                 MockService plus key material: it serves the JWKS for a generated keypair, mints
-                 tokens, records what it answered — the far end of the story's interactions. -->
+            <!-- The recording service mocks, two of them. The ITs point quarkus.oidc at
+                 idp.MockIdp — a MockService plus key material: it serves the JWKS for a generated
+                 keypair, mints the bearers every story presents, and records what it answered. A
+                 plain MockService plays qits-projects' name resolver, which is what makes the
+                 public /git/:projectId/:repoName clone url serve; both recordings are the FAR end
+                 of a story's diagram, drained as NetworkCapture sources. -->
             <groupId>${project.groupId}</groupId>
             <artifactId>qits-service-mock</artifactId>
             <scope>test</scope>
@@ -257,10 +261,13 @@
                 </configuration>
             </plugin>
             <plugin>
-                <!-- TokenValidationBootstrapIT binds here. Unlike the siblings, skipITs is flipped
-                     to false in THIS module's properties, so the IT runs on every `mvn verify`
-                     against the fast-jar; the `native` profile runs the same IT against the
-                     binary. -->
+                <!-- Every userflow binds here — TokenValidationBootstrapIT and the git/browse
+                     story classes alike. Unlike the siblings, skipITs is flipped to false in THIS
+                     module's properties, so they run on every `mvn verify` against the fast-jar;
+                     the `native` profile runs the same set against the binary. They all share one
+                     @TestProfile, so failsafe launches the packaged process ONCE for the whole
+                     phase — which is what lets its access log be a single story-attributed
+                     recording (see stories/support/StoryAccessLog). -->
                 <artifactId>maven-failsafe-plugin</artifactId>
                 <executions>
                     <execution>
