@@ -1,0 +1,20 @@
+# Follow the webui submodule's releases.
+event: SCMRelease
+when:
+  - repository: { exact: qits-spa-githost }
+steps:
+  - image: qits/build-images/node-base:latest
+    timeout-seconds: 600
+    script: |
+      set -eu
+      version=$(node -p 'JSON.parse(process.env.QITS_EVENT_PAYLOAD).version')
+      frontend_url="${QITS_CI_REPOSITORY_URL%/*}/qits-spa-githost"
+      git -c submodule.qits-spa-githost.url="$frontend_url" submodule update --init service/src/main/webui
+      git -C service/src/main/webui fetch "$frontend_url" "refs/tags/$version:refs/tags/$version"
+      git -C service/src/main/webui checkout --detach "$version"
+      target=$(git -C service/src/main/webui rev-parse HEAD)
+      current=$(git ls-tree HEAD service/src/main/webui | awk '{print $3}')
+      if [ "$current" = "$target" ]; then exit 0; fi
+      git update-index --add --cacheinfo 160000,$target,service/src/main/webui
+      git -c user.name="qits release train" -c user.email="release-train@qits.local" commit -q -m "bump(qits-spa-githost@$version): follow qits-spa-githost"
+      git push --force "$QITS_CI_REPOSITORY_URL" HEAD:refs/heads/maintenance/qits-spa-githost
