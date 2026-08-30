@@ -1,5 +1,5 @@
-# The maintenance-branch release. The upstream-spa trigger beside this file bumps the webui gitlink
-# and pushes it onto maintenance/<spa>; this file is what turns that branch into a release, so the
+# The maintenance-branch release. The upstream-frontend trigger beside this file bumps the webui
+# gitlink and pushes it onto maintenance/frontend; this file turns that branch into a release, so the
 # bump reaches main and deploys. Without it a bump lands on its branch and quietly stays there.
 # The gate is a `when:` branch prefix rather than a step-level `branches:` filter, which the event-
 # trigger parser does not allow — and where a branch condition belongs anyway. `checkout:` because
@@ -7,7 +7,11 @@
 # name — the pattern this follows, authorization commentary included.
 event: SCMPublishCommit
 when:
-  - repoId: { exact: qits-githost }
+  # repoName, not repoId: the git host's own coordinate can be an opaque UUID since the
+  # identity cutover, so a name match on repoId is not dependable. The push event echoes the
+  # public name the push was addressed with, which always is; a rename updates this line in
+  # the same campaign.
+  - repoName: { exact: qits-githost-service }
     suppressCi: { exact: "false" }
     branch: { prefix: maintenance/ }
 checkout:

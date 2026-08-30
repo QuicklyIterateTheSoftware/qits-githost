@@ -13,6 +13,15 @@
 # whichever tier listens to the built branch.
 deployment_target: environment
 
+# WHAT THIS REPOSITORY DEPLOYS AS, held still across the repository rename. The repository is
+# qits-githost-service now; the application is still qits-githost, so nothing that is running moves:
+# the swarm service and its wire alias, the container, the image qits/qits-githost the build pushes,
+# the provisioned database, the derived host label, the extras family and the QITS_APPLICATION the
+# container boots with all keep the names they have. Omitted, this name would be DERIVED from the
+# repository, and the rename would read as a decommission plus a new application rather than a
+# rename. Changing the value later is exactly that decommission, so it does not change again.
+application: qits-githost
+
 # `/git` is the smart-HTTP protocol address clients require; `/githost` is this service's machine
 # segment — its API at /githost/api and its health at /githost/q. The edge path-routes every
 # application's route prefixes on EVERY host, so both stay reachable wherever a reader is. The

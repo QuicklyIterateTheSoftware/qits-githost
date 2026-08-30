@@ -15,7 +15,11 @@
 # selects no event its own green run publishes — no cycle.
 event: SCMPublishCommit
 when:
-  - repoId: { exact: qits-githost }
+  # repoName, not repoId: the git host's own coordinate can be an opaque UUID since the
+  # identity cutover, so a name match on repoId is not dependable. The push event echoes the
+  # public name the push was addressed with, which always is; a rename updates this line in
+  # the same campaign.
+  - repoName: { exact: qits-githost-service }
     suppressCi: { exact: "false" }
 checkout:
   branch: branch
@@ -24,7 +28,7 @@ checkout:
 #
 # ONE STEP, TWO HALVES, and the split between them is the whole point:
 #
-#   1. build the git host's client (service/src/main/webui = the qits-spa-githost submodule) HERE,
+#   1. build the git host's client (service/src/main/webui = the qits-githost-frontend submodule) HERE,
 #      in the step container, which can reach the platform's own npm registry — where
 #      @qits/ui-components lives and where nothing else can reach it from;
 #   2. build this repo's docker/Dockerfile, whose builder stage packages that already-built bundle
@@ -70,19 +74,19 @@ steps:
       set -eu
 
       # --- half one: the bundle -----------------------------------------------------------------
-      # The daemon's clone is shallow and does not recurse, so the qits-spa-githost submodule at
+      # The daemon's clone is shallow and does not recurse, so the qits-githost-frontend submodule at
       # service/src/main/webui arrives as an empty directory — and Quinoa fails the image build on
       # exactly that (`No package.json found in Web UI directory`), or worse, disables itself and
       # ships a service with no client. Initialising it here rather than asking the daemon to clone
       # differently keeps the submodule this repo's business: it is a public GitHub repo needing no
       # credentials, and one fetch. The url is derived from this run's own repository url, and the
       # `-c` override is what pins the fetch to the gitlink THIS commit recorded.
-      frontend_url="${QITS_CI_REPOSITORY_URL%/*}/qits-spa-githost"
-      git -c submodule.qits-spa-githost.url="$frontend_url" submodule update --init service/src/main/webui
+      frontend_url="${QITS_CI_REPOSITORY_URL%/*}/qits-githost-frontend"
+      git -c submodule.qits-githost-frontend.url="$frontend_url" submodule update --init service/src/main/webui
 
       cd service/src/main/webui
       # THE LOCKFILE is the one file this step edits, and npm leaves no alternative. npm pins a full
-      # resolved URL per package, and qits-spa-githost's lockfile is generated on the deployment
+      # resolved URL per package, and qits-githost-frontend's lockfile is generated on the deployment
       # host, so every entry names a localhost port that does not exist in this container. `npm ci`
       # fetches tarballs by that URL and never asks the configured registry, so environment alone
       # does not reach them. Replacing the ORIGIN and keeping the path is all it takes, and the
@@ -110,7 +114,7 @@ steps:
         -e "s#(\"resolved\": \")https?://[^/\"]+($npm_hosted_path)#\1$npm_hosted_origin\2#" \
         package-lock.json
 
-      # ENVIRONMENT, not a file. qits-spa-githost COMMITS an .npmrc (registry.dev.localhost:8080 for
+      # ENVIRONMENT, not a file. qits-githost-frontend COMMITS an .npmrc (registry.dev.localhost:8080 for
       # @qits and mirror.dev.localhost:8080 for npmjs, right for a developer on the host), and npm
       # ranks a project .npmrc ABOVE ~/.npmrc — so a `cat > ~/.npmrc` preamble would be written and
       # silently ignored. `npm_config_*` environment outranks both files, so it wins without
@@ -122,7 +126,7 @@ steps:
       # dist/qits-spa-githost/browser — the bundle the image build consumes (it is
       # quarkus.quinoa.build-dir in service/src/main/resources/application.properties, and the path
       # the Dockerfile's `test -f` guard names), and the ONE artifact this half exists to produce.
-      # Lint and test are qits-spa-githost's own pipeline's job; repeating them here would only make
+      # Lint and test are qits-githost-frontend's own pipeline's job; repeating them here would only make
       # this repo red for someone else's commit.
       npm run build
       cd -
