@@ -1,8 +1,8 @@
 package eu.wohlben.qits.githost.persistence;
 
-import eu.wohlben.qits.artifacts.control.BlobStore;
-import eu.wohlben.qits.artifacts.control.ScratchBlob;
-import eu.wohlben.qits.artifacts.error.NotFoundException;
+import eu.wohlben.qits.blobstore.control.BlobStore;
+import eu.wohlben.qits.blobstore.control.ScratchBlob;
+import eu.wohlben.qits.blobstore.error.NotFoundException;
 import eu.wohlben.qits.githost.storage.PackBlobStore;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
