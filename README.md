@@ -1,8 +1,9 @@
-# qits-githost
+# qits-githost-service
 
-The platform's git smart-HTTP host. Every repository qits serves is here: workspace containers
-clone and push over HTTP, qits-ci reads a pipeline config out of one file, qits-workspaces releases
-through it, and a push announces itself to the platform as a durable domain event.
+The platform's git smart-HTTP host, deployed as the `qits-githost` application. Every repository
+qits serves is here: workspace containers clone and push over HTTP, qits-ci reads a pipeline config
+out of one file, qits-workspaces releases through it, and a push announces itself to the platform as
+a durable domain event.
 
 It also serves a page. Since the client landed, this is not a wire-protocol-only service: it carries
 its own Angular SPA — served at `/` on this service's own host, `githost.<env>.<domain>` — and the
@@ -20,7 +21,7 @@ is an env service, so an env-scoped git host is the consistent shape.
 |---|---|
 | `git-storage` | The storage engine: a JGit `DfsRepository` whose packs, pack indexes and reftables are content-addressed blobs. A plain library jar with ONE compile dependency (JGit) and two ports it declares and does not implement. |
 | `githost-events` | The event vocabulary. Depends on `qits-eventstream` and nothing else. **This is the jar a consumer depends on.** |
-| `service` | The deployable: the Vert.x routes, the REST API, the Angular client (`src/main/webui`, the `qits-spa-githost` submodule, served by Quinoa), the two port adapters over `qits-blobstore`, the schema, and the publisher. |
+| `service` | The deployable: the Vert.x routes, the REST API, the Angular client (`src/main/webui`, the `qits-githost-frontend` submodule, served by Quinoa), the two port adapters over `qits-blobstore`, the schema, and the publisher. |
 
 ## Addresses
 
@@ -32,7 +33,7 @@ protocol's; the edge path-routes both on every host, so nothing that names them 
 |---|---|
 | `/git/**` | The git wire protocol. Plain Vert.x routes, the prefix a literal in `GitHostRoutes` — git treats the base as opaque, so no config key can move it. |
 | `/githost/api/**` | The REST API (`quarkus.rest.path`), read by the client and by nothing that speaks git. |
-| `/` | The Angular client, built and served by Quinoa out of `service/src/main/webui` (the `qits-spa-githost` submodule). The old bare-`/githost` trailing-slash wart (upstream quinoa #960) went with the move to the root. |
+| `/` | The Angular client, built and served by Quinoa out of `service/src/main/webui` (the `qits-githost-frontend` submodule). The old bare-`/githost` trailing-slash wart (upstream quinoa #960) went with the move to the root. |
 | `/githost/q/**` | Quarkus' non-application root: health, and nothing else here. |
 
 Because the client sits at the root, `/git` and `/bootstrap-git` are inside the SPA fallback's reach
@@ -114,7 +115,7 @@ ask.
 
 ### The client
 
-`service/src/main/webui` is the `qits-spa-githost` submodule, an Angular 21 SPA that Quinoa builds
+`service/src/main/webui` is the `qits-githost-frontend` submodule, an Angular 21 SPA that Quinoa builds
 during `mvn package` and serves at `/`. Its `baseHref` is `"/"` and the pairing is spelled in two
 repositories — here as `quarkus.quinoa.ui-root-path`, there in `angular.json` — so a mismatch serves
 a page whose every asset 404s. `docs/project-setup-quinoa-angular.md` in the superproject is
@@ -400,7 +401,7 @@ artifacts and spawned as a child process (zonky). A machine missing either tool 
 classes that need it and stays green. `qits-eventstream` resolves from the platform Maven repository; everything
 else is Maven Central or this reactor. `qits-blobstore` is pinned to
 `1.0.0-pgblobs-SNAPSHOT` while the PostgreSQL blob store is on its branch, so a build here needs
-that branch installed (`./mvnw install` in `libs/qits-blobstore`) until it releases.
+that branch installed (`./mvnw install` in `components/qits-registries/qits-registries-javalib`) until it releases.
 
 On the deployment host add `-Dquarkus.http.test-port=0`: Quarkus' default test port 8081 is the
 platform's npm registry there, and the whole suite otherwise dies with `Port already bound: 8081`,
