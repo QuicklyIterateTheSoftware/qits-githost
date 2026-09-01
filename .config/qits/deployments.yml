@@ -33,14 +33,25 @@ routes: /githost,/git
 # audit at the root serves every project rather than belonging to one — at position 5, after
 # System:4. The six `Code` entries are the per-repository links: one in every category's details
 # slot, so each service, daemon, lib, frontend, cli tool and image offers its committed contents at
-# `/<slug>/<category>/<repo>/` on this host. Position 3 is Code's place in the platform's fixed
-# order of the per-repository applications (Api Docs 1, Docs 2, Code 3, CI 4, Artifacts 5, Configuration 6, Workspaces 7);
-# no subpath, because the Code page IS the repository root.
+# `/<slug>/<category>/<repo>/` on this host. Position 4 is Code's place in the platform's fixed
+# order of the per-repository applications (Api Docs 1, Docs 2, Release Requests 3, Code 4, CI 5,
+# Artifacts 6, Configuration 7, Workspaces 8); no subpath, because the Code page IS the repository
+# root.
+#
+# CODE MOVED 3 -> 4 ON 2026-09-01, and nothing about this application changed. qits-projects put a
+# Release Requests row at position 3, above Code, and every entry from Code down moved up one in the
+# same change — this file, qits-ci, qits-artifacts, qits-configuration and qits-workspaces, one line
+# each. The order is stated in integers rather than left to the edge's position-then-label tie-break:
+# equal positions would have sorted "Code" before "Release Requests" anyway, and even where the
+# alphabet happened to agree it would have made the order an accident of the labels.
+#
+# `system.Githost:5` is untouched — that is the GLOBAL group's numbering, a different slot with a
+# different sequence, and the per-repository renumber does not reach it.
 #
 # The host is not spelled because the derived one is already right: the application name minus its
 # `qits-` prefix is `githost`, which is the label every clone url already carries. The browser plane
 # and the git plane land on the same authority by design, not by accident.
-navigation-entries: system.Githost:5, services.details.Code:3, daemons.details.Code:3, libs.details.Code:3, frontends.details.Code:3, cli.details.Code:3, images.details.Code:3
+navigation-entries: system.Githost:5, services.details.Code:4, daemons.details.Code:4, libs.details.Code:4, frontends.details.Code:4, cli.details.Code:4, images.details.Code:4
 
 # TWO DATABASES, because this application opens two datasources with two Flyway lineages.
 # qits-deployments creates a login role and a database for each on the postgres of this tier before
