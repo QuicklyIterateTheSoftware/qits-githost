@@ -60,7 +60,7 @@ served only to that client's self-role (see Configuration).
 | `POST /git/:projectId/:repoName/git-upload-pack` | Fetch / clone. |
 | `POST /git/:projectId/:repoName/git-receive-pack` | Push. |
 | `GET /git/:projectId/:repoName/blob/:rev/<path>` | The raw bytes at that path in that revision. `Git-Commit-Sha` names the resolved commit. |
-| `GET /git/:projectId/:repoName/tree/:rev[/<path>]` | `{"entries":[{"name","type"}]}` for the directory there. |
+| `GET /git/:projectId/:repoName/tree/:rev[/<path>]` | `{"entries":[{"name","type"}]}` for the directory there. `type` is `tree`, `blob` or `commit`; a `commit` is a submodule gitlink and carries `sha` (the pinned commit) and `mode` (`"160000"`) as well. |
 | `GET /git` | `{"repositories": ["<repoId>", …]}` — every repository this host serves, sorted. Storage ids. |
 | `PUT /git/:repoId` | Create, idempotently. Body `{"defaultBranch": "main"}`. 201 created, 200 already there. |
 | `GET /git/:repoId` | `{"repoId", "defaultBranch"}`, or 404. |

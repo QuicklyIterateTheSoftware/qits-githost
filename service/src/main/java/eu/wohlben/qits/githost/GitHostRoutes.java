@@ -138,7 +138,7 @@ import org.jboss.logging.Logger;
  *       <path>} — the raw bytes at that path in that revision.
  *   <li>{@code GET …/:repoId/tree/:rev[/<path>]} and {@code GET …/:projectId/:repoName/tree/:rev[/
  *       <path>]} — {@code {"entries":[{"name","type"}]}} for the directory there; no path is the
- *       root tree.
+ *       root tree. A submodule gitlink is typed {@code commit} and carries the {@code sha} it pins.
  * </ul>
  *
  * <p>The wire protocol has no blob-at-path verb, so a consumer that wanted one file had to keep a
@@ -903,10 +903,29 @@ public class GitHostRoutes {
    * directory at that revision, no path meaning the root tree. 404 when the revision or the path
    * does not resolve, and when the path resolves to something that is not a tree.
    *
-   * <p>{@code type} is {@code tree} or {@code blob} and nothing else: a symlink and a submodule
-   * gitlink are listed as {@code blob}, because what a caller does with an entry is descend into it
-   * or read it, and neither of those can be descended into. The order is the tree's own — git's
-   * canonical sort — so it is stable across revisions without this route sorting anything.
+   * <p>{@code type} is {@code tree}, {@code blob} or {@code commit}. A symlink is listed as {@code
+   * blob}, because what a caller does with an entry is descend into it or read it, and a symlink is
+   * read. A <b>submodule gitlink</b> is neither: it is a pointer, and it is the one entry kind whose
+   * value is not its bytes but the sha it names. So a gitlink — and only a gitlink — carries two
+   * more fields, {@code sha} (the commit it pins, 40 hex) and {@code mode} ({@code "160000"}), and
+   * its {@code type} is git's own name for that entry, {@code commit}.
+   *
+   * <p>The consumer is qits-platform-maintenance, which scans gitlink pins: a pin's version <i>is</i>
+   * the sha of the mode-160000 entry, and its {@code GitHostReader} reads both {@code sha} and
+   * {@code mode}/{@code type} off this answer, pinning nothing (with a WARN) when they are absent.
+   * The fields stay gitlink-only rather than going on every entry: a sha on each blob and tree would
+   * be uniform but would grow every listing of a big directory for readers that never asked, and no
+   * caller has needed a blob's object id — the {@code blob} route addresses content by path, not by
+   * id. A reader that switches on {@code type} keeps working: nothing that was {@code tree} or
+   * {@code blob} moved, only the gitlinks that used to collapse into {@code blob}.
+   *
+   * <p>Descending into a gitlink stays a 404 on both this route and the blob route, which is the
+   * truth: the submodule's objects live in another repository and this one holds none of them. The
+   * {@code sha} on the entry is the whole answer about a gitlink — read the pinned repository at
+   * that sha to go further.
+   *
+   * <p>The order is the tree's own — git's canonical sort — so it is stable across revisions without
+   * this route sorting anything.
    */
   private void serveTree(RoutingContext rc) {
     String rev = decodePercent(rc.pathParam("rev"));
@@ -974,10 +993,7 @@ public class GitHostRoutes {
         walker.addTree(tree);
         walker.setRecursive(false);
         while (walker.next()) {
-          entries.add(
-              new JsonObject()
-                  .put("name", walker.getNameString())
-                  .put("type", FileMode.TREE.equals(walker.getFileMode(0)) ? "tree" : "blob"));
+          entries.add(entry(walker));
         }
       }
       rc.response()
@@ -989,6 +1005,22 @@ public class GitHostRoutes {
     } catch (Exception e) {
       fail(rc, "git-tree", e);
     }
+  }
+
+  /**
+   * One listing entry: {@code name} and {@code type} for anything, plus {@code sha} and {@code mode}
+   * for a gitlink, which is a pin rather than content. See {@link #serveTree(RoutingContext)}.
+   */
+  private static JsonObject entry(TreeWalk walker) {
+    FileMode mode = walker.getFileMode(0);
+    JsonObject entry = new JsonObject().put("name", walker.getNameString());
+    if (FileMode.GITLINK.equals(mode)) {
+      return entry
+          .put("type", "commit")
+          .put("sha", walker.getObjectId(0).name())
+          .put("mode", "160000");
+    }
+    return entry.put("type", FileMode.TREE.equals(mode) ? "tree" : "blob");
   }
 
   /** The tree object at {@code path}, or {@code null} if there is none or it is not a tree. */

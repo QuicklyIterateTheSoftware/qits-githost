@@ -4,6 +4,7 @@ import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItems;
+import static org.hamcrest.Matchers.nullValue;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -343,6 +344,48 @@ public class GitHostTest {
         .body("entries.size()", equalTo(1))
         .body("entries[0].name", equalTo("guide.md"))
         .body("entries[0].type", equalTo("blob"));
+  }
+
+  @Test
+  public void aSubmoduleGitlinkIsListedAsACommitCarryingThePinnedSha() throws Exception {
+    // qits-platform-maintenance scans gitlink pins, and a pin's version IS the sha of the
+    // mode-160000 tree entry — so the entry has to carry it. Everything else in the listing keeps
+    // the shape it had, which is the other half of what is asserted here.
+    String repoId = contentOrigin();
+    Path clone = GitHostFixture.clone(gitBase, repoId);
+    // Any sha will do — a submodule's commits live in the submodule, not here — but the seeded
+    // repository's own tip is one this host can be seen not to be resolving.
+    String pinned = GitHostFixture.head(clone);
+    GitHostFixture.commitGitlink(clone, "pinned-module", pinned, "pin a submodule");
+    GitHostFixture.git(clone, "git", "push", "origin", "main");
+
+    given()
+        .when()
+        .get("/git/" + repoId + "/tree/main")
+        .then()
+        .statusCode(Response.Status.OK.getStatusCode())
+        .body("entries.find { it.name == 'pinned-module' }.type", equalTo("commit"))
+        .body("entries.find { it.name == 'pinned-module' }.sha", equalTo(pinned))
+        .body("entries.find { it.name == 'pinned-module' }.mode", equalTo("160000"))
+        // Unchanged for everything that is not a gitlink: name and type, and no more than that.
+        .body("entries.find { it.name == 'README.md' }.type", equalTo("blob"))
+        .body("entries.find { it.name == 'README.md' }.sha", nullValue())
+        .body("entries.find { it.name == 'README.md' }.mode", nullValue())
+        .body("entries.find { it.name == 'docs' }.type", equalTo("tree"))
+        .body("entries.find { it.name == 'docs' }.sha", nullValue());
+
+    // A gitlink cannot be descended into: the objects it names are in another repository and this
+    // one holds none of them. The sha on the entry is the whole answer.
+    given()
+        .when()
+        .get("/git/" + repoId + "/tree/main/pinned-module")
+        .then()
+        .statusCode(Response.Status.NOT_FOUND.getStatusCode());
+    given()
+        .when()
+        .get("/git/" + repoId + "/blob/main/pinned-module")
+        .then()
+        .statusCode(Response.Status.NOT_FOUND.getStatusCode());
   }
 
   @Test
