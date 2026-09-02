@@ -150,6 +150,21 @@ final class GitHostFixture {
   }
 
   /**
+   * Adds a <b>submodule gitlink</b> — a mode-160000 entry pinning {@code sha} at {@code path} — and
+   * commits it; returns the repository directory for chaining.
+   *
+   * <p>Written straight into the index rather than through {@code git submodule add}, because that
+   * porcelain wants a second repository to clone and a {@code .gitmodules} to write, and neither is
+   * part of what a gitlink is on the wire: the tree entry, and the sha it names. {@code sha} need
+   * not be an object this repository holds — a submodule's commits live in the submodule.
+   */
+  static Path commitGitlink(Path repo, String path, String sha, String message) throws Exception {
+    git(repo, "git", "update-index", "--add", "--cacheinfo", "160000," + sha + "," + path);
+    gitCommitting(repo, "commit", "-q", "-m", message);
+    return repo;
+  }
+
+  /**
    * Rewrites the tip in place, so the local branch and the origin's share a parent but neither is an
    * ancestor of the other — the shape JGit types as {@code UPDATE_NONFASTFORWARD} once its own
    * {@code validateCommands()} has run, which is what the fast-forward-only rule keys on.
