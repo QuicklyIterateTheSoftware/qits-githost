@@ -113,6 +113,50 @@ throw rather than fall back, which is the 2026-08-11 lesson (`fe26a6c`) applied 
 out: a page told "no repositories" shows an empty host, and nothing on it says the service could not
 ask.
 
+### The git primitives
+
+Beside the browser's reads sit the **write primitives** — generic git operations a domain service
+composes, all of them **in-core against the bare** (JGit, no worktree, no clone, no checkout) and all
+of them **machine-only** (`qits:system`; a browser session's `qits:admin` is refused). They speak
+refs, shas and paths and know nothing about what they are being used for.
+
+| Route | What it does |
+|---|---|
+| `POST /githost/api/repositories/{repoId}/merges` | Octopus-merges N sources into a target branch ref. |
+
+```
+POST /githost/api/repositories/<repoId>/merges
+{"target": "refs/heads/release/17",
+ "sources": ["refs/heads/main", "feature/x", "refs/tags/2026.901.1", "<sha>"],
+ "message": "…",                                  // optional
+ "author": {"name": "…", "email": "…"}}           // optional
+
+200 {"target": "refs/heads/release/17", "sha": "<commit>", "outcome": "merged",
+     "parents": ["…", "…"], "skipped": ["refs/heads/main"]}
+409 {"error": "merge-conflict", "target": "…",
+     "conflicts": [{"path": "pom.xml", "head": "feature/x", "headSha": "…", "reason": "content"}]}
+```
+
+**The target's own tip is the first head**, which is what makes this git's octopus rather than an
+invention: `git merge A B C` folds onto `HEAD` and writes four parents, and the target ref plays
+`HEAD` here. A head another head already contains is dropped — git's own "Already up to date" — and
+the two properties that matter fall out of that one rule:
+
+- **nothing changed since the last merge → no new commit.** Every source is then a parent of the
+  target's tip, so every source drops out and the target is the only head left: `outcome`
+  `unchanged`, the same sha as last time. Re-merging is free and leaves no garbage.
+- **one effective head → no empty octopus.** The ref is created at it or fast-forwarded onto it
+  (`outcome` `fast-forward`); a one-parent "merge" is never written.
+
+`outcome` is therefore one of `merged`, `fast-forward` and `unchanged`. **A conflict moves no ref**
+and is reported, never resolved: the paths, and for each the head that was being folded in when it
+broke, spelled as the caller spelled it.
+
+**These writes fire no `post-receive` and publish no events.** That inverts the property the DFS
+storage was built for — receive-pack as the only writer — deliberately: the caller is a domain
+service already narrating what it is doing, and an `SCMPublishCommit` per intermediate merge would
+announce steps nobody outside it can act on.
+
 ### The client
 
 `service/src/main/webui` is the `qits-githost-frontend` submodule, an Angular 21 SPA that Quinoa builds
@@ -209,6 +253,7 @@ lineage, the retry budget). What this service owns is in
 | `QITS_REPOSITORIES_GIT_PROTECT_DEFAULT_BRANCH` | The default branch's seatbelt. Ships `false`. |
 | `QITS_REPOSITORIES_GIT_PUSH_TOKEN` | What `-o qits.token=<value>` must match. No default: unset means no token matches. |
 | `QITS_REPOSITORIES_GIT_MAX_PACK_SIZE` | The largest push this host accepts. Ships `64M`. |
+| `QITS_GIT_AUTHOR_NAME` / `QITS_GIT_AUTHOR_EMAIL` | Who a commit the git primitives manufacture belongs to. The platform's key pair — qits-workspaces reads the same one — defaulting to `qits <qits@local>`. |
 
 There is no variable for where the bytes go any more. `qits.artifacts.blobs-datasource=githost`
 points the blob store at this service's own database, and a deployment has no reason to move it.
