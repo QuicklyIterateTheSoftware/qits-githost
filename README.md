@@ -123,6 +123,9 @@ refs, shas and paths and know nothing about what they are being used for.
 | Route | What it does |
 |---|---|
 | `POST /githost/api/repositories/{repoId}/merges` | Octopus-merges N sources into a target branch ref. |
+| `POST /githost/api/repositories/{repoId}/tags` | Creates an annotated tag at a sha. **Refuses an existing tag.** |
+| `POST /githost/api/repositories/{repoId}/commits` | Writes a map of path → content as one commit on a branch ref. |
+| `DELETE /githost/api/repositories/{repoId}/branches/{name}` | Deletes a branch ref. Never the default branch. |
 
 ```
 POST /githost/api/repositories/<repoId>/merges
@@ -151,6 +154,52 @@ the two properties that matter fall out of that one rule:
 `outcome` is therefore one of `merged`, `fast-forward` and `unchanged`. **A conflict moves no ref**
 and is reported, never resolved: the paths, and for each the head that was being folded in when it
 broke, spelled as the caller spelled it.
+
+```
+POST /githost/api/repositories/<repoId>/tags
+{"name": "2026.903.120000",          // or the full refs/tags/… ref
+ "sha": "refs/heads/release/17",     // a ref, tag or sha naming the commit to tag
+ "message": "…",                     // optional, defaults to the tag's own name
+ "author": {"name": "…", "email": "…"}}
+
+201 {"tag": "refs/tags/2026.903.120000", "sha": "<tag object>", "object": "<commit>"}
+409 {"error": "tag-exists", "tag": "refs/tags/2026.903.120000", "sha": "<what the ref says>"}
+```
+
+**The 409 is the contract**, not a nicety: it is the platform's version-uniqueness guarantee, and it
+replaces the atomic branch-and-tag push the workspaces release door relied on. A caller stamps a
+version, asks for the tag, and `tag-exists` means "somebody already released that — stamp another
+one", distinguishable from every other way the request could fail. The race is refused the same way:
+the ref is created with an expected-old of zero, so two callers asking for one name produce one tag
+and one refusal. Tags are always annotated.
+
+```
+POST /githost/api/repositories/<repoId>/commits
+{"ref": "refs/heads/release/17",
+ "message": "bump the manifests",
+ "files": {"pom.xml": "…", "web/package.json": "…"},   // path -> UTF-8 content
+ "deletePaths": ["old/thing.txt"],                     // optional
+ "author": {"name": "…", "email": "…"}}                // optional
+
+200 {"ref": "…", "sha": "<commit>", "parent": "<old tip>", "outcome": "committed" | "unchanged"}
+409 {"error": "ref-moved", …}     // the branch moved under the caller
+```
+
+The content is the caller's — this host writes it and reads none of it, which is why the primitive is
+a map of paths and not an operation on manifests. **An edit that produces the tip's own tree writes
+nothing** (`unchanged`, ref untouched), so a retried bump after a timeout is free rather than a
+second empty commit. The ref moves as a compare-and-swap against the tip the request read.
+
+```
+DELETE /githost/api/repositories/<repoId>/branches/release/17      // 204
+DELETE /githost/api/repositories/<repoId>/branches/main            // 409 {"error":"protected-branch"}
+```
+
+The name is the path tail, so a slashy branch needs no encoding dance, and `refs/heads/…` is accepted
+as well. **The default branch is refused unconditionally** — `ProtectedRefHook` guards the same ref
+on the push door, and this door would otherwise be a hole in that seatbelt shaped like an HTTP call.
+Unconditionally rather than under that hook's `protect-default-branch` switch: the switch ships off
+because this host serves its own redeploy pushes, an argument about pushes that this door is not.
 
 **These writes fire no `post-receive` and publish no events.** That inverts the property the DFS
 storage was built for — receive-pack as the only writer — deliberately: the caller is a domain

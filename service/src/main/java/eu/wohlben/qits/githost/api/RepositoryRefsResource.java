@@ -7,6 +7,7 @@ import io.quarkus.runtime.annotations.RegisterForReflection;
 import jakarta.annotation.security.RolesAllowed;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
+import jakarta.ws.rs.DELETE;
 import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.PathParam;
@@ -15,6 +16,7 @@ import jakarta.ws.rs.ServerErrorException;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -23,9 +25,14 @@ import java.util.Set;
 import java.util.TreeSet;
 import org.eclipse.jgit.errors.IncorrectObjectTypeException;
 import org.eclipse.jgit.errors.MissingObjectException;
+import org.eclipse.jgit.dircache.DirCache;
+import org.eclipse.jgit.dircache.DirCacheBuilder;
+import org.eclipse.jgit.dircache.DirCacheEditor;
+import org.eclipse.jgit.dircache.DirCacheEntry;
 import org.eclipse.jgit.errors.RevisionSyntaxException;
 import org.eclipse.jgit.lib.CommitBuilder;
 import org.eclipse.jgit.lib.Constants;
+import org.eclipse.jgit.lib.FileMode;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.ObjectInserter;
 import org.eclipse.jgit.lib.ObjectReader;
@@ -33,6 +40,7 @@ import org.eclipse.jgit.lib.PersonIdent;
 import org.eclipse.jgit.lib.Ref;
 import org.eclipse.jgit.lib.RefUpdate;
 import org.eclipse.jgit.lib.Repository;
+import org.eclipse.jgit.lib.TagBuilder;
 import org.eclipse.jgit.merge.MergeStrategy;
 import org.eclipse.jgit.merge.ResolveMerger;
 import org.eclipse.jgit.revwalk.RevCommit;
@@ -40,8 +48,9 @@ import org.eclipse.jgit.revwalk.RevWalk;
 import org.jboss.logging.Logger;
 
 /**
- * {@code POST /githost/api/repositories/{repoId}/merges} — the git primitives the platform's
- * release flow is orchestrated out of, and the first writes this host performs that are not a push.
+ * {@code POST /githost/api/repositories/{repoId}/{merges|tags|commits}} and {@code DELETE
+ * …/branches/{name}} — the git primitives the platform's release flow is orchestrated out of, and
+ * the first writes this host performs that are not a push.
  *
  * <h2>Primitives, not a release flow</h2>
  *
@@ -115,6 +124,18 @@ public class RepositoryRefsResource {
   /** The most heads one merge will fold. A bound, not a policy — it keeps a runaway body cheap. */
   private static final int MAX_SOURCES = 64;
 
+  /**
+   * What one commit-onto-ref will write. Bounds rather than policy, for the same reason {@code
+   * GitHostRoutes.MAX_BLOB_BYTES} is a constant and not a key: this endpoint exists for manifests —
+   * poms, package.jsons, a lockfile — and a caller with a repository's worth of bytes to write
+   * pushes them.
+   */
+  private static final int MAX_FILES = 512;
+
+  private static final int MAX_FILE_BYTES = 1024 * 1024;
+
+  private static final int MAX_PATH_LENGTH = 1024;
+
   @Inject GitRepositoryProvider repositories;
 
   @Inject GitIdentity identity;
@@ -159,6 +180,50 @@ public class RepositoryRefsResource {
   @RegisterForReflection
   public record MergeConflictResponse(
       String error, String target, List<ConflictedPath> conflicts) {}
+
+  /**
+   * An annotated tag at {@code sha}. {@code name} is a tag name ({@code 2026.903.120000}) or the
+   * full ref ({@code refs/tags/2026.903.120000}); {@code sha} is a ref, tag or sha naming the
+   * commit to tag. {@code message} defaults to the tag's own name.
+   */
+  @RegisterForReflection
+  public record TagRequest(String name, String sha, String message, Author author) {}
+
+  /**
+   * The created tag. {@code sha} is the <b>tag object</b> — this host only makes annotated tags, so
+   * the ref and the commit are never the same id — and {@code object} is the commit it points at.
+   */
+  @RegisterForReflection
+  public record TagResponse(String tag, String sha, String object) {}
+
+  /**
+   * The refusal a tag that already exists gets, and the whole point of the endpoint: {@code error}
+   * is {@code tag-exists} and {@code sha} is what the ref already says, so a caller that is using
+   * tag creation as its uniqueness guarantee learns both facts from one answer.
+   */
+  @RegisterForReflection
+  public record TagExistsResponse(String error, String tag, String sha) {}
+
+  /**
+   * One commit's worth of file changes on a branch ref. {@code files} is path → UTF-8 content,
+   * {@code deletePaths} is paths to remove; at least one of the two must say something. The content
+   * is the caller's — this host writes it and reads none of it.
+   */
+  @RegisterForReflection
+  public record CommitRequest(
+      String ref,
+      String message,
+      Map<String, String> files,
+      List<String> deletePaths,
+      Author author) {}
+
+  /**
+   * What the ref now is. {@code outcome} is {@code committed} (a commit was written and the ref
+   * fast-forwarded onto it) or {@code unchanged} (the edits produced the tip's own tree, so there
+   * was nothing to commit and the ref did not move).
+   */
+  @RegisterForReflection
+  public record CommitResponse(String ref, String sha, String parent, String outcome) {}
 
   /**
    * The house error shape, with room for the thing that was wrong. {@code error} is a code a caller
@@ -377,6 +442,311 @@ public class RepositoryRefsResource {
     }
   }
 
+  /**
+   * The annotated tag, and the platform's version-uniqueness guarantee.
+   *
+   * <p><b>An existing tag ref is refused with an answer of its own</b> — 409 and {@code
+   * {"error": "tag-exists", …}} — and that distinction is the contract, not a nicety. It replaces
+   * the atomic branch-and-tag push the workspaces release door used to rely on: a caller stamps a
+   * version, asks for the tag, and a 409 means "somebody already released that version, stamp
+   * another one". Anything else that goes wrong answers differently, so the caller can tell a taken
+   * name from a broken host.
+   *
+   * <p>The race is refused the same way. The ref is created with an expected-old of zero, so two
+   * callers asking for one name at once produce one tag and one {@code tag-exists} — the check is
+   * not a look-before-you-leap that a second process can slip through.
+   *
+   * <p>Always <b>annotated</b>: a tag object with a tagger, a time and a message, so a released
+   * version carries who made it and when. A lightweight tag would be a ref this endpoint could not
+   * tell from a branch tip.
+   */
+  @POST
+  @Path("/tags")
+  @Consumes(MediaType.APPLICATION_JSON)
+  public Response tag(@PathParam("repoId") String repoId, TagRequest request) {
+    if (!isValidRepoId(repoId)) {
+      return badRequest("repoId must match " + REPO_ID_PATTERN);
+    }
+    if (request == null) {
+      return badRequest("a tag needs a body");
+    }
+    String tagRef = tagRef(request.name());
+    if (tagRef == null) {
+      return badRequest("name must be a valid tag name or a refs/tags/… ref name");
+    }
+    if (!isValidRev(request.sha())) {
+      return badRequest("sha must match " + REV_PATTERN);
+    }
+
+    try (Repository repo = repositories.open(repoId)) {
+      if (repo == null) {
+        return notFound("no-such-repository", repoId);
+      }
+      Ref existing = repo.getRefDatabase().exactRef(tagRef);
+      if (existing != null) {
+        return tagExists(tagRef, existing);
+      }
+      try (ObjectInserter inserter = repo.newObjectInserter();
+          ObjectReader reader = inserter.newReader();
+          RevWalk walk = new RevWalk(reader)) {
+        ObjectId id;
+        try {
+          id = repo.resolve(request.sha());
+        } catch (RevisionSyntaxException e) {
+          return badRequest("sha is not a ref, tag or sha: " + request.sha());
+        }
+        if (id == null) {
+          return notFound("no-such-object", request.sha());
+        }
+        RevCommit commit;
+        try {
+          commit = walk.parseCommit(id);
+        } catch (MissingObjectException | IncorrectObjectTypeException e) {
+          return badRequest("sha does not name a commit: " + request.sha());
+        }
+        String name = tagRef.substring(Constants.R_TAGS.length());
+        TagBuilder builder = new TagBuilder();
+        builder.setTag(name);
+        builder.setObjectId(commit);
+        builder.setTagger(authorOf(request.author()));
+        builder.setMessage(tagMessage(request, name));
+        ObjectId tagId = inserter.insert(builder);
+        inserter.flush();
+
+        Response refused = moveRef(repo, tagRef, null, tagId, "tag " + name);
+        if (refused != null) {
+          // Lost the race between the read above and this update: the other caller's tag is the
+          // one that exists, and this caller must learn that rather than a generic conflict.
+          Ref raced = repo.getRefDatabase().exactRef(tagRef);
+          return raced != null ? tagExists(tagRef, raced) : refused;
+        }
+        return Response.status(Response.Status.CREATED)
+            .entity(new TagResponse(tagRef, tagId.name(), commit.name()))
+            .build();
+      }
+    } catch (Exception e) {
+      throw unavailable("could not tag " + tagRef + " in repository " + repoId, e);
+    }
+  }
+
+  /**
+   * One commit's worth of files onto a branch ref, in-core: read the tip's tree, apply the edits,
+   * write the new tree, commit it onto the tip and fast-forward the ref.
+   *
+   * <p><b>The content is the caller's and this host reads none of it.</b> The commit that stamps a
+   * manifest version is qits-projects' work — it knows what a pom and a package.json are; here they
+   * are paths and bytes. That is the whole reason this primitive is a map rather than an operation.
+   *
+   * <p><b>An edit that changes nothing writes nothing.</b> If the built tree is the tip's own tree,
+   * the answer is {@code unchanged} with the tip's sha and the ref does not move — so a retried
+   * bump after a timeout is free rather than a second empty commit.
+   *
+   * <p>The ref moves as a compare-and-swap against the tip this request read, so a branch that moved
+   * underneath a slow caller is a 409 rather than a lost commit.
+   */
+  @POST
+  @Path("/commits")
+  @Consumes(MediaType.APPLICATION_JSON)
+  public Response commit(@PathParam("repoId") String repoId, CommitRequest request) {
+    if (!isValidRepoId(repoId)) {
+      return badRequest("repoId must match " + REPO_ID_PATTERN);
+    }
+    if (request == null) {
+      return badRequest("a commit needs a body");
+    }
+    if (!isBranchRef(request.ref())) {
+      return badRequest("ref must be a valid refs/heads/… ref name");
+    }
+    Map<String, String> files = request.files() == null ? Map.of() : request.files();
+    List<String> deletions = request.deletePaths() == null ? List.of() : request.deletePaths();
+    if (files.isEmpty() && deletions.isEmpty()) {
+      return badRequest("a commit must write or delete at least one path");
+    }
+    if (files.size() + deletions.size() > MAX_FILES) {
+      return badRequest("at most " + MAX_FILES + " paths in one commit");
+    }
+    for (String path : files.keySet()) {
+      if (!isValidPath(path)) {
+        return badRequest("not a repository-relative file path: " + path);
+      }
+      String content = files.get(path);
+      if (content == null) {
+        return badRequest("no content for " + path + " (a deletion goes in deletePaths)");
+      }
+      if (content.getBytes(StandardCharsets.UTF_8).length > MAX_FILE_BYTES) {
+        return badRequest(path + " is larger than " + MAX_FILE_BYTES + " bytes");
+      }
+    }
+    for (String path : deletions) {
+      if (!isValidPath(path)) {
+        return badRequest("not a repository-relative file path: " + path);
+      }
+    }
+    if (request.message() == null || request.message().isBlank()) {
+      return badRequest("a commit needs a message");
+    }
+
+    try (Repository repo = repositories.open(repoId)) {
+      if (repo == null) {
+        return notFound("no-such-repository", repoId);
+      }
+      Ref branch = repo.getRefDatabase().exactRef(request.ref());
+      if (branch == null || branch.getObjectId() == null) {
+        return notFound("no-such-ref", request.ref());
+      }
+      ObjectId tip = branch.getObjectId();
+      try (ObjectInserter inserter = repo.newObjectInserter();
+          ObjectReader reader = inserter.newReader();
+          RevWalk walk = new RevWalk(reader)) {
+        RevCommit parent = walk.parseCommit(tip);
+        ObjectId tree = editedTree(inserter, reader, parent, files, deletions);
+        if (tree.equals(parent.getTree())) {
+          return Response.ok(
+                  new CommitResponse(request.ref(), parent.name(), parent.name(), "unchanged"))
+              .build();
+        }
+        ObjectId committed =
+            insertCommit(
+                inserter,
+                tree,
+                List.of(tip),
+                authorOf(request.author()),
+                request.message());
+        inserter.flush();
+        Response refused = moveRef(repo, request.ref(), tip, committed, "commit onto " + request.ref());
+        if (refused != null) {
+          return refused;
+        }
+        return Response.ok(
+                new CommitResponse(request.ref(), committed.name(), parent.name(), "committed"))
+            .build();
+      }
+    } catch (Exception e) {
+      throw unavailable("could not commit onto " + request.ref() + " of repository " + repoId, e);
+    }
+  }
+
+  /**
+   * Deletes a branch ref — a release request's backing branch and the source branches it consumed,
+   * in the flow this exists for.
+   *
+   * <p><b>The repository's default branch is refused, always.</b> {@code ProtectedRefHook} guards
+   * the same ref on the push door, and this door has to guard it too or the seatbelt would have a
+   * hole shaped like an HTTP call. It is refused <b>unconditionally</b> rather than under that
+   * hook's {@code protect-default-branch} switch, and the difference is deliberate: the switch
+   * ships off because this host serves its own redeploy and a protection bug must not be able to
+   * reject the push that fixes it — an argument about pushes, which nothing here is. No caller of a
+   * ref primitive has a reason to delete a repository's default branch, and one that wants the
+   * repository gone deletes the repository ({@code DELETE /git/:repoId}).
+   *
+   * <p>The name is the tail of the path, so a slashy branch needs no encoding dance: {@code DELETE
+   * …/branches/release/17} and {@code …/branches/refs/heads/release/17} both name the same ref.
+   */
+  @DELETE
+  @Path("/branches/{name:.+}")
+  public Response deleteBranch(
+      @PathParam("repoId") String repoId, @PathParam("name") String name) {
+    if (!isValidRepoId(repoId)) {
+      return badRequest("repoId must match " + REPO_ID_PATTERN);
+    }
+    String ref = branchRef(name);
+    if (ref == null) {
+      return badRequest("name must be a valid branch name or a refs/heads/… ref name");
+    }
+    try (Repository repo = repositories.open(repoId)) {
+      if (repo == null) {
+        return notFound("no-such-repository", repoId);
+      }
+      if (ref.equals(repo.getFullBranch())) {
+        return Response.status(Response.Status.CONFLICT)
+            .entity(new ErrorBody("protected-branch", ref + " is this repository's default branch"))
+            .build();
+      }
+      Ref branch = repo.getRefDatabase().exactRef(ref);
+      if (branch == null) {
+        return notFound("no-such-branch", ref);
+      }
+      RefUpdate update = repo.updateRef(ref);
+      update.setExpectedOldObjectId(branch.getObjectId());
+      update.setForceUpdate(true);
+      update.setRefLogMessage("qits-githost: delete " + ref, false);
+      RefUpdate.Result result = update.delete();
+      return switch (result) {
+        case FORCED, NEW, NO_CHANGE -> Response.noContent().build();
+        case LOCK_FAILURE, REJECTED, REJECTED_CURRENT_BRANCH, REJECTED_OTHER_REASON ->
+            Response.status(Response.Status.CONFLICT)
+                .entity(new ErrorBody("ref-moved", ref + ": " + result.name()))
+                .build();
+        default ->
+            throw new ServerErrorException(
+                "could not delete " + ref + ": " + result.name(),
+                Response.Status.INTERNAL_SERVER_ERROR);
+      };
+    } catch (Exception e) {
+      throw unavailable("could not delete " + ref + " of repository " + repoId, e);
+    }
+  }
+
+  /**
+   * The tip's tree with the caller's writes and deletions applied, built in an in-core {@link
+   * DirCache} — the standard JGit recipe for making a tree without a worktree.
+   *
+   * <p>An existing path keeps an executable bit it already had; anything else becomes a regular
+   * file. A deletion of a path the tree does not hold is not an error: the request describes the
+   * tree the caller wants, and it already has it.
+   */
+  private static ObjectId editedTree(
+      ObjectInserter inserter,
+      ObjectReader reader,
+      RevCommit parent,
+      Map<String, String> files,
+      List<String> deletions)
+      throws IOException {
+    DirCache cache = DirCache.newInCore();
+    DirCacheBuilder from = cache.builder();
+    from.addTree(new byte[0], DirCacheEntry.STAGE_0, reader, parent.getTree());
+    from.finish();
+
+    DirCacheEditor editor = cache.editor();
+    for (Map.Entry<String, String> file : files.entrySet()) {
+      ObjectId blob =
+          inserter.insert(Constants.OBJ_BLOB, file.getValue().getBytes(StandardCharsets.UTF_8));
+      editor.add(
+          new DirCacheEditor.PathEdit(file.getKey()) {
+            @Override
+            public void apply(DirCacheEntry entry) {
+              if (entry.getRawMode() != FileMode.EXECUTABLE_FILE.getBits()) {
+                entry.setFileMode(FileMode.REGULAR_FILE);
+              }
+              entry.setObjectId(blob);
+            }
+          });
+    }
+    for (String path : deletions) {
+      editor.add(new DirCacheEditor.DeletePath(path));
+    }
+    editor.finish();
+    return cache.writeTree(inserter);
+  }
+
+  private static Response tagExists(String tagRef, Ref existing) {
+    return Response.status(Response.Status.CONFLICT)
+        .entity(
+            new TagExistsResponse(
+                "tag-exists",
+                tagRef,
+                existing.getObjectId() == null ? null : existing.getObjectId().name()))
+        .build();
+  }
+
+  private static String tagMessage(TagRequest request, String name) {
+    String message = request.message();
+    if (message == null || message.isBlank()) {
+      message = name;
+    }
+    return message.endsWith("\n") ? message : message + "\n";
+  }
+
   /** Whether some other head already contains this one, which is what makes it nothing to merge. */
   private static boolean containedInAnother(RevWalk walk, Head head, List<Head> heads)
       throws IOException {
@@ -499,6 +869,48 @@ public class RepositoryRefsResource {
         && ref.startsWith(Constants.R_HEADS)
         && ref.length() > Constants.R_HEADS.length()
         && Repository.isValidRefName(ref);
+  }
+
+  /**
+   * The full ref for a branch the caller named either way, or {@code null} if it is not one. Both
+   * spellings are accepted because both are natural at a call site: the merge target is a full ref
+   * because it may not exist yet, and a branch being deleted is usually held as a bare name.
+   */
+  static String branchRef(String name) {
+    if (name == null || name.isBlank()) {
+      return null;
+    }
+    String ref = name.startsWith(Constants.R_HEADS) ? name : Constants.R_HEADS + name;
+    return isBranchRef(ref) ? ref : null;
+  }
+
+  /** The same, for a tag. */
+  static String tagRef(String name) {
+    if (name == null || name.isBlank()) {
+      return null;
+    }
+    String ref = name.startsWith(Constants.R_TAGS) ? name : Constants.R_TAGS + name;
+    return ref.length() > Constants.R_TAGS.length() && Repository.isValidRefName(ref) ? ref : null;
+  }
+
+  /**
+   * A repository-relative file path: no leading slash, no {@code .} or {@code ..} segment, no empty
+   * segment, no control character. The rule {@code RepositoryBrowseResource} reads with, applied to
+   * what this endpoint writes.
+   */
+  static boolean isValidPath(String path) {
+    if (path == null || path.isEmpty() || path.length() > MAX_PATH_LENGTH) {
+      return false;
+    }
+    if (path.startsWith("/") || path.chars().anyMatch(c -> c < 0x20 || c == 0x7f)) {
+      return false;
+    }
+    for (String segment : path.split("/", -1)) {
+      if (segment.isEmpty() || ".".equals(segment) || "..".equals(segment)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   static Response badRequest(String message) {
