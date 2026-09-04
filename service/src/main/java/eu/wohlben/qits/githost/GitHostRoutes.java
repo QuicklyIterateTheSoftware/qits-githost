@@ -87,7 +87,8 @@ import org.jboss.logging.Logger;
  *       service that may speak it; a UUID clone url is never published and never leaks upward. When
  *       {@code qits.githost.storage-client} names the projects service's client, every route of this
  *       scheme demands the role {@code clients/<that client>} and nothing else opens it — see
- *       {@link #storageSchemeRefused}.
+ *       {@link #storageSchemeRefused}. The two <b>content reads</b> take one further list, {@code
+ *       qits.githost.content-readers}, and nothing else does — see {@link #contentReaders}.
  * </ul>
  *
  * <p>The three smart-HTTP endpoints hang off each scheme:
@@ -292,6 +293,46 @@ public class GitHostRoutes {
   @ConfigProperty(name = "qits.githost.storage-client")
   Optional<String> storageClient;
 
+  /**
+   * The roles admitted to the id-addressed <b>content reads</b> — {@code blob} and {@code tree} —
+   * <b>beside</b> {@link #storageClient}'s self-role, and to nothing else on that scheme. A list,
+   * because it is a set of sanctioned identities rather than one caller: {@code
+   * clients/<some client>} for a peer that presents its own bearer, a platform role such as {@code
+   * qits:system} for one that reaches this host through the forwarded-header pair.
+   *
+   * <p><b>Why the content reads and not the scheme</b>, which is the whole of the reasoning
+   * {@link #storageSchemeRefused} makes one paragraph further down. That guard's argument is about
+   * an ADDRESS: {@code /git/<repoId>} is storage plumbing, so speaking it must mean "the caller IS
+   * qits-projects" rather than "the caller is privileged", and every route that CLONES, PUSHES,
+   * CREATES, DELETES or ENUMERATES stays exactly that closed. A blob read is a different act. It
+   * takes no ref, moves no byte into this host, and answers only what the same caller may already
+   * read name-addressed — the file, at the revision, of a repository it was told about. What it
+   * needs the id for is that the caller was handed an id and no name: qits-deployments reads a
+   * released repository's {@code .config/qits/deployments.yml} out of a {@code SoftwareRelease},
+   * whose repository coordinate is the storage id (the name pair is newer than the event and still
+   * absent from the ones already in the log). Refusing that read is the platform's own deployer
+   * being told to stop holding an address nothing else offered it — measured on 2026-09-04 as
+   * thirteen {@code deployment spec unreadable … the git host answered 403} rows, one per release,
+   * each one a deployment that had to be replayed by hand.
+   *
+   * <p><b>The 403 was also the wrong SHAPE of answer</b>, which is why this is a fix rather than a
+   * grant. The deployer reads name-addressed first and falls back to the id url on a 404, so a
+   * refusal here surfaced as a 403 on a read whose real story was "there is no such name" — a
+   * status a caller cannot act on, in place of one it can.
+   *
+   * <p><b>Unset is today's behaviour, byte for byte</b>, and an empty value is unset: the content
+   * reads then demand the storage client's self-role like every other id-addressed route. A value
+   * naming a role broader than one client — {@code qits:system} is the live one — is a deliberate
+   * widening and should be read as such: it says every machine on the platform may read a blob by
+   * storage id, and still nothing more.
+   *
+   * <p>An {@code Optional}, never a {@code List} with an empty default, for the reason
+   * {@link #storageClient} states: SmallRye reads a configured-empty value as absent, and a
+   * non-optional injection of an unset key kills the packaged binary at boot.
+   */
+  @ConfigProperty(name = "qits.githost.content-readers")
+  Optional<List<String>> contentReaders;
+
   @ConfigProperty(name = "qits.bootstrap.ingress.git.enabled", defaultValue = "false")
   boolean bootstrapIngressEnabled;
 
@@ -436,10 +477,11 @@ public class GitHostRoutes {
     //
     // NAME-ADDRESSED FIRST: it is the public scheme, and a miss hands the request on rather than
     // answering it (see the init javadoc for the two shapes that overlap and why length settles
-    // nothing here). The storage-client guard is deliberately NOT a route handler on the two
+    // nothing here). The storage-scheme guard is deliberately NOT a route handler on the two
     // id-addressed content routes: they carry the clone hand-off, and a guard in front of it would
     // 403 a name-addressed clone of a repository called `blob` before the hand-off ever ran. It is
-    // checked inside those handlers instead, after the hand-off.
+    // checked inside those handlers instead, after the hand-off — and it is the CONTENT reading of
+    // it there (contentReadRefused), which is the one place qits.githost.content-readers applies.
     router.getWithRegex(namedBlobRoute()).blockingHandler(this::serveBlobByName);
     router.getWithRegex(namedTreeRoute("")).blockingHandler(this::serveTreeByName);
     router.getWithRegex(namedTreeRoute("/(?<path>.*)")).blockingHandler(this::serveTreeByName);
@@ -510,17 +552,59 @@ public class GitHostRoutes {
    *
    * <p>The role arrives through the ordinary quarkus-oidc groups plumbing, so there is nothing to
    * parse: the identity either carries it or it does not.
+   *
+   * <p><b>The two CONTENT reads ask a wider question</b>, {@link #contentReadRefused}, and they are
+   * the only routes that do: reading one path at one revision is not the same act as cloning,
+   * pushing or provisioning by storage id. Everything else on the scheme comes here.
    */
   private boolean storageSchemeRefused(RoutingContext rc) {
+    return refusedUnlessAdmitted(rc, List.of());
+  }
+
+  /**
+   * The same guard as {@link #storageSchemeRefused}, with {@link #contentReaders} admitted too — the
+   * id-addressed {@code blob} and {@code tree} handlers' spelling of it and the only one.
+   *
+   * <p>Kept as a second method rather than a flag on the first, because the difference is the whole
+   * decision: a route that clones, pushes, provisions, deletes or enumerates asks the scheme
+   * question, and a route that hands back the bytes of one path at one revision asks this one. A
+   * route added to this scheme takes {@link #storageSchemeRefused} unless somebody argues it into
+   * the content family, and that argument is in {@link #contentReaders}.
+   */
+  private boolean contentReadRefused(RoutingContext rc) {
+    return refusedUnlessAdmitted(rc, contentReaderRoles());
+  }
+
+  /**
+   * Whether the id-addressed scheme is closed to this request, ending the response with the 403 when
+   * it is. {@code alsoAdmitted} is the extra roles this particular route opens to — empty for the
+   * scheme, {@link #contentReaders} for the two content reads.
+   */
+  private boolean refusedUnlessAdmitted(RoutingContext rc, List<String> alsoAdmitted) {
     String client = storageClient.map(String::trim).filter(value -> !value.isEmpty()).orElse(null);
     if (client == null) {
       return false;
     }
     SecurityIdentity identity =
         rc.user() instanceof QuarkusHttpUser user ? user.getSecurityIdentity() : null;
-    if (identity != null && identity.hasRole(CLIENT_ROLE_PREFIX + client)) {
+    if (identity == null) {
+      // No identity at all is the class-wide policy's business, not this guard's; it cannot hold a
+      // role, so it is refused here exactly as it was before the list existed.
+      return refuse(rc, client);
+    }
+    if (identity.hasRole(CLIENT_ROLE_PREFIX + client)) {
       return false;
     }
+    for (String role : alsoAdmitted) {
+      if (identity.hasRole(role)) {
+        return false;
+      }
+    }
+    return refuse(rc, client);
+  }
+
+  /** The one 403, so both readings of the guard refuse in the same words. */
+  private boolean refuse(RoutingContext rc, String client) {
     rc.response()
         .setStatusCode(403)
         .end(
@@ -529,6 +613,14 @@ public class GitHostRoutes {
                 + client
                 + ". Clone from /git/<projectId>/<repoName>.");
     return true;
+  }
+
+  /** {@link #contentReaders}, trimmed and without the empty entries a stray comma leaves. */
+  private List<String> contentReaderRoles() {
+    return contentReaders.orElseGet(List::of).stream()
+        .map(String::trim)
+        .filter(role -> !role.isEmpty())
+        .toList();
   }
 
   private void bootstrapPermit(RoutingContext rc, BootstrapIngressCredential credential) {
@@ -816,7 +908,7 @@ public class GitHostRoutes {
     String rev = decodePercent(rc.pathParam("rev"));
     String path = normalizePath(rc.pathParam("path"));
     if (contentReadIsNotAClone(rc, rev, path)
-        || storageSchemeRefused(rc)
+        || contentReadRefused(rc)
         || !blobRequestIsWellFormed(rc, rev, path)) {
       return;
     }
@@ -931,7 +1023,7 @@ public class GitHostRoutes {
     String rev = decodePercent(rc.pathParam("rev"));
     String path = normalizePath(rc.pathParam("path"));
     if (contentReadIsNotAClone(rc, rev, path)
-        || storageSchemeRefused(rc)
+        || contentReadRefused(rc)
         || !treeRequestIsWellFormed(rc, rev, path)) {
       return;
     }
@@ -1399,21 +1491,44 @@ public class GitHostRoutes {
    * pusher spelled them, with the {@code .git} suffix stripped — the name a consumer can act on.
    *
    * @throws RepositoryNameResolver.Unavailable if the resolver could not answer at all, which the
-   *     callers turn into a 503. A miss is {@code null} and a 404; the two must not be confused.
+   *     callers turn into a 503. A miss is {@link NamedRepo#MISS} and a 404; the two must not be
+   *     confused — an outage answered as a miss is {@code fe26a6c} restated on this seam.
    */
-  private OpenedRepo openByName(RoutingContext rc) {
+  private NamedRepo openByName(RoutingContext rc) {
     String projectId = rc.pathParam("projectId");
     String repoName = rc.pathParam("repoName");
     if (projectId == null || repoName == null || repositoryNames.isUnsatisfied()) {
-      return null;
+      return NamedRepo.MISS;
     }
     String name =
         repoName.endsWith(".git") ? repoName.substring(0, repoName.length() - 4) : repoName;
     String repoId = repositoryNames.get().resolveRepositoryId(projectId, name).orElse(null);
+    if (repoId == null) {
+      return NamedRepo.MISS;
+    }
     OpenedRepo opened = open(repoId);
     return opened == null
-        ? null
-        : new OpenedRepo(opened.repoId(), projectId, name, opened.repo());
+        ? NamedRepo.ABSENT
+        : new NamedRepo(new OpenedRepo(opened.repoId(), projectId, name, opened.repo()), true);
+  }
+
+  /**
+   * What a name lookup came back with, and it is three answers rather than two: the repository, "no
+   * such name", and <b>"that name resolves and the store holds no such repository"</b>.
+   *
+   * <p>The third used to be the second, and the difference only shows on the content routes' hand-off
+   * ({@link #openByNameOrHandOff}). A miss may still be an id-addressed read of a repository CALLED
+   * {@code blob} or {@code tree}, so it is handed down; a name that RESOLVED settles the reading,
+   * and passing it on would put a request the public scheme has already claimed in front of the
+   * id-addressed guard — which answers a 403 about an address the caller never used, in place of
+   * the truthful 404. Same status either way when the guard is off; a misleading one when it is on.
+   */
+  private record NamedRepo(OpenedRepo opened, boolean resolved) {
+    /** No repository under that name — the answer, not a failure to get one. */
+    static final NamedRepo MISS = new NamedRepo(null, false);
+
+    /** The name resolves; the store holds no repository at the id it resolves to. */
+    static final NamedRepo ABSENT = new NamedRepo(null, true);
   }
 
   /**
@@ -1426,35 +1541,47 @@ public class GitHostRoutes {
    * been deleted.
    */
   private void byName(RoutingContext rc, Consumer<OpenedRepo> served) {
-    OpenedRepo opened;
+    NamedRepo named;
     try {
-      opened = openByName(rc);
+      named = openByName(rc);
     } catch (RepositoryNameResolver.Unavailable e) {
       resolverUnavailable(rc, e);
       return;
     }
-    served.accept(opened);
+    // A miss and a resolved-but-absent name are one answer here — 404, in the consumer — because
+    // these routes have no second reading to hand a request to.
+    served.accept(named.opened());
   }
 
   /**
    * The name-addressed content routes' resolution: the repository, or {@code null} with the request
-   * already dealt with — 503 when the resolver could not answer, and handed back to the router when
-   * it answered "no such name", because an id-addressed content route registered below may still
-   * match this shape (see {@link #init}). A shape neither reading serves ends as the router's own
-   * 404.
+   * already dealt with — 503 when the resolver could not answer, 404 when the name resolved and the
+   * store holds nothing at it, and handed back to the router when it answered "no such name",
+   * because an id-addressed content route registered below may still match this shape (see {@link
+   * #init}). A shape neither reading serves ends as the router's own 404.
+   *
+   * <p><b>Only the last of those three is handed on</b>, and {@link NamedRepo} says why: an outage
+   * and a resolved name are both this scheme's answer, and passing either down would let the
+   * id-addressed guard answer a 403 about an address the caller never spelled.
    */
   private OpenedRepo openByNameOrHandOff(RoutingContext rc) {
-    OpenedRepo opened;
+    NamedRepo named;
     try {
-      opened = openByName(rc);
+      named = openByName(rc);
     } catch (RepositoryNameResolver.Unavailable e) {
       resolverUnavailable(rc, e);
       return null;
     }
-    if (opened == null) {
-      rc.next();
+    if (named.opened() != null) {
+      return named.opened();
     }
-    return opened;
+    if (named.resolved()) {
+      // The name is this scheme's, and this scheme has no repository to serve at it. See NamedRepo.
+      rc.response().setStatusCode(404).end();
+      return null;
+    }
+    rc.next();
+    return null;
   }
 
   /** 503, and the reason in the log rather than on the wire. */

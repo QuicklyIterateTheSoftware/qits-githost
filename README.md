@@ -54,6 +54,14 @@ plumbing**, spoken by qits-projects and nothing else: it is what mints and mirro
 url is never published. With `qits.githost.storage-client` configured, the id-addressed scheme is
 served only to that client's self-role (see Configuration).
 
+**The id-addressed CONTENT reads take one further list, and nothing else does.**
+`qits.githost.content-readers` names roles admitted to `GET /git/<repoId>/blob/…` and `…/tree/…`
+beside the storage client — the platform's deployer reads a released repository's
+`.config/qits/deployments.yml` and is handed a storage id and no name, because a `SoftwareRelease`
+carries the repository as its id. Clone, push, the lifecycle verbs and `GET /git` are untouched by
+it and stay closed to the storage client alone. Unset — the shipped default — is the behaviour that
+predates the key.
+
 | Route | What it does |
 |---|---|
 | `GET /git/:projectId/:repoName/info/refs?service=…` | The ref advertisement, name-addressed. |
