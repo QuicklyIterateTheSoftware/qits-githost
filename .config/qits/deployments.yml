@@ -1,16 +1,16 @@
 # How qits-deployments deploys this repo. It reads this file from the git host at the built sha, so
 # the answer travels with the commit.
 #
-# CARRYING THE FILE AT ALL is the other thing it says. qits-workspaces reads it on a release to
-# decide whether this repository deploys — a library or an SPA carries none and its release is the
-# trunk push alone.
+# CARRYING THE FILE AT ALL is the other thing it says. The release flow reads it to decide whether
+# this repository deploys — a library or an SPA carries none, and its `main` is finalized at the
+# release itself rather than after a deployment.
 #
 # ENVIRONMENT service, and that is the change this repository exists to make. The git host used to
 # ride inside qits-platform-artifacts, which is platform-scoped because it held the pull-through
 # caches; a git repository is not an artifact, it only shared the blob store's storage layout. Every
 # consumer — qits-ci, qits-deployments, qits-workspaces, the daemons, the workspace containers — is
-# an env service, so an env-scoped git host is the consistent shape. A green build deploys into
-# whichever tier listens to the built branch.
+# an env service, so an env-scoped git host is the consistent shape. A released version is deployed
+# into a tier by a Deployment Request.
 deployment_target: environment
 
 # WHAT THIS REPOSITORY DEPLOYS AS, held still across the repository rename. The repository is

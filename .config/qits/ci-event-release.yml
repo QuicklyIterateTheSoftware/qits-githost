@@ -2,13 +2,14 @@
 # released VERSION. qits-platform-dns' file, name for name — see that repository for the long form of
 # each rule; the short form of the ones that bite:
 #
-# - The selection naming this repository is not a loop: SCMRelease comes from qits-workspaces, and
-#   nothing in this file publishes it.
+# - The selection naming this repository is not a loop: SCMRelease comes from qits-projects' Auto
+#   Release, and nothing in this file publishes it.
 # - `artifacts:` is a declaration, not a report — qits-ci announces on the strength of it. Keep it
 #   true.
 # - The name is unqualified on purpose; the reader supplies its own registry host.
-# - The build below is ci-event-build.yml's, and the two must stay matched: one image content, two
-#   coordinates. That includes --network and --build-arg, which this repository needs because
+# - The build below is ci-event-release-request.yml's gating step, and the two must stay matched:
+#   the QA pipeline proves a release request's fold with this same build, minus the push. That
+#   includes --network and --build-arg, which this repository needs because
 #   qits-eventstream lives only in the platform's own Maven repository, AND the whole first half —
 #   the webui submodule fetch, the lockfile origin swap and the `npm_config_*` environment. That
 #   file is where each of those is explained at length; this one carries the short form rather than
@@ -58,7 +59,7 @@ steps:
       # --- half one: the bundle -----------------------------------------------------------------
       # The daemon's clone is shallow and does not recurse, so qits-githost-frontend arrives as an empty
       # directory and Quinoa's client never gets built — the Dockerfile's `test -f` guard is what
-      # turns that into a red build instead of an image with no page. See ci-event-build.yml for
+      # turns that into a red build instead of an image with no page. See ci-event-release-request.yml for
       # why the lockfile origins are rewritten and why the registry is passed as environment rather
       # than as a file: that repo's committed .npmrc outranks any ~/.npmrc this step could write.
       frontend_url="${QITS_CI_REPOSITORY_URL%/*}/qits-githost-frontend"
@@ -90,7 +91,7 @@ steps:
       # pair to the mounts on the Dockerfile's mvnw RUN. Unconditional on purpose: a missing env
       # source is NOT an error — measured on buildx v0.36.1, `--secret id=x,env=DOES_NOT_EXIST`
       # builds green and the mounted variable is simply unset — so this is inert until a run carries
-      # the pair. ci-event-build.yml carries the same two flags, and the two must stay matched.
+      # the pair. ci-event-release-request.yml carries the same two flags, and the two must stay matched.
       ref="$QITS_REGISTRY/$QITS_IMAGE_REPOSITORY/qits-githost:$version"
       docker build --network host \
         --build-arg QITS_MAVEN_REPOSITORY_URL="http://$QITS_REGISTRY/artifacts/maven/maven" \
@@ -109,8 +110,8 @@ steps:
       # qits-ci announces `SoftwareRelease` only for a green run, so no consumer is ever told about
       # a version whose bill of materials is missing. A failed PUT fails the release ON PURPOSE —
       # the store being down is not a reason to announce a version nobody can audit. Only THIS
-      # pipeline uploads one; ci-event-build.yml's sha push announces no release and owes no
-      # document. And only for the image: the two library jars stay undeclared above, so nothing
+      # pipeline uploads one; the QA pipeline's fold build pushes nothing, announces no release and
+      # owes no document. And only for the image: the two library jars stay undeclared above, so nothing
       # here speaks for them either.
       #
       # The second `docker build` reaches the Dockerfile's `sbom` stage — a `FROM scratch` holding

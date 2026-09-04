@@ -2,8 +2,8 @@
 
 The platform's git smart-HTTP host, deployed as the `qits-githost` application. Every repository
 qits serves is here: workspace containers clone and push over HTTP, qits-ci reads a pipeline config
-out of one file, qits-workspaces releases through it, and a push announces itself to the platform as
-a durable domain event.
+out of one file, qits-projects folds and tags release requests through its git primitives, and a
+push announces itself to the platform as a durable domain event.
 
 It also serves a page. Since the client landed, this is not a wire-protocol-only service: it carries
 its own Angular SPA — served at `/` on this service's own host, `githost.<env>.<domain>` — and the
@@ -324,18 +324,16 @@ whole `X-Qits-` prefix, so a header would behave differently through the front d
 
 ## Deployment
 
-A push builds `docker/Dockerfile` — a Mandrel builder stage that native-compiles `service`, a
+A release builds `docker/Dockerfile` — a Mandrel builder stage that native-compiles `service`, a
 `ubi-minimal` runtime stage that carries only the binary — and pushes it as
-`qits/qits-githost:<sha>`; a release rebuilds the same content under the released version
-(`.config/qits/ci-event-build.yml` and `.config/qits/ci-event-release.yml` — this repository
-carries **no `ci-post-receive.yml`**: every pipeline is a domain-event trigger, the push build
-riding `SCMPublishCommit` with `checkout:` so it still builds the pushed branch at the pushed sha.
-A third file, `ci-event-userflows.yml`, runs `mvn verify` per commit and publishes the userflow
-reports as the `@userflows/qits-githost` docs site, version = the commit sha, non-gating for the
-image). Both image builds run
-`--network host` with `--build-arg QITS_MAVEN_REPOSITORY_URL=…`, because `qits-eventstream`
-exists only in the platform's own Maven repository and a docker build reaches no other address for
-it.
+`qits/qits-githost:<version>` (`.config/qits/ci-event-release.yml`, riding `SCMRelease`). **Nothing
+builds a push any more**: per-push CI is retired platform-wide, and this repository's other pipeline,
+`.config/qits/ci-event-release-request.yml`, runs the same build — minus the push — plus `mvn
+verify` and the userflow publish against a release request's fold, `release/<id>`. The build half is
+gating; the userflow half declares `gating: false`, so a red verify shows red without holding the
+fold. Both image builds run `--network host` with `--build-arg QITS_MAVEN_REPOSITORY_URL=…`, because
+`qits-eventstream` exists only in the platform's own Maven repository and a docker build reaches no
+other address for it.
 
 **Each pipeline is one step with two halves**, and the split is not cosmetic: the client depends on
 `@qits/ui-components`, which lives only on the platform's own npm registry, and a docker `RUN` can
@@ -345,8 +343,8 @@ image build packages one that already exists — its Quinoa install/ci/build com
 boots and serves `/` as a 404.
 
 `.config/qits/deployments.yml` is the deploy answer: **an environment service** — every tier
-runs its own git host, and a green build deploys into whichever tier listens to the built branch —
-with `resources: postgresql:db, postgresql:eventstream:qits_githost_eventstream` and the health gate
+runs its own git host, and a released version is deployed into a tier by a Deployment Request, never
+by a branch — with `resources: postgresql:db, postgresql:eventstream:qits_githost_eventstream` and the health gate
 at `/githost/q/health/ready`. Those two resource **names** are load-bearing: they are what makes
 `QITS_RESOURCE_DB_*` and `QITS_RESOURCE_EVENTSTREAM_*` exist, and neither triple has a default, so a
 missing one kills the boot at Flyway rather than opening a store nobody meant. **There is no blobs
@@ -358,8 +356,9 @@ other repository's build clones from.
 
 Every integration test in `service` is a **userflow**: a `@UserStory` that emits its own
 documentation under `service/target/userstories/<category>/<slug>/` — the steps, the command
-transcripts, the files a story wrote, and a **network diagram** — which `ci-event-userflows.yml`
-publishes as the `@userflows/qits-githost` docs site. The proof and the documentation are the same
+transcripts, the files a story wrote, and a **network diagram** — which the non-gating second step
+of `ci-event-release-request.yml` publishes as the `@userflows/qits-githost` docs site, once per
+release-request fold. The proof and the documentation are the same
 artifact, so neither can go stale without the build going red.
 
 **Three categories, seven stories.**
