@@ -8,6 +8,7 @@ import jakarta.annotation.security.RolesAllowed;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.DELETE;
+import jakarta.ws.rs.GET;
 import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.PathParam;
@@ -23,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.regex.Pattern;
 import org.eclipse.jgit.errors.IncorrectObjectTypeException;
 import org.eclipse.jgit.errors.MissingObjectException;
 import org.eclipse.jgit.dircache.DirCache;
@@ -134,6 +136,12 @@ public class RepositoryRefsResource {
 
   private static final int MAX_FILE_BYTES = 1024 * 1024;
 
+  /**
+   * What a gitlink pins: one full object name, lowercase hex. Shape only — the commit lives in a
+   * different repository, so there is nothing here it could be resolved against.
+   */
+  private static final Pattern GITLINK_SHA = Pattern.compile("[0-9a-f]{40}");
+
   private static final int MAX_PATH_LENGTH = 1024;
 
   @Inject GitRepositoryProvider repositories;
@@ -196,6 +204,10 @@ public class RepositoryRefsResource {
   @RegisterForReflection
   public record TagResponse(String tag, String sha, String object) {}
 
+  /** Where a branch stands right now: the full ref name and the commit it points at. */
+  @RegisterForReflection
+  public record BranchResponse(String ref, String sha) {}
+
   /**
    * The refusal a tag that already exists gets, and the whole point of the endpoint: {@code error}
    * is {@code tag-exists} and {@code sha} is what the ref already says, so a caller that is using
@@ -206,8 +218,13 @@ public class RepositoryRefsResource {
 
   /**
    * One commit's worth of file changes on a branch ref. {@code files} is path → UTF-8 content,
-   * {@code deletePaths} is paths to remove; at least one of the two must say something. The content
-   * is the caller's — this host writes it and reads none of it.
+   * {@code deletePaths} is paths to remove, {@code gitlinks} is path → commit sha written as a
+   * gitlink (mode 160000) tree entry — a superproject's submodule pin; at least one of the three
+   * must say something. The content is the caller's — this host writes it and reads none of it.
+   *
+   * <p>A gitlink's sha names a commit of a <em>different</em> repository, so it is deliberately
+   * not resolved against this one — exactly git's own reading of the mode — and only its shape (40
+   * hex digits) is checked. qits-projects banks a wrapper's submodule pins with this on release.
    */
   @RegisterForReflection
   public record CommitRequest(
@@ -215,7 +232,18 @@ public class RepositoryRefsResource {
       String message,
       Map<String, String> files,
       List<String> deletePaths,
-      Author author) {}
+      Map<String, String> gitlinks,
+      Author author) {
+    /** The form before gitlink entries existed: files and deletions only. */
+    public CommitRequest(
+        String ref,
+        String message,
+        Map<String, String> files,
+        List<String> deletePaths,
+        Author author) {
+      this(ref, message, files, deletePaths, Map.of(), author);
+    }
+  }
 
   /**
    * What the ref now is. {@code outcome} is {@code committed} (a commit was written and the ref
@@ -559,10 +587,11 @@ public class RepositoryRefsResource {
     }
     Map<String, String> files = request.files() == null ? Map.of() : request.files();
     List<String> deletions = request.deletePaths() == null ? List.of() : request.deletePaths();
-    if (files.isEmpty() && deletions.isEmpty()) {
+    Map<String, String> gitlinks = request.gitlinks() == null ? Map.of() : request.gitlinks();
+    if (files.isEmpty() && deletions.isEmpty() && gitlinks.isEmpty()) {
       return badRequest("a commit must write or delete at least one path");
     }
-    if (files.size() + deletions.size() > MAX_FILES) {
+    if (files.size() + deletions.size() + gitlinks.size() > MAX_FILES) {
       return badRequest("at most " + MAX_FILES + " paths in one commit");
     }
     for (String path : files.keySet()) {
@@ -582,6 +611,18 @@ public class RepositoryRefsResource {
         return badRequest("not a repository-relative file path: " + path);
       }
     }
+    for (Map.Entry<String, String> gitlink : gitlinks.entrySet()) {
+      if (!isValidPath(gitlink.getKey())) {
+        return badRequest("not a repository-relative file path: " + gitlink.getKey());
+      }
+      if (files.containsKey(gitlink.getKey())) {
+        return badRequest(gitlink.getKey() + " is both a file and a gitlink");
+      }
+      String sha = gitlink.getValue();
+      if (sha == null || !GITLINK_SHA.matcher(sha).matches()) {
+        return badRequest("a gitlink pins a full 40-hex commit sha; " + gitlink.getKey() + " does not");
+      }
+    }
     if (request.message() == null || request.message().isBlank()) {
       return badRequest("a commit needs a message");
     }
@@ -599,7 +640,7 @@ public class RepositoryRefsResource {
           ObjectReader reader = inserter.newReader();
           RevWalk walk = new RevWalk(reader)) {
         RevCommit parent = walk.parseCommit(tip);
-        ObjectId tree = editedTree(inserter, reader, parent, files, deletions);
+        ObjectId tree = editedTree(inserter, reader, parent, files, deletions, gitlinks);
         if (tree.equals(parent.getTree())) {
           return Response.ok(
                   new CommitResponse(request.ref(), parent.name(), parent.name(), "unchanged"))
@@ -642,6 +683,39 @@ public class RepositoryRefsResource {
    * <p>The name is the tail of the path, so a slashy branch needs no encoding dance: {@code DELETE
    * …/branches/release/17} and {@code …/branches/refs/heads/release/17} both name the same ref.
    */
+  /**
+   * Where a branch of this repository stands — the read half of the primitives, for a caller
+   * composing a cross-repository fact out of refs it does not own. qits-projects resolves each
+   * submodule's default-branch head with this when it banks a wrapper's gitlink pins on release.
+   *
+   * <p>Same name reading as the DELETE beside it: the tail of the path, so a slashy branch needs no
+   * encoding dance, and {@code branches/main} and {@code branches/refs/heads/main} name the same
+   * ref.
+   */
+  @GET
+  @Path("/branches/{name:.+}")
+  public Response branch(@PathParam("repoId") String repoId, @PathParam("name") String name) {
+    if (!isValidRepoId(repoId)) {
+      return badRequest("repoId must match " + REPO_ID_PATTERN);
+    }
+    String ref = branchRef(name);
+    if (ref == null) {
+      return badRequest("name must be a valid branch name or a refs/heads/… ref name");
+    }
+    try (Repository repo = repositories.open(repoId)) {
+      if (repo == null) {
+        return notFound("no-such-repository", repoId);
+      }
+      Ref branch = repo.getRefDatabase().exactRef(ref);
+      if (branch == null || branch.getObjectId() == null) {
+        return notFound("no-such-branch", ref);
+      }
+      return Response.ok(new BranchResponse(ref, branch.getObjectId().name())).build();
+    } catch (Exception e) {
+      throw unavailable("could not read " + ref + " of repository " + repoId, e);
+    }
+  }
+
   @DELETE
   @Path("/branches/{name:.+}")
   public Response deleteBranch(
@@ -694,13 +768,18 @@ public class RepositoryRefsResource {
    * <p>An existing path keeps an executable bit it already had; anything else becomes a regular
    * file. A deletion of a path the tree does not hold is not an error: the request describes the
    * tree the caller wants, and it already has it.
+   *
+   * <p>A gitlink writes no object at all — the sha names a commit of another repository, so there
+   * is nothing to insert here and nothing to verify against this object store; the entry is the
+   * mode and the id, which is all a submodule pin is.
    */
   private static ObjectId editedTree(
       ObjectInserter inserter,
       ObjectReader reader,
       RevCommit parent,
       Map<String, String> files,
-      List<String> deletions)
+      List<String> deletions,
+      Map<String, String> gitlinks)
       throws IOException {
     DirCache cache = DirCache.newInCore();
     DirCacheBuilder from = cache.builder();
@@ -719,6 +798,17 @@ public class RepositoryRefsResource {
                 entry.setFileMode(FileMode.REGULAR_FILE);
               }
               entry.setObjectId(blob);
+            }
+          });
+    }
+    for (Map.Entry<String, String> gitlink : gitlinks.entrySet()) {
+      ObjectId pinned = ObjectId.fromString(gitlink.getValue());
+      editor.add(
+          new DirCacheEditor.PathEdit(gitlink.getKey()) {
+            @Override
+            public void apply(DirCacheEntry entry) {
+              entry.setFileMode(FileMode.GITLINK);
+              entry.setObjectId(pinned);
             }
           });
     }

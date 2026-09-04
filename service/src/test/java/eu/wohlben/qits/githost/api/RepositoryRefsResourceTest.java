@@ -262,6 +262,57 @@ public class RepositoryRefsResourceTest {
   }
 
   @Test
+  public void aGitlinkPinIsWrittenAsASubmoduleEntry() throws Exception {
+    String repo = seed();
+    String pinned = "1234567890abcdef1234567890abcdef12345678";
+    Map<String, Object> body = commitBody("refs/heads/release/1", "bank the estate");
+    body.put("files", Map.of(".gitmodules", "[submodule \"y\"]\n\tpath = components/x/y\n"));
+    body.put("gitlinks", Map.of("components/x/y", pinned));
+
+    post(repo, "/commits", body).then().statusCode(200).body("outcome", is("committed"));
+
+    // The entry is mode 160000 with the pinned sha — a real clone's reading, because a gitlink is
+    // invisible to the browse tree (it is not a blob) and only git itself says the mode.
+    Path clone = Files.createTempDirectory("qits-gitlink-clone");
+    git(null, "clone", "-q", "--branch", "release/1", gitBase + "/" + repo, clone.toString());
+    assertThat(
+        git(clone, "ls-tree", "HEAD", "components/x/y").trim(),
+        is("160000 commit " + pinned + "\tcomponents/x/y"));
+
+    // The same pin again is the tree that is already there: no commit, no ref move.
+    Map<String, Object> again = commitBody("refs/heads/release/1", "bank the same estate");
+    again.put("gitlinks", Map.of("components/x/y", pinned));
+    post(repo, "/commits", again).then().statusCode(200).body("outcome", is("unchanged"));
+  }
+
+  @Test
+  public void aGitlinkPinsAFullShaAndAPathIsOneKindOnly() throws Exception {
+    String repo = seed();
+    Map<String, Object> shortSha = commitBody("refs/heads/release/1", "x");
+    shortSha.put("gitlinks", Map.of("components/x/y", "123abc"));
+    post(repo, "/commits", shortSha).then().statusCode(400);
+
+    Map<String, Object> bothKinds = commitBody("refs/heads/release/1", "x");
+    bothKinds.put("files", Map.of("components/x/y", "content"));
+    bothKinds.put("gitlinks", Map.of("components/x/y", "1234567890abcdef1234567890abcdef12345678"));
+    post(repo, "/commits", bothKinds).then().statusCode(400);
+  }
+
+  @Test
+  public void aBranchIsReadBackWithItsHead() throws Exception {
+    String repo = seed();
+    String tip = lsRemote(repo, "refs/heads/main", "refs/heads/main");
+    given()
+        .when()
+        .get(API + repo + "/branches/main")
+        .then()
+        .statusCode(200)
+        .body("ref", is("refs/heads/main"))
+        .body("sha", is(tip));
+    given().when().get(API + repo + "/branches/never-was-there").then().statusCode(404);
+  }
+
+  @Test
   public void aBrowserSessionIsNotAMachineOnAnyOfThem() throws Exception {
     String repo = seed();
     given()
