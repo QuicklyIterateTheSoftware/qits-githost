@@ -20,7 +20,9 @@ import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import org.eclipse.jgit.diff.RawText;
 import org.eclipse.jgit.errors.IncorrectObjectTypeException;
@@ -30,15 +32,19 @@ import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.FileMode;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.ObjectLoader;
+import org.eclipse.jgit.lib.PersonIdent;
+import org.eclipse.jgit.lib.Ref;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
+import org.eclipse.jgit.revwalk.RevObject;
+import org.eclipse.jgit.revwalk.RevTag;
 import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.treewalk.TreeWalk;
 import org.jboss.logging.Logger;
 
 /**
- * {@code GET /githost/api/repositories/{repoId}[/tree|/file|/loc]} — the browser plane's content
- * reads, for qits-spa-githost's per-repository Code pages.
+ * {@code GET /githost/api/repositories/{repoId}[/tags|/tree|/file|/loc]} — the browser plane's
+ * content reads, for qits-spa-githost's per-repository Code pages.
  *
  * <p><b>Why this exists beside {@code /git/…/tree|blob}.</b> Those live on the git wire's storage
  * scheme, which {@code qits.githost.storage-client} is slated to close to qits-projects' own client
@@ -123,6 +129,29 @@ public class RepositoryBrowseResource {
   @JsonInclude(JsonInclude.Include.NON_NULL)
   public record FileResponse(String path, boolean binary, long size, String content) {}
 
+  /**
+   * One tag, as a reader browsing content needs it. {@code commitSha} is always the PEELED commit —
+   * an annotated tag's own object sha names a tag object, which no tree read and no line count can
+   * be taken at, so it is of no use here and is not carried. {@code taggedAt} is the tagger's clock
+   * for an annotated tag and the committer's for a lightweight one, ISO-8601, and null when the
+   * object holds no ident at all.
+   */
+  @RegisterForReflection
+  public record TagInfo(String name, String commitSha, String taggedAt) {}
+
+  /**
+   * The repository's tags, newest first. Empty is an honest answer — a repository nobody has
+   * released has no tags, and a freshly provisioned origin has no objects either.
+   */
+  @RegisterForReflection
+  public record TagsResponse(String id, List<TagInfo> tags) {}
+
+  /**
+   * A tag beside the clock it is ordered by. The wire record carries the date as a string, which is
+   * what the page renders and not what a comparator should be reading.
+   */
+  private record DatedTag(TagInfo tag, Instant taggedAt) {}
+
   @RegisterForReflection
   public record ErrorBody(String error) {}
 
@@ -144,6 +173,58 @@ public class RepositoryBrowseResource {
       return Response.ok(new DescribeResponse(repoId, defaultBranch, branches)).build();
     } catch (Exception e) {
       throw unavailable("could not describe repository " + repoId, e);
+    }
+  }
+
+  /**
+   * The tags, newest first. The read plane's answer to "what has this repository released" —
+   * {@code POST …/tags} on {@link RepositoryRefsResource} is the machine-only write beside it and
+   * they share nothing but the segment.
+   *
+   * <p><b>Ordered by date, and that is not a preference.</b> The platform's versions are calver
+   * ({@code 2026.903.113443}), which does NOT sort lexically — {@code 2026.9.1} sorts after
+   * {@code 2026.10.1}, and a zero-padded month would still put a re-tagged older commit at the top.
+   * The clock the tag was made at is the only ordering that stays right, with the name descending
+   * as the tie-break so two tags of the same second have a stable order rather than the ref
+   * database's, and a tag carrying no ident at all last.
+   *
+   * <p>{@code limit} trims AFTER the sort, so {@code limit=1} is the newest tag and not whichever
+   * one the ref database listed first. There is no default cap: the client asking for all of them
+   * is the dropdown, and a repository's tag list is small enough to answer whole.
+   */
+  @GET
+  @Path("/tags")
+  public Response tags(@PathParam("repoId") String repoId, @QueryParam("limit") Integer limit) {
+    if (!isValidRepoId(repoId)) {
+      return badRequest("repoId must match " + REPO_ID_PATTERN);
+    }
+    if (limit != null && limit <= 0) {
+      return badRequest("limit must be a positive count");
+    }
+    try (Repository repo = openOrNull(repoId)) {
+      if (repo == null) {
+        return notFound("no-such-repository");
+      }
+      List<DatedTag> dated = new ArrayList<>();
+      try (RevWalk walk = new RevWalk(repo)) {
+        for (Ref ref : repo.getRefDatabase().getRefsByPrefix(Constants.R_TAGS)) {
+          DatedTag tag = datedTag(walk, ref);
+          if (tag != null) {
+            dated.add(tag);
+          }
+        }
+      }
+      Comparator<Instant> newestFirst = Comparator.nullsLast(Comparator.reverseOrder());
+      dated.sort(
+          Comparator.comparing(DatedTag::taggedAt, newestFirst)
+              .thenComparing(tag -> tag.tag().name(), Comparator.reverseOrder()));
+      List<TagInfo> tags = dated.stream().map(DatedTag::tag).toList();
+      if (limit != null && limit < tags.size()) {
+        tags = tags.subList(0, limit);
+      }
+      return Response.ok(new TagsResponse(repoId, tags)).build();
+    } catch (Exception e) {
+      throw unavailable("could not list the tags of repository " + repoId, e);
     }
   }
 
@@ -284,6 +365,36 @@ public class RepositoryBrowseResource {
   /** Null is absence and only absence; a store that cannot answer throws out of here unchanged. */
   private Repository openOrNull(String repoId) {
     return repositories.open(repoId);
+  }
+
+  /**
+   * One ref under {@code refs/tags/} as a dated tag, or null for one that names no commit.
+   *
+   * <p>Both kinds arrive here. This host only ever CREATES annotated tags — the write primitive
+   * says so and the release door depends on it — but receive-pack accepts a lightweight one from
+   * anybody pushing {@code --tags}, so a ref pointing straight at a commit is a tag like any other
+   * and carries that commit's committer date. An annotated tag is peeled in a loop rather than
+   * once: a tag of a tag is legal git, and only the commit at the end of the chain is browsable.
+   * What peels to a tree or a blob is skipped outright — there is nothing for a Code page to open
+   * there, and it is not an error either.
+   */
+  private static DatedTag datedTag(RevWalk walk, Ref ref) throws IOException {
+    String name = ref.getName().substring(Constants.R_TAGS.length());
+    RevObject object = walk.parseAny(ref.getObjectId());
+    PersonIdent ident = object instanceof RevTag tag ? tag.getTaggerIdent() : null;
+    boolean annotated = object instanceof RevTag;
+    while (object instanceof RevTag tag) {
+      object = walk.parseAny(tag.getObject());
+    }
+    if (!(object instanceof RevCommit commit)) {
+      return null;
+    }
+    if (!annotated) {
+      ident = commit.getCommitterIdent();
+    }
+    Instant taggedAt = ident == null ? null : ident.getWhenAsInstant();
+    return new DatedTag(
+        new TagInfo(name, commit.name(), taggedAt == null ? null : taggedAt.toString()), taggedAt);
   }
 
   /**
