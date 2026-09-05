@@ -52,14 +52,14 @@
              The store now builds inside the qits-registries reactor and carries that reactor's
              version. The coordinate is unchanged; its packages are eu.wohlben.qits.blobstore.*
              since this release, and the config keys stay qits.artifacts.*. -->
-        <qits.blobstore.version>2026.903.85122</qits.blobstore.version>
+        <qits.blobstore.version>2026.904.82651</qits.blobstore.version>
         <!-- The event bus: the outbox, the idempotent PUT, the durable listener. Published by
              libs/qits-eventstream into the platform Maven repository — the same place the blob
              store above and qits-db-core below come from, and why the <repositories> block below
              exists: none of the three is on Maven Central or built in this reactor. -->
-        <qits.eventstream.version>2026.903.85121</qits.eventstream.version>
+        <qits.eventstream.version>2026.904.82646</qits.eventstream.version>
         <!-- Shared OIDC and forwarded-header authentication. -->
-        <qits.integrations-quarkus.version>2026.902.53026</qits.integrations-quarkus.version>
+        <qits.integrations-quarkus.version>2026.904.82648</qits.integrations-quarkus.version>
         <!-- The platform's datasource resilience, released together out of
              libs/qits-integrations-quarkus, which is why the two versions are the same string:
              qits-db-core carries PatientPgDriver (the pool's connections are opened through it and
@@ -69,8 +69,8 @@
              qits-arch-rules carries the assertion that this service configured the first one. They
              move together — the rule names the driver as a string, so a driver that moved without
              the rule would pass a build it should fail. -->
-        <qits.db-core.version>2026.902.53026</qits.db-core.version>
-        <qits.arch-rules.version>2026.902.53026</qits.arch-rules.version>
+        <qits.db-core.version>2026.904.82648</qits.db-core.version>
+        <qits.arch-rules.version>2026.904.82648</qits.arch-rules.version>
         <!-- The user-story framework (test scope): TokenValidationBootstrapIT is a userflow, so a
              `mvn verify` also regenerates service/target/userstories/ — the stories' documentation,
              network diagram included. The diagram is OBSERVED rather than narrated: this version
@@ -78,7 +78,7 @@
              StoryNetworkFilter, deleted here when the git stories landed), `Commands` for the
              CLI-driven stories, and the negative network claims — assertEdgeCount,
              assertOnlyEdgesFrom, assertNotLeaked — the `git` category rests on. -->
-        <qits.userflows.version>2026.902.53027</qits.userflows.version>
+        <qits.userflows.version>2026.904.223009</qits.userflows.version>
         <!-- The recording service mocks the same IT boots against (the generic MockService plus
              idp.MockIdp), released out of libs/qits-integrations-quarkus like
              qits-db-core/qits-arch-rules above (the same-string policy applies the day this repo
@@ -86,7 +86,7 @@
              bearers, and a plain MockService plays qits-projects' name resolver — which is what
              makes the PUBLIC clone url (/git/:projectId/:repoName) serve at all, and what puts the
              qits-githost -> qits-projects lookup in every git story's diagram. -->
-        <qits.service-mock.version>2026.902.53026</qits.service-mock.version>
+        <qits.service-mock.version>2026.904.82648</qits.service-mock.version>
         <qits.maven.repository.url>http://registry.dev.localhost:8080/artifacts/maven/maven</qits.maven.repository.url>
 
         <maven.compiler.release>25</maven.compiler.release>
