@@ -116,8 +116,16 @@ public class RepositoryBrowseResourceTest {
     // Two annotated tags at that commit, at clocks their names disagree with: 2026.902.100000 sorts
     // after 2026.831.090000 lexically and was made before it, so a list in date order can only have
     // been read off the tagger's clock.
-    gitAt(work, "2026-09-01T10:00:00+00:00", "tag", "-a", "-m", "earlier", "2026.902.100000");
-    gitAt(work, "2026-09-03T10:00:00+00:00", "tag", "-a", "-m", "later", "2026.831.090000");
+    gitAt(
+        work,
+        "2026-09-01T10:00:00+00:00",
+        "-c", "user.email=qits@local", "-c", "user.name=qits",
+        "tag", "-a", "-m", "earlier", "2026.902.100000");
+    gitAt(
+        work,
+        "2026-09-03T10:00:00+00:00",
+        "-c", "user.email=qits@local", "-c", "user.name=qits",
+        "tag", "-a", "-m", "later", "2026.831.090000");
     // A lightweight tag — this host creates none, receive-pack takes them from anybody pushing
     // `--tags` — on a commit of its own, so the clock it answers with is provably the committer's.
     Files.writeString(work.resolve("VERSION"), "0\n");
