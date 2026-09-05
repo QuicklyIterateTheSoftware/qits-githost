@@ -36,6 +36,8 @@ public class RepositoryBrowseAuthTest {
     String repo = UUID.randomUUID().toString();
     given().when().get("/githost/api/repositories/" + repo).then()
         .statusCode(Response.Status.UNAUTHORIZED.getStatusCode());
+    given().when().get("/githost/api/repositories/" + repo + "/tags").then()
+        .statusCode(Response.Status.UNAUTHORIZED.getStatusCode());
     given().when().get("/githost/api/repositories/" + repo + "/tree").then()
         .statusCode(Response.Status.UNAUTHORIZED.getStatusCode());
     given().when().get("/githost/api/repositories/" + repo + "/file?path=README.md").then()

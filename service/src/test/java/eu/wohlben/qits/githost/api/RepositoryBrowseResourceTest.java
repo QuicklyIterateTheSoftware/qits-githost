@@ -23,7 +23,8 @@ import java.util.UUID;
 import org.junit.jupiter.api.Test;
 
 /**
- * {@code GET /githost/api/repositories/{repoId}[/tree|/file]} — the browser plane's content reads.
+ * {@code GET /githost/api/repositories/{repoId}[/tags|/tree|/file]} — the browser plane's content
+ * reads.
  *
  * <p>Seeded through the served git endpoint, like the rest of the suite: receive-pack is the only
  * door this storage has, and a DFS repository has no directory to build a fixture in. The helpers
@@ -48,10 +49,15 @@ public class RepositoryBrowseResourceTest {
 
   /**
    * One repository with everything the endpoints under test care about: a nested tree, a binary
-   * blob, a blob past the content cap, a symlink, a submodule gitlink, and a slashy branch. Seeded
-   * once for the class — the assertions are all reads.
+   * blob, a blob past the content cap, a symlink, a submodule gitlink, a slashy branch, and three
+   * tags. Seeded once for the class — the assertions are all reads.
    */
   private static volatile String seeded;
+
+  /** The commit both annotated tags were taken at, and the one the lightweight tag names. */
+  private static volatile String annotatedCommit;
+
+  private static volatile String lightweightCommit;
 
   private String seededRepo() throws Exception {
     String repo = seeded;
@@ -106,7 +112,24 @@ public class RepositoryBrowseResourceTest {
     git(work, "update-index", "--add", "--cacheinfo", "160000," + tip + ",vendored");
     commit(work, "vendor a submodule pointer");
     git(work, "branch", "feature/slashy");
-    git(work, "push", "-q", gitBase + "/" + repoId, "main", "feature/slashy");
+    annotatedCommit = git(work, "rev-parse", "HEAD").trim();
+    // Two annotated tags at that commit, at clocks their names disagree with: 2026.902.100000 sorts
+    // after 2026.831.090000 lexically and was made before it, so a list in date order can only have
+    // been read off the tagger's clock.
+    gitAt(work, "2026-09-01T10:00:00+00:00", "tag", "-a", "-m", "earlier", "2026.902.100000");
+    gitAt(work, "2026-09-03T10:00:00+00:00", "tag", "-a", "-m", "later", "2026.831.090000");
+    // A lightweight tag — this host creates none, receive-pack takes them from anybody pushing
+    // `--tags` — on a commit of its own, so the clock it answers with is provably the committer's.
+    Files.writeString(work.resolve("VERSION"), "0\n");
+    git(work, "add", ".");
+    gitAt(
+        work,
+        "2026-09-02T10:00:00+00:00",
+        "-c", "user.email=qits@local", "-c", "user.name=qits",
+        "commit", "-q", "-m", "a commit to hang a lightweight tag on");
+    lightweightCommit = git(work, "rev-parse", "HEAD").trim();
+    git(work, "tag", "lightweight");
+    git(work, "push", "-q", "--tags", gitBase + "/" + repoId, "main", "feature/slashy");
     return repoId;
   }
 
@@ -149,6 +172,52 @@ public class RepositoryBrowseResourceTest {
   @Test
   public void anIdThatIsNotASlugIsRefusedNotLookedUp() {
     given().when().get(API + "..%2Fetc").then().statusCode(400);
+  }
+
+  @Test
+  public void tagsAnswerNewestFirstWithTheirPeeledCommits() throws Exception {
+    JsonPath body =
+        given()
+            .when()
+            .get(API + seededRepo() + "/tags")
+            .then()
+            .statusCode(Response.Status.OK.getStatusCode())
+            .extract()
+            .jsonPath();
+    assertThat(body.getString("id"), is(seededRepo()));
+    // Both kinds in one date order — read by name this list would be upside down.
+    assertThat(
+        body.getList("tags.name", String.class),
+        is(List.of("2026.831.090000", "lightweight", "2026.902.100000")));
+    assertThat(body.getString("tags[0].taggedAt"), is("2026-09-03T10:00:00Z"));
+    // The lightweight tag carries no tagger, so its clock is its commit's committer date.
+    assertThat(body.getString("tags[1].taggedAt"), is("2026-09-02T10:00:00Z"));
+    assertThat(body.getString("tags[2].taggedAt"), is("2026-09-01T10:00:00Z"));
+    // An annotated tag answers the commit it was taken at, never its own tag object.
+    assertThat(body.getString("tags[0].commitSha"), is(annotatedCommit));
+    assertThat(body.getString("tags[2].commitSha"), is(annotatedCommit));
+    assertThat(body.getString("tags[1].commitSha"), is(lightweightCommit));
+  }
+
+  @Test
+  public void limitTrimsAfterTheSortSoOneTagIsTheNewestOne() throws Exception {
+    given()
+        .queryParam("limit", 1)
+        .when()
+        .get(API + seededRepo() + "/tags")
+        .then()
+        .statusCode(200)
+        .body("tags.name", is(List.of("2026.831.090000")));
+    given().queryParam("limit", 0).when().get(API + seededRepo() + "/tags").then().statusCode(400);
+  }
+
+  @Test
+  public void aRepositoryThatHasReleasedNothingAnswersNoTagsRatherThanNothing() throws Exception {
+    String empty = UUID.randomUUID().toString();
+    repositories.create(empty, "main");
+    given().when().get(API + empty + "/tags").then().statusCode(200).body("tags", is(List.of()));
+    given().when().get(API + UUID.randomUUID() + "/tags").then().statusCode(404)
+        .body("error", is("no-such-repository"));
   }
 
   @Test
@@ -304,12 +373,29 @@ public class RepositoryBrowseResourceTest {
   }
 
   private static String git(Path cwd, String... args) throws Exception {
+    return git(cwd, null, args);
+  }
+
+  /**
+   * The same call at a chosen clock. Both dates are set because git reads two: a commit takes its
+   * committer from {@code GIT_COMMITTER_DATE} and its author from {@code GIT_AUTHOR_DATE}, and an
+   * annotated tag takes its tagger's from the committer one.
+   */
+  private static String gitAt(Path cwd, String when, String... args) throws Exception {
+    return git(cwd, when, args);
+  }
+
+  private static String git(Path cwd, String when, String[] args) throws Exception {
     String[] command = new String[args.length + 1];
     command[0] = "git";
     System.arraycopy(args, 0, command, 1, args.length);
     ProcessBuilder pb = new ProcessBuilder(command);
     pb.directory(cwd.toFile());
     pb.redirectErrorStream(true);
+    if (when != null) {
+      pb.environment().put("GIT_COMMITTER_DATE", when);
+      pb.environment().put("GIT_AUTHOR_DATE", when);
+    }
     Process p = pb.start();
     String out = new String(p.getInputStream().readAllBytes());
     if (p.waitFor() != 0) {
